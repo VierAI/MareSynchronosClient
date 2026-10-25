@@ -25,12 +25,13 @@ using System.Text;
 
 namespace MareSynchronos.PlayerData.Pairs;
 
-public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBase
+public sealed partial class PairDataApplicationHandler : DisposableMediatorSubscriberBase
 {
     private sealed record DataApplication
     {
         public required Guid ApplicationBase;
         public required CharacterData CharacterData;
+        public CharacterData? ReceivedData; // fork: unfiltered copy, kept as the 'last received' data
         public required long Sequence;
         public bool ForceApplyCustomization = false;
         public Dictionary<ObjectKind, HashSet<PlayerChanges>> CharacterDataToUpdate = [];
@@ -38,7 +39,7 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
         public bool UpdateModdedPaths => CharacterDataToUpdate.Values.Any(v => v.Any(p => p == PlayerChanges.ModFiles));
     }
 
-    private static readonly SemaphoreSlim _dataApplicationGate = new(4, 4);
+    private static readonly PriorityWorkGate _dataApplicationGate = PriorityWorkGate.Apply; // fork: tier-ordered when full
     private static readonly IImmutableList<string> FileExtensionsToValidate = [".avfx", ".tmb"];
     private static readonly ConcurrentDictionary<string, byte> _filesThatHaveBeenVerifiedGood = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, byte> _filesThatHaveBeenVerifiedBad = new(StringComparer.OrdinalIgnoreCase);
@@ -281,6 +282,7 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
     {
         if (!visible)
         {
+            ForkResetDebounce();
             if (_isPairValid)
             {
                 _isPairValid = false;
@@ -588,6 +590,15 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
         using CancellationTokenSource linkedCts = CancellationTokenSource.CreateLinkedTokenSource(dataApplicationToken, topLevelToken);
         var linkedToken = linkedCts.Token;
 
+        // Fork fix: a Penumbra (re)initialize clears _charaHandler for pairs that are out of view at that moment, and the pair's
+        // one-time initialize never runs again (it already has a cached player). Every later apply then failed instantly with
+        // 'invalid pair state' and was requeued on every deferred tick. Rebind the live handler (and the temp collection) here.
+        if (_charaHandler == null && Pair.IsVisible && Pair.CachedPlayer?.CharacterHandler is { } liveHandler)
+        {
+            Logger.LogInformation("[BASE-{appBase}] Rebinding character handler for {uid} (lost after a Penumbra reinitialize)", applicationBase, Pair.UserData.UID);
+            await Initialize(liveHandler).ConfigureAwait(false);
+        }
+
         DataApplication dataApplication = new()
         {
             ApplicationBase = applicationBase,
@@ -620,6 +631,7 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
         if (moddedPaths == null)
         {
             SetPairCharacterData(characterData);
+            ForkSetApplied(dataApplication.CharacterData);
             _currentVersion = _pendingVersion;
             LastDataApplicationTime = DateTimeOffset.UtcNow;
             Mediator.Publish(new EventMessage(new DataApplicationEvent(applicationBase, DataApplicationStatus.Completed,
@@ -628,7 +640,16 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
 
             return;
         }
-        await ValidateCharacterModFilesAsync(dataApplication, moddedPaths, linkedToken).ConfigureAwait(false);
+        // Fork: file validation (reads + checks) is tier-ordered when several pairs validate at once
+        await PriorityWorkGate.Validation.WaitAsync(Pair, linkedToken).ConfigureAwait(false);
+        try
+        {
+            await ValidateCharacterModFilesAsync(dataApplication, moddedPaths, linkedToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            PriorityWorkGate.Validation.Release();
+        }
         await ApplyDataApplicationAsync(dataApplication, moddedPaths, linkedToken).ConfigureAwait(false);
     }
 
@@ -651,6 +672,7 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
         {
             _cachedData = data?.DeepClone();
             _pendingData = null;
+            if (data == null) ForkSetApplied(null);
         }
     }
 
@@ -668,7 +690,13 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
             $"Preparing to start data application for {Pair.PairUIDName}")));
 
         var cachedData = GetCopyOfPairCharacterData();
-        characterData = RemoveNotSyncedFiles(characterData)!;
+        // Fork fix: filter a copy, so the cached 'last received' data keeps files we skip right now (muted sounds, animations,
+        // VFX) and unmute/unpause can restore them; diff against what was actually applied.
+        dataApplication.ReceivedData ??= characterData;
+        characterData = RemoveNotSyncedFiles(characterData.DeepClone())!;
+        dataApplication.CharacterData = characterData;
+        cachedData = ForkAppliedBaseline(cachedData);
+        var filterChanged = ForkFilterChanged(characterData, cachedData);
 
         // Check if we are in combat or performing and need to defer pair loading
         if ((_configService.Current.AutoPauseDataApplicationWhenPerforming && _dalamudUtil.IsPerforming) || _dalamudUtil.IsInCombat)
@@ -726,8 +754,23 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
         Logger.LogDebug("[BASE-{appbase}] Hash for data is {newHash}, current cache hash is {oldHash}",
             applicationBase, characterData.DataHash.Value, cachedData?.DataHash.Value ?? "NODATA");
 
+        // Fork: skip a forced re-apply of identical data seconds after the last finished apply (see PairDataApplicationHandler.Fork.cs)
+
+        if (!filterChanged && ForkIsDuplicateApply(characterData.DataHash.Value, cachedData?.DataHash.Value, forceApplyCustomization))
+
+        {
+
+            Logger.LogDebug("[BASE-{appbase}] Skipping duplicate forced re-apply of {hash} for {player}", applicationBase, characterData.DataHash.Value, this);
+
+            _currentVersion = _pendingVersion;
+
+            return Task.CompletedTask;
+
+        }
+
+
         // Check if the pairs data is what we already expect, if we're not forcing it, just stop here
-        if (string.Equals(characterData.DataHash.Value, cachedData?.DataHash.Value ?? string.Empty, StringComparison.Ordinal) && !forceApplyCustomization)
+        if (string.Equals(characterData.DataHash.Value, cachedData?.DataHash.Value ?? string.Empty, StringComparison.Ordinal) && !forceApplyCustomization && !filterChanged)
         {
             _currentVersion = _pendingVersion;
             Mediator.Publish(new EventMessage(new DataApplicationEvent(applicationBase, DataApplicationStatus.Completed, Pair.PlayerName, Pair.UserData, nameof(ValidatePairDataApplicationReadiness), EventSeverity.Informational,
@@ -767,6 +810,13 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
         if (charaDataToUpdate.TryGetValue(ObjectKind.Player, out var player) && Interlocked.Exchange(ref _redrawOnNextApplication, 0) == 1)
         {
             player.Add(PlayerChanges.ForcedRedraw);
+        }
+
+        // Fork fix: files were added back or taken out by a permission change (mute/unmute): redraw so the game reloads them
+        if (filterChanged)
+        {
+            if (!charaDataToUpdate.TryGetValue(ObjectKind.Player, out var filterPlayer)) charaDataToUpdate[ObjectKind.Player] = filterPlayer = [];
+            filterPlayer.Add(PlayerChanges.ForcedRedraw);
         }
 
         // Check for any pair data for optional plugins that we don't have installed/enabled
@@ -864,7 +914,7 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
                     $"Starting download for {toDownloadReplacements.Count} files")));
 
                 // start download for needed files
-                _pairDownloadTask = Task.Run(async () => await _downloadManager.DownloadFiles(new DownloadBatchInfo(_charaHandler!.Name, "Player", _charaHandler),
+                _pairDownloadTask = Task.Run(async () => await _downloadManager.DownloadFiles(new DownloadBatchInfo(_charaHandler!.Name, "Player", _charaHandler, Pair),
                     toDownloadReplacements, compressionSubstitutions, cancellationToken).ConfigureAwait(false));
 
                 await _pairDownloadTask.ConfigureAwait(false);
@@ -1033,7 +1083,8 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
                     {
                         try
                         {
-                            var bytes = await File.ReadAllBytesAsync(filePath, cancellationToken).ConfigureAwait(false);
+                            var bytes = await ReadForValidationAsync(file.Key.Hash!, filePath, cancellationToken).ConfigureAwait(false);
+                            if (bytes == null) { if (LowPriorityFile.IsWine || !File.Exists(filePath)) moddedPaths.Remove(file.Key); continue; }
                             var validationMessages = FileValidation.ValidateFile(_dataManager.Excel, _dalamudUtil.InstalledExpansions, bytes, extension, path => path.Contains('/')
                                 && (_dataManager.FileExists(path) || replacementPaths.Contains(path))).ToArray();
 
@@ -1120,6 +1171,8 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
                     .OrderByDescending(entry => entry.Key.Hash == null)
                     .ThenBy(entry => entry.Key.Hash, StringComparer.Ordinal)
                     .First().Value, StringComparer.Ordinal);
+            // Fork: texture size cap (swaps to existing smaller copies, queues the rest in the background)
+            moddedPathsData = MareSynchronos.Services.TextureCap.TextureCapService.Instance?.ApplyCaps(Pair.UserData, moddedPathsData) ?? moddedPathsData;
 
             if (dataApplication.UpdateModdedPaths)
             {
@@ -1191,7 +1244,10 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
 
         Logger.LogDebug("[{applicationId}] Application finished", applicationId);
 
-        SetPairCharacterData(charaData);
+        OnForkDataApplied(applicationId, charaData, updatedData);
+
+        SetPairCharacterData(dataApplication.ReceivedData ?? charaData);
+        ForkSetApplied(charaData);
         _currentVersion = _pendingVersion;
         LastDataApplicationTime = DateTimeOffset.UtcNow;
     }
@@ -1265,9 +1321,12 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
         double petNamesTime = 0;
         double redrawTime = 0;
 
-        // 3 groups within one framework call: Glamourer -> Everything else -> Redraw
+        // Groups: Penumbra (temp collection, mods, manips) -> Glamourer -> Everything else -> Redraw.
+        // Fork: with SplitApplyAcrossFrames (VierAIConfig, default on) each group runs in its own framework call, so one heavy
+        // apply is spread over several frames; otherwise all groups run in one framework call as before. Redraw is always last.
         var changeGroup = new[]
         {
+            Array.Empty<PlayerChanges>(), // Penumbra stage: no PlayerChanges of its own, runs when mods/manips need updating
             orderedCharacterChanges.Where(change => change == PlayerChanges.Glamourer).ToArray(),
             orderedCharacterChanges.Where(change => change != PlayerChanges.Glamourer && change != PlayerChanges.ForcedRedraw).ToArray(),
             orderedCharacterChanges.Where(change => change == PlayerChanges.ForcedRedraw).Take(1).ToArray(), // hash set so this should only ever be one, but just in case someone changes it
@@ -1283,24 +1342,21 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
         Logger.LogTrace("Number of pending data applications via IPCs: {count}", Volatile.Read(ref _pendingDataIpcCounts));
         try
         {
-            await _dataApplicationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await _dataApplicationGate.WaitAsync(Pair, cancellationToken).ConfigureAwait(false);
             try
             {
                 bool nonPlayerObjectAndNull = false;
                 string? failureReason = null;
                 PlayerChanges? failedChange = null;
 
-                bool playerIsStillValid = await _dalamudUtil.RunOnFrameworkThread(() =>
+                bool needsPenumbraStage = !penumbraApplied && (updateModdedPaths || updateManip);
+
+                // Runs one change group on the framework thread. null = go on with the next group; true/false = stop with that result.
+                bool? RunGroup(PlayerChanges[] changes)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
-                    foreach (var changes in changeGroup)
                     {
-                        if (changes.Length == 0)
-                        {
-                            continue;
-                        }
-
                         bool groupValid = _dalamudUtil.TryActOnFramework(Pair.ContendId,
                             (player, playerAddress) =>
                             {
@@ -1419,7 +1475,7 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
                         if (!groupValid)
                         {
                             failureReason = actionFailureReason;
-                            failedChange = changes[0];
+                            failedChange = changes.Length > 0 ? changes[0] : PlayerChanges.ModFiles;
 
                             return false;
                         }
@@ -1429,8 +1485,35 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
                         }
                     }
 
-                    return true;
-                }).ConfigureAwait(false);
+                    return null;
+                }
+
+                bool playerIsStillValid;
+                if (VierAIConfigStore.Current.SplitApplyAcrossFrames)
+                {
+                    playerIsStillValid = await ForkApplyChangeGroupsSplitAsync(changeGroup, needsPenumbraStage, RunGroup, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    playerIsStillValid = await _dalamudUtil.RunOnFrameworkThread(() =>
+                    {
+                        for (int i = 0; i < changeGroup.Length; i++)
+                        {
+                            if (changeGroup[i].Length == 0 && !(i == 0 && needsPenumbraStage))
+                            {
+                                continue;
+                            }
+
+                            var result = RunGroup(changeGroup[i]);
+                            if (result.HasValue)
+                            {
+                                return result.Value;
+                            }
+                        }
+
+                        return true;
+                    }).ConfigureAwait(false);
+                }
 
                 if (!playerIsStillValid)
                 {
@@ -1455,6 +1538,13 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
                     finally
                     {
                         _charaHandler.IsRedrawingViaIpcRequest = false;
+                    }
+
+                    // Fork: the redraw rebuilds the skeleton, so Customize+ and Heels applied before it can land on a half-built
+                    // model (long fingers, broken bones). Wait for the skeleton (max ~3s, timeout = proceed) and apply them once more.
+                    if (VierAIConfigStore.Current.ReapplyScaleAfterRedraw)
+                    {
+                        await ReapplyScaleAndHeelsAfterRedrawAsync(applicationId, charaData, cancellationToken).ConfigureAwait(false);
                     }
                 }
             }
@@ -1502,6 +1592,35 @@ public sealed class PairDataApplicationHandler : DisposableMediatorSubscriberBas
         }
     }
 
+    private async Task ReapplyScaleAndHeelsAfterRedrawAsync(Guid applicationId, CharacterData charaData, CancellationToken cancellationToken)
+    {
+        string? scale = null;
+        if (charaData.CustomizePlusData.TryGetValue(ObjectKind.Player, out var encoded) && !string.IsNullOrEmpty(encoded))
+        {
+            scale = Encoding.UTF8.GetString(Convert.FromBase64String(encoded));
+        }
+        var heels = charaData.HeelsData;
+        bool doScale = scale != null && _ipcManager.CustomizePlus.APIAvailable;
+        bool doHeels = !string.IsNullOrEmpty(heels);
+        if (!doScale && !doHeels) return;
+
+        await _dalamudUtil.ForkWaitForSkeletonReadyAsync(Pair.ContendId, 3000, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        _dalamudUtil.TryActOnFramework(Pair.ContendId, (player, playerAddress) =>
+        {
+            if (doScale)
+            {
+                var id = _ipcManager.CustomizePlus.SetBodyScaleOnFramework(player.ObjectIndex, scale!);
+                if (id != null) _customizeIds[ObjectKind.Player] = id;
+            }
+            if (doHeels)
+            {
+                _ipcManager.Heels.SetOffsetForPlayerOnFramework(player.ObjectIndex, heels);
+            }
+        }, out var failure);
+        Logger.LogDebug("[{applicationId}] Post-redraw C+/Heels reapply for {pair}: scale={scale} heels={heels} {failure}", applicationId, Pair.PairUIDName, doScale, doHeels, failure ?? string.Empty);
+    }
     private async Task<string?> WaitForCharacterToDrawAsync(Guid applicationId, ObjectKind objectKind, CancellationToken linkedToken, GameObjectHandler? charaHandler = null)
     {
         linkedToken.ThrowIfCancellationRequested();

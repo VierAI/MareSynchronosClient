@@ -1,3 +1,5 @@
+using MareSynchronos.FileCache;
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -5,20 +7,29 @@ namespace MareSynchronos.Utils;
 
 public static class Crypto
 {
-#pragma warning disable SYSLIB0021 // Type or member is obsolete
-
-    private static readonly Dictionary<(string, ushort), string> _hashListPlayersSHA256 = new();
-    private static readonly Dictionary<string, string> _hashListSHA256 = new(StringComparer.Ordinal);
-    private static readonly SHA256CryptoServiceProvider _sha256CryptoProvider = new();
+    private static readonly ConcurrentDictionary<(string, ushort), string> _hashListPlayersSHA256 = new();
+    private static readonly ConcurrentDictionary<string, string> _hashListSHA256 = new(StringComparer.Ordinal);
 
     public static string GetFileHash(this string filePath)
     {
         // Streaming hash to avoid allocating an entire file buffer
         using var sha1 = SHA1.Create();
-        using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 1024 * 1024, options: FileOptions.SequentialScan);
-        var hashBytes = sha1.ComputeHash(fs);
+        try
+        {
+            using var fs = LowPriorityFile.OpenRead(filePath);
+            return Convert.ToHexString(sha1.ComputeHash(fs));
+        }
+        catch (IOException) when (LowPriorityFile.IsWine)
+        {
+            // Wine "General failure": one retry with a plain stream (Windows behaviour unchanged: the exception propagates).
+            using var plain = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 4096, FileOptions.None);
+            return Convert.ToHexString(sha1.ComputeHash(plain));
+        }
+    }
 
-        return Convert.ToHexString(hashBytes);
+    public static string GetBytesHash(ReadOnlySpan<byte> data)
+    {
+        return Convert.ToHexString(SHA1.HashData(data));
     }
 
     public static async Task<string> GetStreamHashAsync(Stream stream, CancellationToken token = default)
@@ -28,25 +39,18 @@ public static class Crypto
 
     public static string GetHash256(this (string, ushort) playerToHash)
     {
-        if (_hashListPlayersSHA256.TryGetValue(playerToHash, out var hash))
-            return hash;
-
-        return _hashListPlayersSHA256[playerToHash] =
-            BitConverter.ToString(_sha256CryptoProvider.ComputeHash(Encoding.UTF8.GetBytes(playerToHash.Item1 + playerToHash.Item2.ToString()))).Replace("-", "", StringComparison.Ordinal);
+        return _hashListPlayersSHA256.GetOrAdd(playerToHash, static key => HashString(key.Item1 + key.Item2.ToString()));
     }
 
     public static string GetHash256(this string stringToHash)
     {
-        return GetOrComputeHashSHA256(stringToHash);
+        return _hashListSHA256.GetOrAdd(stringToHash, static value => HashString(value));
     }
 
-    private static string GetOrComputeHashSHA256(string stringToCompute)
+    // SHA256.HashData does not share a hasher. The hex form matches the old BitConverter string.
+    private static string HashString(string value)
     {
-        if (_hashListSHA256.TryGetValue(stringToCompute, out var hash))
-            return hash;
-
-        return _hashListSHA256[stringToCompute] =
-            BitConverter.ToString(_sha256CryptoProvider.ComputeHash(Encoding.UTF8.GetBytes(stringToCompute))).Replace("-", "", StringComparison.Ordinal);
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(value));
+        return BitConverter.ToString(hash).Replace("-", "", StringComparison.Ordinal);
     }
-#pragma warning restore SYSLIB0021 // Type or member is obsolete
 }

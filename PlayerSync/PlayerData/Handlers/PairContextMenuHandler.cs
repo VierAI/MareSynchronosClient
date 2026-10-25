@@ -113,6 +113,8 @@ namespace MareSynchronos.PlayerData.Handlers
         private void AddContextMenu(Pair pair, IMenuOpenedArgs args)
         {
             if (!pair.HasCachedPlayer || (args.Target is not MenuTargetDefault target) || target.TargetObjectId != pair.PlayerCharacterId || pair.IsPaused) return;
+            // Fork (PairMenuSwap): same conditions as PairInviteManager's Send Pair Request (world menu, not a two-way direct pair)
+            var worldMenu = args.AddonName == null;
 
             for (int ss = 0; ss < _configurationService.Current.ContextMenuOrder.Length; ss++)
             {
@@ -139,7 +141,7 @@ namespace MareSynchronos.PlayerData.Handlers
                         args.AddMenuItem(new MenuItem()
                         {
                             Name = new SeStringBuilder().AddText("Pair Data").Build(),
-                            OnClicked = (args) => DrawPairDataContenxtSubmenu(pair, args),
+                            OnClicked = (a) => DrawPairDataContenxtSubmenu(pair, a, worldMenu),
                             IsSubmenu = true,
                             UseDefaultPrefix = false,
                             PrefixChar = 'P',
@@ -191,7 +193,7 @@ namespace MareSynchronos.PlayerData.Handlers
                         args.AddMenuItem(new MenuItem()
                         {
                             Name = new SeStringBuilder().AddText("Reapply Last Data").Build(),
-                            OnClicked = (a) => pair.ReapplyCachedData(forced: true),
+                            OnClicked = (a) => pair.ReapplyCachedDataByUser(),
                             UseDefaultPrefix = false,
                             PrefixChar = 'P',
                             PrefixColor = 530,
@@ -226,14 +228,18 @@ namespace MareSynchronos.PlayerData.Handlers
             }
         }
 
-        private void DrawPairDataContenxtSubmenu(Pair pair, IMenuItemClickedArgs clickedArgs)
+        private void DrawPairDataContenxtSubmenu(Pair pair, IMenuItemClickedArgs clickedArgs, bool worldMenu = false)
         {
             var menuItems = new List<MenuItem>();
 
-            menuItems.Add(new MenuItem()
+            // Fork (PairMenuSwap): Send Pair Request replaces Reapply Last Data here when Reapply is at the top level instead
+            var swapIdent = worldMenu && _apiController.IsConnected && pair.UserPair?.IndividualPairStatus != API.Data.Enum.IndividualPairStatus.Bidirectional
+                ? _dalamudUtilService.GetHashedCIDFromPlayerPointer(pair.Address) : null;
+            if (swapIdent != null) menuItems.Add(PairMenuSwap.SendPairRequestItem(() => _inviteManager.SendPairRequest(swapIdent)));
+            else menuItems.Add(new MenuItem()
             {
                 Name = new SeStringBuilder().AddText("Reapply Last Data").Build(),
-                OnClicked = (a) => pair.ReapplyCachedData(forced: true)
+                OnClicked = (a) => pair.ReapplyCachedDataByUser()
             });
 
             menuItems.Add(new MenuItem()
@@ -247,6 +253,8 @@ namespace MareSynchronos.PlayerData.Handlers
                 Name = new SeStringBuilder().AddText("Cycle Pause State").Build(),
                 OnClicked = (a) => Mediator.Publish(new CyclePauseMessage(pair.UserData)),
             });
+
+            PairMenuPrioritize.AddItem(menuItems, pair, _performanceConfigService, Mediator);
 
             menuItems.Add(new MenuItem()
             {

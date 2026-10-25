@@ -1,4 +1,4 @@
-﻿using MareSynchronos.API.Data.Enum;
+using MareSynchronos.API.Data.Enum;
 using MareSynchronos.API.Dto.User;
 using MareSynchronos.Interop.Ipc;
 using MareSynchronos.MareConfiguration;
@@ -29,6 +29,11 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
     private readonly object _deferredApplicationLock = new();
     private readonly ConcurrentDictionary<Pair, CharacterDataApplication> _deferredPairDataApplications = [];
     private readonly HashSet<Pair> _runningApplyDataTasks = [];
+    // Fork: per-pair retry backoff after a failed application (1 s doubling to 60 s), so a pair that keeps failing the same
+    // way is not retried on every 250 ms deferred tick. Reset on success, new full data, a reapply request, or the pair leaving view.
+    private readonly ConcurrentDictionary<Pair, (int Failures, DateTimeOffset NextTry, string Reason)> _failureBackoff = new();
+    private static readonly TimeSpan BackoffStart = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan BackoffCap = TimeSpan.FromSeconds(60);
 
     private CancellationTokenSource? _deferredApplicationCts;
     private CancellationTokenSource? _dataApplicationManagerCts;
@@ -53,7 +58,7 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
         _pairManager = pairManager;
         _maxConcurrentApplyData = _configurationService.Current.MaxConcurrentApplications < 1 ? 1 : _configurationService.Current.MaxConcurrentApplications;
 
-        Mediator.Subscribe<ReapplyCachedPairDataMessage>(this, (msg) => _ = ReapplyCachedPairData(msg.Pair, msg.Force));
+        Mediator.Subscribe<ReapplyCachedPairDataMessage>(this, (msg) => { ResetBackoff(msg.Pair); _ = ReapplyCachedPairData(msg.Pair, msg.Force); });
         Mediator.Subscribe<DisconnectedMessage>(this, (_) =>
         {
             _isConnected = false;
@@ -141,6 +146,7 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
 
         CharacterDataApplication queuedData;
         queuedData = new(dto, Interlocked.Increment(ref _dataApplicationSequence));
+        if (dto.AddonPlugin == null) ResetBackoff(pair); // new full data: retry right away
 
         if (!pair.CanApplyModdedData || DeferringDataApplications) // defer this pair for now
         {
@@ -468,6 +474,7 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
         var version = queuedData.DataApplicationSequence;
         bool hadErrors = false;
         bool hasStarted = false;
+        bool failureLogged = false;
         Guid applicationBase = Guid.NewGuid();
 
         try
@@ -503,6 +510,7 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                     pair.UserData, nameof(ApplyPairDataAsync), EventSeverity.Warning, $"Data application was cancelled for {pair.PairUIDName}")));
 
             Logger.LogDebug("[BASE-{appBase}] Queued data application was cancelled for {pair}", applicationBase, pair.PairUIDName);
+            failureLogged = true; // a cancel (newer data, pair left view) is not a failure; no warning, no backoff
         }
         catch (PairDataApplicationException ex)
         {
@@ -519,6 +527,8 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                     pair.UserData, nameof(ApplyPairDataAsync), EventSeverity.Error, $"Requeueing failed data application for {pair.PairUIDName}, {ex.Reason}")));
 
                 Logger.LogDebug("[BASE-{appBase}] Requeueing failed data application for {pair} due to {reason}", applicationBase, pair.PairUIDName, ex.Reason);
+                RecordFailure(applicationBase, pair, ex.Reason + ": " + ex.Message);
+                failureLogged = true;
                 QueueOrRequeueDeferredData(pair, queuedData);
             }
         }
@@ -530,6 +540,8 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                     pair.UserData, nameof(ApplyPairDataAsync), EventSeverity.Error, $"Data application failed for {pair.PairUIDName}, {ex.Message}")));
 
             Logger.LogError(ex, "[BASE-{appBase}] Failed to apply queued pair data for {pair}", applicationBase, pair.PairUIDName);
+            RecordFailure(applicationBase, pair, ex.GetType().Name + ": " + ex.Message, logWarning: false);
+            failureLogged = true;
         }
         finally
         {
@@ -539,11 +551,17 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                 stopwatch?.Stop();
                 if (hadErrors)
                 {
-                    Logger.LogWarning("[BASE-{appBase}] Queued data application was cancelled or failed for {pair} after {elapsedMs}ms",
-                        applicationBase, pair.PairUIDName, stopwatch!.ElapsedMilliseconds);
+                    // Fork: the reason is logged once by RecordFailure; this per-attempt line is debug only (it spammed every 250 ms).
+                    if (failureLogged)
+                        Logger.LogDebug("[BASE-{appBase}] Queued data application was cancelled or failed for {pair} after {elapsedMs}ms",
+                            applicationBase, pair.PairUIDName, stopwatch!.ElapsedMilliseconds);
+                    else
+                        Logger.LogWarning("[BASE-{appBase}] Queued data application was cancelled or failed for {pair} after {elapsedMs}ms",
+                            applicationBase, pair.PairUIDName, stopwatch!.ElapsedMilliseconds);
                 }
                 else
                 {
+                    ResetBackoff(pair);
                     Mediator.Publish(new EventMessage(new DataApplicationEvent(applicationBase, DataApplicationStatus.Completed, pair.PlayerName, pair.UserData,
                         nameof(ApplyPairDataAsync), EventSeverity.Informational,
                         $"Data application task for {pair.PairUIDName} completed in {stopwatch!.ElapsedMilliseconds}ms")));
@@ -574,7 +592,7 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                     {
                         lock (_deferredApplicationLock) // this gets cleared when you zone, we need to not be acting on it while it gets cleared
                         {
-                            if (pair.CanApplyModdedData && !DeferringDataApplications && _deferredPairDataApplications.TryRemove(pair, out var queuedData))
+                            if (pair.CanApplyModdedData && !DeferringDataApplications && !IsBackingOff(pair) && _deferredPairDataApplications.TryRemove(pair, out var queuedData))
                             {
                                 Logger.LogTrace("Pending deferred pair data applications remaining: {count}", _deferredPairDataApplications.Count);
                                 Logger.LogDebug("Pair is no longer deferred and has data application: {pair}", pair.PairUIDName);
@@ -603,6 +621,44 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
 
             await Task.Delay(TimeSpan.FromMilliseconds(250), ct).ConfigureAwait(false);
         }
+    }
+
+    private void RecordFailure(Guid applicationBase, Pair pair, string reason, bool logWarning = true)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var reasonChanged = _failureBackoff.TryGetValue(pair, out var prev) && !string.Equals(prev.Reason, reason, StringComparison.Ordinal);
+        var state = _failureBackoff.AddOrUpdate(pair,
+            _ => (1, now + BackoffStart, reason),
+            (_, old) =>
+            {
+                var failures = old.Failures + 1;
+                var delay = TimeSpan.FromTicks(Math.Min(BackoffCap.Ticks, BackoffStart.Ticks << Math.Min(failures - 1, 16)));
+                return (failures, now + delay, reason);
+            });
+        var delayNow = state.NextTry - now;
+        // Warn on the first failure, when the reason changes, and once when the retry delay reaches the cap; debug otherwise.
+        var first = state.Failures == 1;
+        var reachedCap = delayNow >= BackoffCap && (BackoffStart.Ticks << Math.Min(state.Failures - 2, 16)) < BackoffCap.Ticks;
+        if (logWarning && (first || reasonChanged || reachedCap))
+        {
+            Logger.LogWarning("[BASE-{appBase}] Data application failed for {pair}: {reason}. Retry {n} in {delay:0.#} s{cap}",
+                applicationBase, pair.UserData.UID, reason, state.Failures, delayNow.TotalSeconds,
+                reachedCap ? " (retry delay capped at 60 s; further failures are logged at debug level)" : string.Empty);
+        }
+        else
+        {
+            Logger.LogDebug("[BASE-{appBase}] Data application failed again for {pair} ({n}x): {reason}, next retry in {delay:0.#} s",
+                applicationBase, pair.UserData.UID, state.Failures, reason, delayNow.TotalSeconds);
+        }
+    }
+
+    private void ResetBackoff(Pair pair) => _failureBackoff.TryRemove(pair, out _);
+
+    private bool IsBackingOff(Pair pair)
+    {
+        if (!_failureBackoff.TryGetValue(pair, out var state)) return false;
+        if (!pair.IsVisible) { _failureBackoff.TryRemove(pair, out _); return false; } // left view: start fresh when they come back
+        return DateTimeOffset.UtcNow < state.NextTry;
     }
 
     protected override void Dispose(bool disposing)

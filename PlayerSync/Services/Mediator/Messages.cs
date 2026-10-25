@@ -1,4 +1,4 @@
-﻿using Dalamud.Game.ClientState.Objects.Types;
+using Dalamud.Game.ClientState.Objects.Types;
 using MareSynchronos.API.Data;
 using MareSynchronos.API.Data.Enum;
 using MareSynchronos.API.Dto;
@@ -52,7 +52,7 @@ public record GlamourerChangedMessage(ObjectKind? ObjectKind) : MessageBase;
 public record PlayerDrawEndMessage(string PlayerName) : MessageBase;
 public record HeelsOffsetMessage : MessageBase;
 public record PenumbraResourceLoadMessage(IntPtr GameObject, string GamePath, string FilePath) : SameThreadMessage;
-public record PenumbraSoundResourceLoadMessage(ulong ContentId, string FilePath) : SameThreadMessage;
+public record PenumbraSoundResourceLoadMessage(ulong ContentId, string FilePath, string GamePath = "") : SameThreadMessage;
 public record CustomizePlusMessage(ObjectKind? ObjectKind, bool All = false) : MessageBase;
 public record HonorificMessage(string NewHonorificTitle) : MessageBase;
 public record MoodlesMessage(ObjectKind? ObjectKind) : MessageBase;
@@ -80,7 +80,7 @@ public record FrameworkCharactersChangedMessage(IReadOnlyList<FrameworkCharacter
 public record HubReconnectingMessage(Exception? Exception) : SameThreadMessage;
 public record HubReconnectedMessage(string? Arg) : SameThreadMessage;
 public record HubClosedMessage(Exception? Exception) : SameThreadMessage;
-public record DownloadBatchInfo(string DisplayName, string DisplayType, GameObjectHandler? GameObject);
+public record DownloadBatchInfo(string DisplayName, string DisplayType, GameObjectHandler? GameObject, Pair? Pair = null);
 public record DownloadStartedMessage(DownloadBatchInfo BatchInfo, ConcurrentDictionary<string, FileDownloadStatus> DownloadStatus) : MessageBase;
 public record DownloadFinishedMessage(DownloadBatchInfo BatchInfo) : MessageBase;
 public record UiToggleMessage(Type UiType) : MessageBase;
@@ -108,6 +108,8 @@ public record OpenPermissionWindow(Pair Pair) : MessageBase;
 public record OpenStageDetailsWindow(StageFullInfoDto? StartingStageInfo, string? OwningGroupId) : MessageBase;
 public record OpenStageUpdateWindow(string StageId, string NewDefinitionFilename) : MessageBase;
 public record DownloadLimitChangedMessage() : SameThreadMessage;
+// Priority list, tiers or the in-game friends set changed: re-tier waiting and running downloads.
+public record PriorityChangedMessage() : MessageBase;
 public record TargetPairMessage(Pair? Pair, TargetType TargetType) : MessageBase;
 public record CombatOrPerformanceStartMessage : MessageBase;
 public record CombatOrPerformanceEndMessage : MessageBase;

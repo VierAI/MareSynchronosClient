@@ -1,4 +1,4 @@
-﻿using Dalamud.Interface.ImGuiFileDialog;
+using Dalamud.Interface.ImGuiFileDialog;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
@@ -76,6 +76,7 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         FileValidation.Initialize(pluginInterface);
+        VierAIConfigStore.Initialize(pluginInterface.ConfigDirectory.FullName); // fork-only settings (vierai-config.json), before any shared config can be rewritten
 
         _host = new HostBuilder()
         .UseContentRoot(pluginInterface.ConfigDirectory.FullName)
@@ -120,6 +121,9 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddSingleton<PerformanceCollectorService>();
             collection.AddSingleton<HubFactory>();
             collection.AddSingleton<FileUploadManager>();
+            collection.AddSingleton<InGameFriendService>();
+            collection.AddSingleton<DownloadPriorityQueue>();
+            collection.AddSingleton<SoundActivityTracker>();
             collection.AddSingleton<FileTransferOrchestrator>();
             collection.AddSingleton((s) => new PreloaderService(
                 s.GetRequiredService<FileCacheManager>(), s.GetRequiredService<FileUploadManager>(),
@@ -136,6 +140,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddSingleton<CharacterAnalyzer>();
             collection.AddSingleton<TokenProvider>();
             collection.AddSingleton<PluginWarningNotificationService>();
+            collection.AddSingleton<BackgroundDiskWorker>();
             collection.AddSingleton<FileCompactor>();
             collection.AddSingleton<TagHandler>();
             collection.AddSingleton<IdDisplayHandler>();
@@ -144,6 +149,8 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddSingleton<CompressedAlternateManager>();
             collection.AddSingleton<ICompressedAlternateManager, CompressedAlternateManager>(services => services.GetRequiredService<CompressedAlternateManager>());
             collection.AddHostedService(services => services.GetRequiredService<CompressedAlternateManager>());
+            collection.AddSingleton<MareSynchronos.Services.TextureCap.TextureCapService>();
+            collection.AddHostedService(services => services.GetRequiredService<MareSynchronos.Services.TextureCap.TextureCapService>());
             collection.AddSingleton<StageDisplayService>();
             collection.AddSingleton<IStageDisplayService>(services => services.GetRequiredService<StageDisplayService>());
             collection.AddHostedService(services => services.GetRequiredService<StageDisplayService>());
@@ -245,6 +252,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddSingleton<IConfigService<IMareConfiguration>>(s => s.GetRequiredService<StageConfigService>());
             collection.AddSingleton<ConfigurationMigrator>();
             collection.AddSingleton<ConfigurationSaveService>();
+            collection.AddSingleton<VierAIConfigService>();
             collection.AddSingleton<UiTheme>();
 
             collection.AddSingleton<VersionUpdateCheckService>();
@@ -268,6 +276,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddScoped<WindowMediatorSubscriberBase, EventViewerUI>();
             collection.AddScoped<WindowMediatorSubscriberBase, CharaDataHubUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, PairAnalysisViewerUI>();
+            collection.AddScoped<WindowMediatorSubscriberBase, NoiseMakersUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, PairingRequestsUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, PairingRequestsNoticeUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, EditProfileUi>((s) => new EditProfileUi(s.GetRequiredService<ILogger<EditProfileUi>>(),
@@ -292,9 +301,12 @@ public sealed class Plugin : IDalamudPlugin
                 pluginInterface, textureProvider, s.GetRequiredService<Dalamud.Localization>(), s.GetRequiredService<ServerConfigurationManager>(), s.GetRequiredService<TokenProvider>(),
                 s.GetRequiredService<MareMediator>(), dataManager));
             collection.AddHostedService(p => p.GetRequiredService<ConfigurationSaveService>());
+            collection.AddHostedService(p => p.GetRequiredService<VierAIConfigService>());
             collection.AddHostedService(p => p.GetRequiredService<MareMediator>());
             collection.AddHostedService(p => p.GetRequiredService<NotificationService>());
             collection.AddHostedService(p => p.GetRequiredService<NamePlateManagerService>());
+            collection.AddHostedService(p => p.GetRequiredService<SoundActivityTracker>());
+            collection.AddHostedService(p => p.GetRequiredService<InGameFriendService>());
             collection.AddHostedService(p => p.GetRequiredService<FileCacheManager>());
             collection.AddHostedService(p => p.GetRequiredService<ConfigurationMigrator>());
             collection.AddHostedService(p => p.GetRequiredService<DalamudUtilService>());
@@ -310,6 +322,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddHostedService(p => p.GetRequiredService<JsonDataTypeHandlerService>());
             collection.AddHostedService(p => p.GetRequiredService<AnimationBindGuard>());
             collection.AddHostedService<StageSavedNotificationService>();
+            collection.AddHostedService<CacheFolderHealthCheck>();
             //collection.AddHostedService(p => p.GetRequiredService<PlayerIdleStatusService>());
             collection.AddHostedService<SkeletonMappingFix>();
         })

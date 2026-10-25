@@ -325,6 +325,8 @@ public partial class SettingsUi
         }
         _uiShared.DrawHelpText("This will draw a ⇔ icon next to names for visibile pairs.");
 
+        DrawSoundActivitySettings();
+
         if (ImGui.Checkbox("Color Code Active Pair Names" , ref showNameHighlights))
         {
             _configService.Current.ShowNameHighlights = showNameHighlights;

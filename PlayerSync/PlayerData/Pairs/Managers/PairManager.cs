@@ -1,4 +1,4 @@
-﻿using MareSynchronos.API.Data;
+using MareSynchronos.API.Data;
 using MareSynchronos.API.Data.Comparer;
 using MareSynchronos.API.Data.Extensions;
 using MareSynchronos.API.Dto.Group;
@@ -203,7 +203,29 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     public List<UserData> GetVisibleUsers() => [.. _allClientPairs.Where(p => p.Value.IsVisible).Select(p => p.Key)];
 
-    public List<Pair> GetVisiblePairs() => [.. _allClientPairs.Where(p => p.Value.IsVisible).Select(p => p.Value)];
+    // Fork perf: GetVisiblePairs is called from several per-frame paths (name plates, Noises, menus). On the framework thread
+    // the scan over every pair runs once per frame; each caller still gets its own list. Off-thread callers always scan.
+    private Pair[] _visiblePairsFrameCache = [];
+    private long _visiblePairsFrameCacheFrame = -1;
+
+    public List<Pair> GetVisiblePairs()
+    {
+        if (!_dalamudUtilService.IsOnFrameworkThread)
+        {
+            return [.. _allClientPairs.Where(p => p.Value.IsVisible).Select(p => p.Value)];
+        }
+
+        var frame = _dalamudUtilService.FrameworkUpdateCount;
+        if (_visiblePairsFrameCacheFrame != frame)
+        {
+            _visiblePairsFrameCache = [.. _allClientPairs.Where(p => p.Value.IsVisible).Select(p => p.Value)];
+            _visiblePairsFrameCacheFrame = frame;
+        }
+
+        return [.. _visiblePairsFrameCache];
+    }
+
+    private void InvalidateVisiblePairsFrameCache() => _visiblePairsFrameCacheFrame = -1;
 
     public void MarkPairOffline(UserData user)
     {
@@ -377,6 +399,8 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             Mediator.Publish(new ClearProfileDataMessage(dto.User));
         }
 
+        // Fork: remember whether this change unmutes the pair, so the reapply below can restore their sound in full.
+        var unmuted = pair.UserPair.OwnPermissions.IsDisableSounds() && !dto.Permissions.IsDisableSounds();
         pair.UserPair.OwnPermissions = dto.Permissions;
 
         Logger.LogTrace("Paused: {paused}, Anims: {anims}, Sounds: {sounds}, VFX: {vfx}",
@@ -389,7 +413,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         {
             _serverConfigurationManager.RemovePauseReasonForUid(pair.UserData.UID);
             _serverConfigurationManager.RemovePendingPauseForUid(pair.UserData.UID);
-            pair.ReapplyCachedData();
+            UnmuteSoundRestore.Reapply(pair, unmuted);
         }
 
         RecreateLazy();
@@ -455,6 +479,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     private void OnFrameworkCharactersChanged(IReadOnlyList<ObjectTablePlayersFrameworkUpdate> changes)
     {
+        InvalidateVisiblePairsFrameCache();
         foreach (var change in changes)
         {
             UpdatePairVisibility(change);

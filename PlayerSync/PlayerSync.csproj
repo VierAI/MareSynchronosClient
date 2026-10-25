@@ -1,9 +1,9 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
     <Authors></Authors>
     <Company></Company>
-    <Version>1.15.5.12</Version>
+    <Version>1.15.5.1209</Version>
     <Description></Description>
     <Copyright></Copyright>
     <PackageProjectUrl>https://github.com/MareSynchronos/client</PackageProjectUrl>
@@ -108,5 +108,15 @@
         <Private>true</Private>
       </Reference>
     </ItemGroup>
+  </Target>
+  <!-- Fork: PlayerSync.Validation references the VFXEditor submodule, whose VFXEditor.json (a Content item) is copied
+       transitively into our output and then zipped by DalamudPackager. Keep it out of the output and the plugin zip. -->
+  <Target Name="ExcludeVfxEditorManifest" AfterTargets="GetCopyToOutputDirectoryItems">
+    <ItemGroup>
+      <_SourceItemsToCopyToOutputDirectory Remove="@(_SourceItemsToCopyToOutputDirectory)" Condition="'%(Filename)%(Extension)' == 'VFXEditor.json'" />
+      <_TransitiveItemsToCopyToOutputDirectory Remove="@(_TransitiveItemsToCopyToOutputDirectory)" Condition="'%(Filename)%(Extension)' == 'VFXEditor.json'" />
+      <AllItemsFullPathWithTargetPath Remove="@(AllItemsFullPathWithTargetPath)" Condition="'%(Filename)%(Extension)' == 'VFXEditor.json'" />
+    </ItemGroup>
+    <Delete Files="$(OutDir)VFXEditor.json" />
   </Target>
 </Project>

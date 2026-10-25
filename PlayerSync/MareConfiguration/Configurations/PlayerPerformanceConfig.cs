@@ -1,4 +1,6 @@
-﻿using MareSynchronos.MareConfiguration.Models;
+using MareSynchronos.MareConfiguration.Models;
+using MareSynchronos.Services;
+using System.Text.Json.Serialization;
 
 namespace MareSynchronos.MareConfiguration.Configurations;
 
@@ -62,6 +64,10 @@ public class PlayerPerformanceConfig : IMareConfiguration
     public PauseDuration PauseDurationAutoPauseExceedingHeightThresholds { get; set; } = PauseDuration.Indefinitely;
     public bool WarnOnPausedExceedingThresholds { get; set; } = true;
     public bool WarnOnPausedAutoHeightExceedingThreshold { get; set; } = true;
+
+    // Download priority (Priority tab). Fork-only: stored in vierai-config.json, not in this file (see Services/VierAIConfig.cs)
+    [JsonIgnore]
+    public List<string> UIDsToPrioritize { get => VierAIConfigStore.Current.UIDsToPrioritize; set { VierAIConfigStore.Current.UIDsToPrioritize = value ?? new(); VierAIConfigStore.MarkDirty(); } }
 }
 
 public static class PlayerPerformanceConfigExtensions

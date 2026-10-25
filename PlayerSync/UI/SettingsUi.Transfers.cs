@@ -24,6 +24,7 @@ public partial class SettingsUi
         new(TransfersTabs.Bandwidth, "Bandwidth", DrawTransfersBandwidth),
         new(TransfersTabs.Overlay, "Overlay", DrawTransfersOverlay),
         new(TransfersTabs.Preload, "Preload", DrawTransfersPreload),
+        new(TransfersTabs.Priority, "Priority", DrawTransfersPriority),
         new(TransfersTabs.Current, "Current", DrawTransfersCurrent),
     ];
 
@@ -32,6 +33,7 @@ public partial class SettingsUi
         Bandwidth,
         Overlay,
         Preload,
+        Priority,
         Current
     }
 

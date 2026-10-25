@@ -1,4 +1,4 @@
-﻿using MareSynchronos.MareConfiguration;
+using MareSynchronos.MareConfiguration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
@@ -18,7 +18,11 @@ public sealed class MareMediator : IHostedService
     private readonly MareConfigService _mareConfigService;
     private readonly ConcurrentDictionary<Type, HashSet<SubscriberAction>> _subscriberDict = [];
     private bool _processQueue = false;
-    private readonly ConcurrentDictionary<Type, MethodInfo?> _genericExecuteMethods = new();
+    // Fork perf: per message type, a pre-sorted copy of the subscribers (high priority first), rebuilt only when someone
+    // subscribes/unsubscribes, and a typed executor delegate built once per type instead of MethodInfo.Invoke per publish.
+    private readonly ConcurrentDictionary<Type, SubscriberAction[]> _snapshots = new();
+    private readonly ConcurrentDictionary<Type, Action<MareMediator, SubscriberAction[], MessageBase>> _executors = new();
+    private static readonly MethodInfo ExecuteTypedMethod = typeof(MareMediator).GetMethod(nameof(ExecuteTyped), BindingFlags.NonPublic | BindingFlags.Static)!;
     public MareMediator(ILogger<MareMediator> logger, PerformanceCollectorService performanceCollector, MareConfigService mareConfigService)
     {
         _logger = logger;
@@ -106,6 +110,7 @@ public sealed class MareMediator : IHostedService
             {
                 throw new InvalidOperationException("Already subscribed");
             }
+            _snapshots.TryRemove(typeof(T), out _);
         }
     }
 
@@ -116,6 +121,7 @@ public sealed class MareMediator : IHostedService
             if (_subscriberDict.ContainsKey(typeof(T)))
             {
                 _subscriberDict[typeof(T)].RemoveWhere(p => p.Subscriber == subscriber);
+                _snapshots.TryRemove(typeof(T), out _);
             }
         }
     }
@@ -129,6 +135,7 @@ public sealed class MareMediator : IHostedService
                 int unSubbed = _subscriberDict[kvp]?.RemoveWhere(p => p.Subscriber == subscriber) ?? 0;
                 if (unSubbed > 0)
                 {
+                    _snapshots.TryRemove(kvp, out _);
                     _logger.LogDebug("{sub} unsubscribed from {msg}", subscriber.GetType().Name, kvp.Name);
                 }
             }
@@ -137,28 +144,36 @@ public sealed class MareMediator : IHostedService
 
     private void ExecuteMessage(MessageBase message)
     {
-        if (!_subscriberDict.TryGetValue(message.GetType(), out HashSet<SubscriberAction>? subscribers) || subscribers == null || !subscribers.Any()) return;
-
-        List<SubscriberAction> subscribersCopy = [];
-        lock (_addRemoveLock)
-        {
-            subscribersCopy = subscribers?.Where(s => s.Subscriber != null).OrderBy(k => k.Subscriber is IHighPriorityMediatorSubscriber ? 0 : 1).ToList() ?? [];
-        }
-
-#pragma warning disable S3011 // Reflection should not be used to increase accessibility of classes, methods, or fields
         var msgType = message.GetType();
-        if (!_genericExecuteMethods.TryGetValue(msgType, out var methodInfo))
-        {
-            _genericExecuteMethods[msgType] = methodInfo = GetType()
-                 .GetMethod(nameof(ExecuteReflected), BindingFlags.NonPublic | BindingFlags.Instance)?
-                 .MakeGenericMethod(msgType);
-        }
+        var subscribers = GetSnapshot(msgType);
+        if (subscribers.Length == 0) return;
 
-        methodInfo!.Invoke(this, [subscribersCopy, message]);
-#pragma warning restore S3011 // Reflection should not be used to increase accessibility of classes, methods, or fields
+        var executor = _executors.GetOrAdd(msgType, static t =>
+            (Action<MareMediator, SubscriberAction[], MessageBase>)ExecuteTypedMethod.MakeGenericMethod(t)
+                .CreateDelegate(typeof(Action<MareMediator, SubscriberAction[], MessageBase>)));
+        executor(this, subscribers, message);
     }
 
-    private void ExecuteReflected<T>(List<SubscriberAction> subscribers, T message) where T : MessageBase
+    // The snapshot is an immutable array: handlers that subscribe/unsubscribe while a message is being delivered only
+    // affect the next publish (same as the old copy-per-publish). Built and invalidated under _addRemoveLock, so the
+    // subscriber HashSet is never read outside the lock.
+    private SubscriberAction[] GetSnapshot(Type msgType)
+    {
+        if (_snapshots.TryGetValue(msgType, out var snapshot)) return snapshot;
+        lock (_addRemoveLock)
+        {
+            if (_snapshots.TryGetValue(msgType, out snapshot)) return snapshot;
+            snapshot = _subscriberDict.TryGetValue(msgType, out var subscribers) && subscribers != null
+                ? subscribers.Where(s => s.Subscriber != null).OrderBy(k => k.Subscriber is IHighPriorityMediatorSubscriber ? 0 : 1).ToArray()
+                : [];
+            _snapshots[msgType] = snapshot;
+            return snapshot;
+        }
+    }
+
+    private static void ExecuteTyped<T>(MareMediator mediator, SubscriberAction[] subscribers, MessageBase message) where T : MessageBase
+        => mediator.ExecuteReflected(subscribers, (T)message);
+    private void ExecuteReflected<T>(SubscriberAction[] subscribers, T message) where T : MessageBase
     {
         foreach (SubscriberAction subscriber in subscribers)
         {

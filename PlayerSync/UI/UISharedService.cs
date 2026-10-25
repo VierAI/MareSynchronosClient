@@ -1,4 +1,4 @@
-﻿using Dalamud.Bindings.ImGui;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Colors;
 using Dalamud.Interface.GameFonts;
@@ -621,6 +621,10 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
             ColorTextWrapped("Your selected directory contains characters unreadable by FFXIV. " +
                              "Restrict yourself to latin letters (A-Z), and avoid illegal characters (< > : \" | ? *).", ImGuiColors.DalamudRed);
         }
+
+        CacheFolderHealthCheck.DrawWarning(_dalamudUtil.IsWine, _configService.Current.CacheFolder);
+
+        WineAnalysisSetting.Draw(_dalamudUtil.IsWine);
 
         float maxCacheSize = (float)_configService.Current.MaxLocalCacheInGiB;
         if (ImGui.SliderFloat("Maximum Storage Size in GiB", ref maxCacheSize, 1f, 200f, "%.2f GiB"))

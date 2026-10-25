@@ -1,4 +1,4 @@
-﻿using MareSynchronos.API.Data;
+using MareSynchronos.API.Data;
 using MareSynchronos.MareConfiguration;
 using MareSynchronos.Services.Mediator;
 using MareSynchronos.WebAPI.Files.Models;
@@ -18,31 +18,39 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
     private readonly TokenProvider _tokenProvider;
     private readonly object _runningDownloadsLock = new();
     private readonly ConcurrentDictionary<string, DownloadTask> _runningDownloads = new(StringComparer.OrdinalIgnoreCase);
+    private readonly DownloadPriorityQueue _priorityQueue;
+
     private readonly ConcurrentDictionary<string, byte> _hashesReportedError404 = new(StringComparer.OrdinalIgnoreCase);
 
-    // Download slots
+    // Download slots. One semaphore for the life of the orchestrator. Swapping it
+    // leaves a waiter on the old instance and Release on the new one.
+    private const int MaxTransferSlots = 100;
     private readonly object _semaphoreModificationLock = new();
     private int _availableDownloadSlots;
-    private SemaphoreSlim _downloadSemaphore;
-    private int CurrentlyUsedDownloadSlots => _availableDownloadSlots - _downloadSemaphore.CurrentCount;
+    private readonly SemaphoreSlim _downloadSemaphore;
+    private int _downloadSlotsToReclaim;
+    private int CurrentlyUsedDownloadSlots => _availableDownloadSlots - _downloadSemaphore.CurrentCount + _downloadSlotsToReclaim;
 
     // Upload slots
     private readonly object _uploadModificationLock = new();
     private int _availableUploadSlots;
-    private SemaphoreSlim _uploadSemaphore;
-    private int CurrentlyUsedUploadSlots => _availableUploadSlots - _uploadSemaphore.CurrentCount;
+    private readonly SemaphoreSlim _uploadSemaphore;
+    private int _uploadSlotsToReclaim;
+    private int CurrentlyUsedUploadSlots => _availableUploadSlots - _uploadSemaphore.CurrentCount + _uploadSlotsToReclaim;
 
     public FileTransferOrchestrator(ILogger<FileTransferOrchestrator> logger, MareConfigService mareConfig,
-        MareMediator mediator, TokenProvider tokenProvider, HttpClientProvider httpClientProvider) : base(logger, mediator)
+        MareMediator mediator, TokenProvider tokenProvider, HttpClientProvider httpClientProvider, DownloadPriorityQueue priorityQueue) : base(logger, mediator)
     {
+        _priorityQueue = priorityQueue;
+        _priorityQueue.SetSlotAcquirer(() => _downloadSemaphore.Wait(0));
         _mareConfig = mareConfig;
         _tokenProvider = tokenProvider;
         _httpClientProvider = httpClientProvider;
 
-        _availableDownloadSlots = Math.Clamp(mareConfig.Current.ParallelDownloads, 1, 100);
-        _downloadSemaphore = new(_availableDownloadSlots, _availableDownloadSlots);
+        _availableDownloadSlots = Math.Clamp(mareConfig.Current.ParallelDownloads, 1, MaxTransferSlots);
+        _downloadSemaphore = new(_availableDownloadSlots, MaxTransferSlots);
 
-        _availableUploadSlots = Math.Clamp(mareConfig.Current.ParallelUploads, 1, 100);
+        _availableUploadSlots = Math.Clamp(mareConfig.Current.ParallelUploads, 1, MaxTransferSlots);
         // temp for now until a better config validation framework can be worked out
         if (_availableDownloadSlots != mareConfig.Current.ParallelDownloads || _availableUploadSlots != mareConfig.Current.ParallelUploads)
         {
@@ -51,12 +59,17 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
             mareConfig.Save();
         }
 
-        _uploadSemaphore = new(_availableUploadSlots, _availableUploadSlots);
+        _uploadSemaphore = new(_availableUploadSlots, MaxTransferSlots);
 
         Mediator.Subscribe<ConnectedMessage>(this, (msg) =>
         {
             FilesCdnUri = msg.Connection.ServerInfo.FileServerAddress;
         });
+
+        // Priority settings changed or a priority download started/finished: re-evaluate who gets the next slot.
+        Mediator.Subscribe<DownloadLimitChangedMessage>(this, (msg) => _priorityQueue.Pump());
+        // Priority list / tier switches / in-game friends changed: re-tier waiting and running downloads (e.g. someone added to the list while visible).
+        Mediator.Subscribe<PriorityChangedMessage>(this, (msg) => _priorityQueue.Retier("a priority settings or friends change"));
 
         Mediator.Subscribe<DisconnectedMessage>(this, (msg) =>
         {
@@ -91,28 +104,66 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
         }
     }
 
-    public void ReleaseDownloadSlot()
+    /// <param name="key">The key (file hash) that was passed to <see cref="WaitForDownloadSlotAsync"/>.</param>
+    public void ReleaseDownloadSlot(string? key = null)
     {
-        try
-        {
-            _downloadSemaphore.Release();
+        _priorityQueue.OnSlotReleased(key);
+        var released = ReleaseTransferSlot(_semaphoreModificationLock, _downloadSemaphore, ref _availableDownloadSlots, ref _downloadSlotsToReclaim, _mareConfig.Current.ParallelDownloads);
+        _priorityQueue.Pump();
+        if (released)
             Mediator.Publish(new DownloadLimitChangedMessage());
-        }
-        catch (SemaphoreFullException)
-        {
-            // ignore
-        }
     }
 
     public void ReleaseUploadSlot()
     {
-        try
+        ReleaseTransferSlot(_uploadModificationLock, _uploadSemaphore, ref _availableUploadSlots, ref _uploadSlotsToReclaim, _mareConfig.Current.ParallelUploads);
+    }
+
+    private static void ApplyTransferLimit(SemaphoreSlim semaphore, ref int currentLimit, ref int slotsToReclaim, int configured)
+    {
+        var desired = Math.Clamp(configured, 1, MaxTransferSlots);
+        var delta = desired - currentLimit;
+        if (delta == 0) return;
+
+        if (delta > 0)
         {
-            _uploadSemaphore.Release();
+            var restore = Math.Min(delta, slotsToReclaim);
+            slotsToReclaim -= restore;
+            var releaseCount = delta - restore;
+            if (releaseCount > 0)
+                semaphore.Release(releaseCount);
         }
-        catch (SemaphoreFullException)
+        else
         {
-            // ignore
+            var toRemove = -delta;
+            while (toRemove > 0 && semaphore.Wait(0))
+                toRemove--;
+            slotsToReclaim += toRemove;
+        }
+
+        currentLimit = desired;
+    }
+
+    private static bool ReleaseTransferSlot(object gate, SemaphoreSlim semaphore, ref int currentLimit, ref int slotsToReclaim, int configured)
+    {
+        lock (gate)
+        {
+            ApplyTransferLimit(semaphore, ref currentLimit, ref slotsToReclaim, configured);
+            if (slotsToReclaim > 0)
+            {
+                slotsToReclaim--;
+                return true;
+            }
+
+            try
+            {
+                semaphore.Release();
+                return true;
+            }
+            catch (SemaphoreFullException)
+            {
+                return false;
+            }
         }
     }
 
@@ -144,7 +195,7 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
     /// <param name="statusCallback">A callback that is invoked when the status of the file download changes.</param>
     /// <param name="downloadFunc">The function to actually perform the download.</param>
     /// <returns>A Task that can be used to wait for the download to complete.</returns>
-    public Task GetOrStartDownloadTask(string hash, EventHandler<long> progressCallback, Action<DownloadStatus> statusCallback, Func<string, IProgress<long>, Action<DownloadStatus>, Task> downloadFunc)
+    public Task GetOrStartDownloadTask(string hash, EventHandler<long> progressCallback, Action<DownloadStatus> statusCallback, Func<string, IProgress<long>, Action<DownloadStatus>, Task> downloadFunc, int tier = PriorityTiers.Everyone, MareSynchronos.PlayerData.Pairs.Pair? pair = null)
     {
         DownloadTask result;
         bool joined;
@@ -154,6 +205,7 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
             if (_runningDownloads.TryGetValue(hash, out var active))
             {
                 result = active;
+                if (tier < PriorityTiers.Everyone || pair != null) _priorityQueue.Promote(hash, tier, pair); // fork: priority tiers
                 result.Progress.ProgressChanged += progressCallback;
                 result.StatusUpdated += statusCallback;
                 joined = true;
@@ -221,19 +273,29 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
         return await SendRequestInternalAsync(requestMessage, ct, withToken: withToken).ConfigureAwait(false);
     }
 
-    public async Task WaitForDownloadSlotAsync(CancellationToken token)
+    /// <summary>
+    /// Waits for a download slot through the priority queue. Priority downloads are handed free slots first.
+    /// </summary>
+    /// <param name="key">Identifies the download (the file hash). Pass the same key to <see cref="ReleaseDownloadSlot"/>.</param>
+    public async Task WaitForDownloadSlotAsync(string key, int tier, CancellationToken token, MareSynchronos.PlayerData.Pairs.Pair? pair = null)
     {
         lock (_semaphoreModificationLock)
         {
-            if (_availableDownloadSlots != _mareConfig.Current.ParallelDownloads && _availableDownloadSlots == _downloadSemaphore.CurrentCount)
-            {
-                _availableDownloadSlots = _mareConfig.Current.ParallelDownloads;
-                _downloadSemaphore = new(_availableDownloadSlots, _availableDownloadSlots);
-            }
+            ApplyTransferLimit(_downloadSemaphore, ref _availableDownloadSlots, ref _downloadSlotsToReclaim, _mareConfig.Current.ParallelDownloads);
         }
 
-        await _downloadSemaphore.WaitAsync(token).ConfigureAwait(false);
+        await _priorityQueue.WaitForSlotAsync(key, tier, token, pair).ConfigureAwait(false);
         Mediator.Publish(new DownloadLimitChangedMessage());
+    }
+
+    public int GetTier(DownloadBatchInfo batch) => _priorityQueue.GetTier(batch);
+
+    /// <summary>
+    /// The speed limit in bytes per second for the download with this key (same for every tier).
+    /// </summary>
+    public long DownloadLimitFor(string? key)
+    {
+        return DownloadLimitPerSlot();
     }
 
     public long DownloadLimitPerSlot()
@@ -262,13 +324,9 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
 
     public async Task WaitForUploadSlotAsync(CancellationToken token)
     {
-        lock (_semaphoreModificationLock)
+        lock (_uploadModificationLock)
         {
-            if (_availableUploadSlots != _mareConfig.Current.ParallelUploads && _availableUploadSlots == _uploadSemaphore.CurrentCount)
-            {
-                _availableUploadSlots = _mareConfig.Current.ParallelUploads;
-                _uploadSemaphore = new(_availableUploadSlots, _availableUploadSlots);
-            }
+            ApplyTransferLimit(_uploadSemaphore, ref _availableUploadSlots, ref _uploadSlotsToReclaim, _mareConfig.Current.ParallelUploads);
         }
 
         await _uploadSemaphore.WaitAsync(token).ConfigureAwait(false);

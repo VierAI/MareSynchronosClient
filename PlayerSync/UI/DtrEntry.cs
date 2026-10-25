@@ -123,7 +123,7 @@ public sealed class DtrEntry : IDisposable, IHostedService
         SeStringBuilder textBuilder = new SeStringBuilder();
         if (_apiController.IsConnected)
         {
-            tooltip = "PlayerSync: Connected";
+            tooltip = "PlayerSync (VierAI-fied): Connected";
 
             // Add the broadcast info
             if (_broadcastManager.IsListening)
@@ -171,7 +171,7 @@ public sealed class DtrEntry : IDisposable, IHostedService
         else
         {
             textBuilder.AddColoredText("\uE044 \uE04C", _configService.Current.UseColorsInDtr ? _configService.Current.DtrColorsNotConnected : default);
-            tooltip = "PlayerSync: Not Connected";
+            tooltip = "PlayerSync (VierAI-fied): Not Connected";
         }
 
         _entry.Value.Text = textBuilder.Build();

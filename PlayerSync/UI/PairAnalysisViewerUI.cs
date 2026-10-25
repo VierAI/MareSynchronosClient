@@ -1,4 +1,4 @@
-﻿using Dalamud.Bindings.ImGui;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Colors;
 using Dalamud.Interface.Utility;
@@ -325,7 +325,7 @@ internal class PairAnalysisViewerUI : WindowMediatorSubscriberBase
                         }
                         int cmp = sortBy switch
                         {
-                            SortByID.Sound => Nullable.Compare(a.LastLoadedSoundSinceRedrawTime, b.LastLoadedSoundSinceRedrawTime),
+                            SortByID.Sound => Nullable.Compare(a.SoundStateSince, b.SoundStateSince),
                             SortByID.UID => string.Compare(a.UserData.UID, b.UserData.UID, StringComparison.OrdinalIgnoreCase),
                             SortByID.Name => string.Compare(a.PlayerName ?? "", b.PlayerName ?? "", StringComparison.OrdinalIgnoreCase),
                             SortByID.FileSize => a.LastAppliedDataBytes.CompareTo(b.LastAppliedDataBytes),
@@ -480,7 +480,9 @@ internal class PairAnalysisViewerUI : WindowMediatorSubscriberBase
                     else
                     {
                         TableHelper.CText(mypaddedfilesize, centerHorizontally: true);
-                        UiSharedService.AttachToolTip($"Compression redirects: {compressionRedirects[pair]} (Go to Settings > Performance to manage automatic compression)");
+                        UiSharedService.AttachToolTip($"Compression redirects: {compressionRedirects[pair]} (Go to Settings > Performance to manage automatic compression)"
+                            + (MareSynchronos.Services.TextureCap.TextureCapService.Instance?.GetStats(pair.UserData.UID) is { SavedBytes: > 0 } capStats
+                                ? $"\nTexture size cap: {capStats.Swapped} smaller texture(s), {UiSharedService.ByteToString(capStats.SavedBytes)} VRAM saved" : string.Empty));
                     }
 
                     // VRAM Column 
@@ -534,22 +536,22 @@ internal class PairAnalysisViewerUI : WindowMediatorSubscriberBase
                     ImGui.TableSetColumnIndex(6);
                     ImGui.AlignTextToFramePadding();
                     float cellWidth2 = ImGui.GetColumnWidth();
-                    Vector2 iconSize2 = ImGui.CalcTextSize(FontAwesomeIcon.VolumeOff.ToIconString()); // approximate width of icon
+                    Vector2 iconSize2 = ImGui.CalcTextSize(SoundActivity.SpeakerIcon(pair).ToIconString()); // approximate width of icon
                     float indent2 = (cellWidth2 - iconSize2.X) * 0.5f;
                     ImGui.SetCursorPosX(ImGui.GetCursorPosX() + indent2);
 
-                    if (pair.LastLoadedSoundSinceRedrawTime != null)
+                    if (pair.SoundStateSince != null)
                     {
-                        var timepassed = DateTimeOffset.UtcNow - pair.LastLoadedSoundSinceRedrawTime.Value;
+                        var timepassed = DateTimeOffset.UtcNow - pair.SoundStateSince.Value;
 
-                        FontAwesomeIcon icon = FontAwesomeIcon.VolumeOff;
+                        FontAwesomeIcon icon = SoundActivity.SpeakerIcon(pair);
 
-                        var color = UiSharedService.TimePassedIconColor(timepassed);                 
+                        var color = SoundActivity.IconColor(pair, timepassed);                 
 
                         _uiSharedService.IconText(icon, color);
 
                         UiSharedService.AttachToolTip(
-                            $"Started playing modded audio {UiSharedService.ApproxElapsedTimeToString(timepassed)}." +
+                            SoundActivity.Describe(pair, timepassed) +
                             $"{UiSharedService.TooltipSeparator}CTRL + Click to disable sound sync with {pair.UserData.AliasOrUID}."
                         );
 

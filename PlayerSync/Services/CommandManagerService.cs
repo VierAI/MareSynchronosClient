@@ -1,4 +1,4 @@
-﻿using Dalamud.Game.Command;
+using Dalamud.Game.Command;
 using Dalamud.Plugin.Services;
 using MareSynchronos.FileCache;
 using MareSynchronos.MareConfiguration;

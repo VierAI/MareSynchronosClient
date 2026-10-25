@@ -1,4 +1,4 @@
-﻿using MareSynchronos.MareConfiguration;
+using MareSynchronos.MareConfiguration;
 using MareSynchronos.Utils;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -24,6 +24,7 @@ public sealed class PerformanceCollectorService : IHostedService
 
     public T LogPerformance<T>(object sender, MareInterpolatedStringHandler counterName, Func<T> func, int maxEntries = 10000)
     {
+        MareInterpolatedStringHandler.Enabled = _mareConfigService.Current.LogPerformance;
         if (!_mareConfigService.Current.LogPerformance) return func.Invoke();
 
         string cn = sender.GetType().Name + _counterSplit + counterName.BuildMessage();
@@ -51,6 +52,7 @@ public sealed class PerformanceCollectorService : IHostedService
 
     public void LogPerformance(object sender, MareInterpolatedStringHandler counterName, Action act, int maxEntries = 10000)
     {
+        MareInterpolatedStringHandler.Enabled = _mareConfigService.Current.LogPerformance;
         if (!_mareConfigService.Current.LogPerformance) { act.Invoke(); return; }
 
         var cn = sender.GetType().Name + _counterSplit + counterName.BuildMessage();

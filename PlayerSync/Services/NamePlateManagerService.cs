@@ -49,15 +49,22 @@ namespace PlayerSync.Services
             return Task.CompletedTask;
         }
 
+        private readonly Dictionary<nint, Pair> _visibleByAddress = new();
+
         private void UpdateNamePlate(INamePlateUpdateContext context, IReadOnlyList<INamePlateUpdateHandler> handlers)
         {
             if (!(_configService.Current.ShowPairedIndicator 
                 || _configService.Current.ShowPermsInsteadOfFCTags 
                 || _configService.Current.ShowSoundSourceIndicator
+                || _configService.Current.NamePlatePairedSoundIndicator
                 || _configService.Current.ShowNameHighlights)) return;
 
+            // Fork perf: skip the plate loop when no pair is in view, and reuse one dictionary instead of allocating per update.
             var visiblePairs = _pairs.GetVisiblePairs();
-            Dictionary<nint, Pair> visibleByAddress = new();
+            if (visiblePairs.Count == 0 || handlers.Count == 0) return;
+
+            var visibleByAddress = _visibleByAddress;
+            visibleByAddress.Clear();
             foreach (var pair in visiblePairs)
             {
                 var address = pair.Address;
@@ -65,8 +72,10 @@ namespace PlayerSync.Services
                 {
                     continue;
                 }
-                visibleByAddress.Add(address, pair);
+                visibleByAddress[address] = pair;
             }
+
+            if (visibleByAddress.Count == 0) return;
 
             foreach (var handle in handlers)
             {
@@ -109,6 +118,8 @@ namespace PlayerSync.Services
                     fcTagBuilder.Append(" ⇔");
                     fcTagBuilder.AddUiForegroundOff();
                 }
+
+                MareSynchronos.Services.SoundActivity.AppendNamePlateSpeaker(fcTagBuilder, pair, _configService.Current);
 
                 handle.FreeCompanyTag = fcTagBuilder.Build();
 

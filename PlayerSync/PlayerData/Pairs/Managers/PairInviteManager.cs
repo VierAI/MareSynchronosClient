@@ -1,10 +1,11 @@
-﻿using Dalamud.Game.Gui.ContextMenu;
+using Dalamud.Game.Gui.ContextMenu;
 using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Plugin.Services;
 using MareSynchronos.API.Data;
 using MareSynchronos.API.Dto.Group;
 using MareSynchronos.API.Dto.User;
 using MareSynchronos.MareConfiguration;
+using MareSynchronos.PlayerData.Handlers;
 using MareSynchronos.Services;
 using MareSynchronos.Services.Mediator;
 using MareSynchronos.Services.ServerConfiguration;
@@ -179,7 +180,7 @@ namespace MareSynchronos.PlayerData.Pairs
             if (args.AddonName != null) return; // This should prevent most game windows from registering
 
             var target = _dalamudUtilService.SoftTargetAddress != nint.Zero ? _dalamudUtilService.SoftTargetAddress : _dalamudUtilService.TargetAddress;
-            if (target == nint.Zero) return;
+            if (target == nint.Zero || !_dalamudUtilService.IsLiveObject(target)) return;
 
             // don't add menu to self
             if (_dalamudUtilService.GetPlayerPtr() == target) return;
@@ -195,6 +196,14 @@ namespace MareSynchronos.PlayerData.Pairs
 
             var targetIdent = _dalamudUtilService.GetHashedCIDFromPlayerPointer(target);
             if (targetIdent == null) return;
+
+            // Fork: Send Pair Request lives in the Pair Data submenu for synced players; Reapply Last Data takes its spot (PairMenuSwap)
+            var visiblePair = _pairManager.GetVisiblePairs().FirstOrDefault(p => p.Address == target);
+            if (PairMenuSwap.Applies(visiblePair, _configurationService))
+            {
+                if (_apiController.IsConnected) PairMenuSwap.AddTopLevelReapply(args, visiblePair!, _configurationService);
+                return;
+            }
 
             try
             {

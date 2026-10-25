@@ -7,6 +7,9 @@
     internal class ThrottledStream : Stream
     {
         public static long Infinite => long.MaxValue;
+
+        /// <summary>Optional caller tag, used to look up per-download limits (the file hash).</summary>
+        public string? Tag { get; init; }
         private readonly Stream _baseStream;
         private long _bandwidthLimit;
         private Bandwidth _bandwidth;

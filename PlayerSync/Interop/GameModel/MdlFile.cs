@@ -51,7 +51,7 @@ public class MdlFile
 
     public MdlFile(string filePath)
     {
-        using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read);
+        using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         using var r = new LuminaBinaryReader(stream);
 
         var header = LoadModelFileHeader(r);

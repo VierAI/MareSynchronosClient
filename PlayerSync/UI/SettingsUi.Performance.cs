@@ -21,13 +21,15 @@ public partial class SettingsUi
             new(PerformanceTabs.Texture, "Auto Texture Compression", DrawPerformanceTextureCompression),
             new(PerformanceTabs.Threshold, "Auto Threshold Pausing", DrawPerformanceThresholdPausing),
             new(PerformanceTabs.Height, "Auto Height Pausing", DrawPerformanceHeightPausing),
+            new(PerformanceTabs.TextureCap, "Texture Size Cap", DrawPerformanceTextureCap),
         ];
 
     private enum PerformanceTabs
     {
         Texture,
         Threshold,
-        Height
+        Height,
+        TextureCap,
     }
 
     private void DrawPerformanceSettings()

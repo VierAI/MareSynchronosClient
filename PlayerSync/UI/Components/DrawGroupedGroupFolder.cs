@@ -1,4 +1,4 @@
-﻿using Dalamud.Bindings.ImGui;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Utility.Raii;
 using MareSynchronos.UI.Handlers;
@@ -61,7 +61,8 @@ public class DrawGroupedGroupFolder : IDrawFolder
                 ImGui.TextUnformatted("[" + OnlinePairs.ToString() + "]");
             }
             UiSharedService.AttachToolTip(OnlinePairs + " online in all of your joined syncshells" + Environment.NewLine +
-                TotalPairs + " pairs combined in all of your joined syncshells");
+                TotalPairs + " pairs combined in all of your joined syncshells"
+                + (SyncshellUniqueCount.Enabled ? Environment.NewLine + SyncshellUniqueCount.LastTotal + " people you only reach through a single syncshell" : string.Empty)); // fork
             ImGui.SameLine();
             ImGui.AlignTextToFramePadding();
             ImGui.TextUnformatted($"All Syncshells {_joinedGroups.ToString()}/{_maxJoinGroups.ToString()}");

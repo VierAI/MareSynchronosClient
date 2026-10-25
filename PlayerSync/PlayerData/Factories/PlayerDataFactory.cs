@@ -383,6 +383,7 @@ public class PlayerDataFactory : DisposableMediatorSubscriberBase
     private async Task VerifyPlayerAnimationBones(Dictionary<string, List<ushort>>? boneIndices, CharacterDataFragmentPlayer fragment, CancellationToken ct)
     {
         if (boneIndices == null) return;
+        if (WineAnalysisSetting.ShouldSkip(_dalamudUtil.IsWine)) { _logger.LogDebug("Skipping animation bone check (Wine setting)"); return; }
 
         foreach (var kvp in boneIndices)
         {

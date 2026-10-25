@@ -1,6 +1,7 @@
 using Dalamud.Bindings.ImGui;
 using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Interface.Colors;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Windowing;
 using MareSynchronos.MareConfiguration;
 using MareSynchronos.PlayerData.Handlers;
@@ -21,16 +22,19 @@ public class DownloadUi : WindowMediatorSubscriberBase
     private readonly DalamudUtilService _dalamudUtilService;
     private readonly FileUploadManager _fileTransferManager;
     private readonly UiSharedService _uiShared;
+    private readonly DownloadPriorityQueue _priorityQueue;
     private readonly ConcurrentDictionary<GameObjectHandler, bool> _uploadingPlayers = new();
 
     public DownloadUi(ILogger<DownloadUi> logger, DalamudUtilService dalamudUtilService, MareConfigService configService,
-        FileUploadManager fileTransferManager, MareMediator mediator, UiSharedService uiShared, PerformanceCollectorService performanceCollectorService)
+        FileUploadManager fileTransferManager, MareMediator mediator, UiSharedService uiShared, PerformanceCollectorService performanceCollectorService,
+        DownloadPriorityQueue priorityQueue)
         : base(logger, mediator, "PlayerSync Downloads", performanceCollectorService)
     {
         _dalamudUtilService = dalamudUtilService;
         _configService = configService;
         _fileTransferManager = fileTransferManager;
         _uiShared = uiShared;
+        _priorityQueue = priorityQueue;
 
         SizeConstraints = new WindowSizeConstraints
         {
@@ -107,7 +111,9 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
             try
             {
-                foreach (var item in _currentDownloads)
+                // Only transfers that are actually running are listed; everyone else is counted in the summary line below.
+                var rows = ActiveRows(out var waitingCount);
+                foreach (var item in rows)
                 {
                     var dlSlot = item.Value.Count(c => c.Value.DownloadStatus == DownloadStatus.WaitingForSlot);
                     var dlQueue = item.Value.Count(c => c.Value.DownloadStatus == DownloadStatus.WaitingForQueue);
@@ -122,13 +128,19 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     ImGui.SameLine();
                     var xDistance = ImGui.GetCursorPosX();
                     UiSharedService.DrawOutlinedFont(
-                        $"{item.Key.DisplayName} [W:{dlSlot}/Q:{dlQueue}/P:{dlProg}/D:{dlDecomp}]",
+                        $"{BatchName(item.Key)} [W:{dlSlot}/Q:{dlQueue}/P:{dlProg}/D:{dlDecomp}]",
                         ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
                     ImGui.NewLine();
                     ImGui.SameLine(xDistance);
                     UiSharedService.DrawOutlinedFont(
                         $"{transferredFiles}/{totalFiles} ({UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)})",
                         ImGuiColors.DalamudWhite, new Vector4(0, 0, 0, 255), 1);
+                }
+
+                var summary = WaitingSummaryText(waitingCount);
+                if (summary != null)
+                {
+                    UiSharedService.DrawOutlinedFont(summary, ImGuiColors.DalamudGrey, new Vector4(0, 0, 0, 255), 1);
                 }
             }
             catch
@@ -179,9 +191,15 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
                         if (_configService.Current.TransferBarsShowText)
                         {
-                            var downloadText = $"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}";
+                            // Fork: once bytes have moved, keep showing progress while the next file group waits for a slot (no 'Waiting' flash between groups).
+                            var isActive = transferredBytes > 0 || transfer.Value.Any(c => c.Value.DownloadStatus is DownloadStatus.Downloading or DownloadStatus.Decompressing);
+                            var downloadText = isActive
+                                ? $"{UiSharedService.ByteToString(transferredBytes, addSuffix: false)}/{UiSharedService.ByteToString(totalBytes)}"
+                                : "Waiting";
+                            // Center the text actually drawn (textSize is the widest possible text, which left-shifts 'Waiting').
+                            var drawnSize = ImGui.CalcTextSize(downloadText);
                             UiSharedService.DrawOutlinedFont(drawList, downloadText,
-                                screenPos with { X = screenPos.X - textSize.X / 2f - 1, Y = screenPos.Y - textSize.Y / 2f - 1 },
+                                screenPos with { X = screenPos.X - drawnSize.X / 2f - 1, Y = screenPos.Y - drawnSize.Y / 2f - 1 },
                                 UiSharedService.Color(255, 255, 255, transparency),
                                 UiSharedService.Color(0, 0, 0, transparency), 1);
                         }
@@ -250,11 +268,88 @@ public class DownloadUi : WindowMediatorSubscriberBase
             Flags |= ImGuiWindowFlags.NoResize;
         }
 
-        var maxHeight = ImGui.GetTextLineHeight() * (_configService.Current.ParallelDownloads + 3);
+        // Size the window from its content: 2 lines per transfer, 2 for uploads, widest line, all scaled by the UI scale.
+        var scale = ImGuiHelpers.GlobalScale;
+        var width = 300f * scale;
+        var lines = 0;
+        var extra = 0f;
+        try
+        {
+            if (_configService.Current.ShowTransferWindow)
+            {
+                var uploads = _fileTransferManager.CurrentUploadList.Count;
+                if (uploads > 0)
+                {
+                    lines += 2;
+                    width = Math.Max(width, ImGui.CalcTextSize($"Compressing+Uploading {uploads}/{uploads}").X);
+                    if (_currentDownloads.Any()) extra += 8f * scale;
+                }
+
+                var rows = ActiveRows(out var waitingCount);
+                foreach (var item in rows)
+                {
+                    lines += 2;
+                    width = Math.Max(width, ImGui.CalcTextSize($"{BatchName(item.Key)} [W:999/Q:999/P:999/D:999]").X);
+                }
+
+                if (WaitingSummaryText(waitingCount) is { } summaryText)
+                {
+                    lines += 1;
+                    width = Math.Max(width, ImGui.CalcTextSize(summaryText).X);
+                }
+            }
+        }
+        catch
+        {
+            // ignore errors thrown from UI
+        }
+
+        if (_uiShared.EditTrackerPosition) lines = Math.Max(lines, 4);
+        lines = Math.Max(lines, 2);
+        var height = ImGui.GetTextLineHeightWithSpacing() * (lines + 0.5f) + ImGui.GetStyle().WindowPadding.Y * 2 + extra;
+        width += ImGui.GetStyle().WindowPadding.X * 2 + 4f;
         SizeConstraints = new()
         {
-            MinimumSize = new Vector2(300, maxHeight),
-            MaximumSize = new Vector2(300, maxHeight),
+            MinimumSize = new Vector2(width, height),
+            MaximumSize = new Vector2(width, height),
         };
+    }
+
+    // The transfers shown in the list: batches with a file downloading or decompressing right now (at most ParallelDownloads).
+    // Everything else (waiting for a slot) is only counted.
+    private List<KeyValuePair<DownloadBatchInfo, ConcurrentDictionary<string, FileDownloadStatus>>> ActiveRows(out int waiting)
+    {
+        var rows = new List<KeyValuePair<DownloadBatchInfo, ConcurrentDictionary<string, FileDownloadStatus>>>();
+        waiting = 0;
+        var cap = Math.Max(1, _configService.Current.ParallelDownloads);
+        foreach (var item in _currentDownloads)
+        {
+            // Fork: a started transfer stays listed between file groups instead of dropping to '+N waiting' for a moment.
+            var active = item.Value.Any(c => c.Value.DownloadStatus is DownloadStatus.Downloading or DownloadStatus.Decompressing)
+                || item.Value.Sum(c => c.Value.TransferredBytes) > 0;
+            if (active && rows.Count < cap) rows.Add(item);
+            else waiting++;
+        }
+
+        return rows;
+    }
+
+    // "+N waiting"; null when nobody is waiting.
+    private string? WaitingSummaryText(int waiting)
+    {
+        if (waiting <= 0) return null;
+        return $"+{waiting} waiting";
+    }
+
+    // The batch's DisplayName is the character name captured when the download started. It can still be empty then
+    // (the handler fills its name on a later frame), so fall back to the live handler name, then the pair.
+    private static string BatchName(DownloadBatchInfo batch)
+    {
+        if (!string.IsNullOrWhiteSpace(batch.DisplayName)) return batch.DisplayName;
+        var live = batch.GameObject?.Name;
+        if (!string.IsNullOrWhiteSpace(live)) return live;
+        var pairName = batch.Pair?.PlayerName;
+        if (!string.IsNullOrWhiteSpace(pairName)) return pairName;
+        return batch.Pair?.UserData.AliasOrUID ?? batch.DisplayType;
     }
 }

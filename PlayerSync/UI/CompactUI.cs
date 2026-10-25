@@ -53,6 +53,7 @@ public class CompactUi : WindowMediatorSubscriberBase
     private List<IDrawFolder> _drawFolders;
     private DrawFolderBroadcasts? _broadcastsFolder;
     private DrawFolderStages _stagesFolder;
+    private DrawFolderNoises _noisesFolder;
     private Pair? _lastAddedUser;
     private string _lastAddedUserComment = string.Empty;
     private Vector2 _lastPosition = Vector2.One;
@@ -128,15 +129,16 @@ public class CompactUi : WindowMediatorSubscriberBase
 
         _drawFolders = GetDrawFolders().ToList();
         _stagesFolder = _drawEntityFactory.CreateDrawFolderStages();
+        _noisesFolder = new DrawFolderNoises(_tagHandler, _uiSharedService, _pairManager, Mediator, _configService, _apiController);
 
         string ver = _uiSharedService.Version;
 
 #if DEBUG
         string dev = "Dev Build";
-        WindowName = $"PlayerSync {dev} ({ver})###PlayerSyncMainUI";
+        WindowName = $"PlayerSync (VierAI-fied) {dev} ({ver}-VierAI)###PlayerSyncMainUI";
         Toggle();
 #else
-        WindowName = "PlayerSync " + ver + "###PlayerSyncMainUI";
+        WindowName = "PlayerSync (VierAI-fied) " + ver + "-VierAI###PlayerSyncMainUI";
 #endif
         Mediator.Subscribe<SwitchToMainUiMessage>(this, (_) => IsOpen = true);
         Mediator.Subscribe<SwitchToIntroUiMessage>(this, (_) => IsOpen = false);
@@ -293,6 +295,8 @@ public class CompactUi : WindowMediatorSubscriberBase
         {
             _stagesFolder.Draw();
         }
+
+        _noisesFolder.Draw(); // 1.15.5.910: draws nothing while nobody is making noise
 
         foreach (var item in _drawFolders)
         {

@@ -1,4 +1,4 @@
-﻿using Dalamud.Utility;
+using Dalamud.Utility;
 using K4os.Compression.LZ4.Legacy;
 using MareSynchronos.API.Data;
 using MareSynchronos.API.Dto.Files;
@@ -63,11 +63,11 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     return;
                 }
 
-                var newLimit = _orchestrator.DownloadLimitPerSlot();
                 var changedStreams = 0;
 
                 foreach (var stream in _activeDownloadStreams)
                 {
+                    var newLimit = _orchestrator.DownloadLimitFor(stream.Tag); // fork: tier-aware limit
                     if (stream.BandwidthLimit == newLimit)
                     {
                         continue;
@@ -78,7 +78,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                 if (changedStreams > 0)
                 {
-                    Logger.LogTrace("Set Download Speed Limit to {newLimit} for {count} active streams", newLimit, changedStreams);
+                    Logger.LogTrace("Updated download speed limits for {count} active streams", changedStreams);
                 }
             }
         });
@@ -88,7 +88,29 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     public List<FileTransfer> ForbiddenTransfers => _orchestrator.ForbiddenTransfers;
 
-    public bool IsDownloading => !CurrentDownloads.Any();
+    // Fork bug fix: was inverted (!Any).
+    public bool IsDownloading
+    {
+        get
+        {
+            lock (_downloadInfoLock)
+            {
+                return CurrentDownloads.Count > 0;
+            }
+        }
+    }
+
+    // Fork bug fix: one failed or cancelled file no longer clears the whole batch list.
+    private void RemoveDownload(DownloadFileTransfer download)
+    {
+        lock (_downloadInfoLock)
+        {
+            CurrentDownloads.Remove(download);
+        }
+
+        if (!string.IsNullOrEmpty(download.DirectDownloadUrl))
+            _downloadStatus.TryRemove(download.DirectDownloadUrl, out _);
+    }
 
     public static void MungeBuffer(Span<byte> buffer)
     {
@@ -257,16 +279,16 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         ThrottledStream? stream = null;
         try
         {
-            var fileStream = File.Create(destinationFilename);
+            var fileStream = LowPriorityFile.Create(destinationFilename); // fork: low-priority I/O (Wine)
             await using (fileStream.ConfigureAwait(false))
             {
                 var bufferSize = response.Content.Headers.ContentLength > 1024 * 1024 ? 65536 : 8196;
                 var buffer = new byte[bufferSize];
 
                 var bytesRead = 0;
-                var limit = _orchestrator.DownloadLimitPerSlot();
+                var limit = _orchestrator.DownloadLimitFor(fileHash);
                 Logger.LogTrace("Starting Download with a speed limit of {limit} to {tempPath}", limit, destinationFilename);
-                stream = new ThrottledStream(await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false), limit);
+                stream = new ThrottledStream(await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false), limit) { Tag = fileHash };
 
                 lock (_downloadInfoLock)
                 {
@@ -338,6 +360,14 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         [
             .. await FilesGetSizes(fileHashes, storeId, ct).ConfigureAwait(false),
         ];
+
+        // Security fix: every hash the server sends ends up in a file path; drop entries with a malformed hash.
+        var invalidHashCount = downloadFileInfoFromService.RemoveAll(f => !FileCacheManager.IsValidFileHash(f.Hash)
+            || (f.CompressedAlternateFileDownload != null && !FileCacheManager.IsValidFileHash(f.CompressedAlternateFileDownload.Hash)));
+        if (invalidHashCount > 0)
+        {
+            Logger.LogWarning("Skipped {count} download entries with an invalid file hash from the server for {id}", invalidHashCount, debugName);
+        }
 
         Logger.LogDebug("Files with size 0 or less: {files}", string.Join(", ", downloadFileInfoFromService.Where(f => f.Size <= 0).Select(f => f.Hash)));
 
@@ -437,6 +467,11 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
         Mediator.Publish(new DownloadStartedMessage(batchInfo, _downloadStatus));
 
+        // Fork: priority tier of this batch (UID list, in-game friends, direct syncs, everyone else)
+        var batchTier = _orchestrator.GetTier(batchInfo);
+        Logger.LogInformation("Priority tier {tier} ({tierName}) for {name} ({uid}): {count} file(s)", batchTier, PriorityTiers.Name(batchTier),
+            batchInfo.DisplayName, batchInfo.Pair?.UserData.AliasOrUID ?? "-", directDownloads.Count);
+
         // Start downloading each of the direct downloads
         var directDownloadsTask = directDownloads.Count == 0 ? Task.CompletedTask : Parallel.ForEachAsync(directDownloads, new ParallelOptions()
         {
@@ -453,19 +488,26 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 (status) => downloadTracker.DownloadStatus = status,
                 async (hash, progress, statusCallback) =>
                 {
-                    try
+                    if (!FileCacheManager.IsValidFileHash(directDownload.Hash))
                     {
-                        statusCallback.Invoke(DownloadStatus.WaitingForSlot);
-                        await _orchestrator.WaitForDownloadSlotAsync(token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException ex)
-                    {
-                        Logger.LogDebug("{hash}: Detected cancellation of file queued for direct download, canceling.", directDownload.Hash);
-                        ClearDownload();
+                        Logger.LogWarning("Skipping direct download with an invalid file hash");
+                        RemoveDownload(directDownload);
                         return;
                     }
 
-                    var tempFilename = _fileDbManager.GetCacheFilePath(directDownload.Hash, $"{Guid.NewGuid():N}.bin");
+                    try
+                    {
+                        statusCallback.Invoke(DownloadStatus.WaitingForSlot);
+                        await _orchestrator.WaitForDownloadSlotAsync(directDownload.Hash, batchTier, token, batchInfo.Pair).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        Logger.LogDebug("{hash}: Detected cancellation of file queued for direct download, canceling.", directDownload.Hash);
+                        RemoveDownload(directDownload);
+                        return;
+                    }
+
+                    var tempFilename = _fileDbManager.GetCacheTempFilePath(directDownload.Hash);
                     try
                     {
                         // Download the compressed file directly
@@ -495,18 +537,18 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     catch (OperationCanceledException ex)
                     {
                         Logger.LogDebug("{hash}: Detected cancellation of direct download, discarding file.", directDownload.Hash);
-                        _orchestrator.ReleaseDownloadSlot();
+                        _orchestrator.ReleaseDownloadSlot(directDownload.Hash);
                         DeleteTemporaryDownloadFile(tempFilename);
                         Logger.LogDebug(ex, "{hash}: Error during direct download.", directDownload.Hash);
-                        ClearDownload();
+                        RemoveDownload(directDownload);
                         return;
                     }
                     catch (Exception ex)
                     {
-                        _orchestrator.ReleaseDownloadSlot();
+                        _orchestrator.ReleaseDownloadSlot(directDownload.Hash);
                         DeleteTemporaryDownloadFile(tempFilename);
                         Logger.LogError(ex, "{hash}: Error during direct download.", directDownload.Hash);
-                        ClearDownload();
+                        RemoveDownload(directDownload);
                         return;
                     }
 
@@ -515,10 +557,16 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
                     try
                     {
-                        var fileExtension = fileReplacement.First(f => string.Equals(compressionSubstitutions.GetValueOrDefault(f.Hash, f.Hash), directDownload.Hash, StringComparison.OrdinalIgnoreCase)).GamePaths[0].Split(".")[^1];
+                        var fileExtension = fileReplacement.First(f => string.Equals(compressionSubstitutions.GetValueOrDefault(f.Hash, f.Hash), directDownload.Hash, StringComparison.OrdinalIgnoreCase)).GamePaths[0].Split(".")[^1].ToLowerInvariant();
+                        // Security fix: the extension comes from the pair's game path; never let it reach the file system unchecked.
+                        if (!FileCacheManager.IsSafeCacheExtension(fileExtension))
+                        {
+                            Logger.LogWarning("Skipping download of {hash}: unsafe file extension in the pair's game path", directDownload.Hash);
+                            return;
+                        }
                         var finalFilename = _fileDbManager.GetCacheFilePath(directDownload.Hash, fileExtension);
                         Logger.LogDebug("Decompressing direct download {hash} from {compressedFile} to {finalFile}", directDownload.Hash, tempFilename, finalFilename);
-                        byte[] compressedBytes = await File.ReadAllBytesAsync(tempFilename).ConfigureAwait(false);
+                        byte[] compressedBytes = await LowPriorityFile.ReadAllBytesAsync(tempFilename, token).ConfigureAwait(false);
                         var decompressedBytes = LZ4Wrapper.Unwrap(compressedBytes);
                         var downloadedHash = Convert.ToHexString(SHA1.HashData(decompressedBytes));
                         if (!string.Equals(downloadedHash, directDownload.Hash, StringComparison.OrdinalIgnoreCase))
@@ -537,11 +585,11 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     }
                     finally
                     {
-                        _orchestrator.ReleaseDownloadSlot();
+                        _orchestrator.ReleaseDownloadSlot(directDownload.Hash);
                         DeleteTemporaryDownloadFile(tempFilename);
                     }
 
-                }).ConfigureAwait(true);
+                }, batchTier, batchInfo.Pair).ConfigureAwait(true);
             downloadTracker.TransferredFiles = 1;
         });
 

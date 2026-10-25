@@ -1,13 +1,13 @@
 {
   "Author": "The PlayerSync Team",
-  "Name": "PlayerSync",
-  "Punchline": "Let others see you as you see yourself.",
-  "Description": "This plugin will synchronize your Penumbra mods and current Glamourer state with other paired clients automatically.",
+  "Name": "PlayerSync (VierAI-fied)",
+  "Punchline": "!!! YOU MUST UNINSTALL THE OFFICIAL PLAYERSYNC FIRST !!! Let others see you as you see yourself. Unofficial VierAI-fied build (AI generated code).",
+  "Description": "!!! YOU MUST UNINSTALL THE OFFICIAL PLAYERSYNC FIRST !!!\n\nThis plugin will synchronize your Penumbra mods and current Glamourer state with other paired clients automatically.\n\nPlayerSync by the PlayerSync Team - VierAI-fied\n\nForked from the official PlayerSync (https://github.com/universalconquistador/MareSynchronosClient). AI generated code: unofficial build, not supported by the original authors.\n\nAdded:\n- Noises window: see and mute who is playing modded sounds\n- Download priority tiers (friends and direct pairs first)\n- Texture size cap for tiny models (off by default)\n- Syncshell count of members only reachable through that shell\n- Faster pair loading spread across frames\n\nFixed:\n- Half-loaded players (Customize+ and Heels)\n- Music and sound not returning after unmute\n- Endless retry loop after Penumbra restarts\n- Wine/macOS file reads\n- Server file hash and path validation",
   "InternalName": "MareSempiterne",
   "ApplicableVersion": "any",
   "Tags": [
     "customization"
   ],
-  "IconUrl": "https://maresempiterne.io/download/plugin/icon.png",
-  "RepoUrl": ""
+  "IconUrl": "https://raw.githubusercontent.com/VierAI/MareSynchronosClient/vierai/images/icon.png",
+  "RepoUrl": "https://github.com/VierAI/MareSynchronosClient"
 }

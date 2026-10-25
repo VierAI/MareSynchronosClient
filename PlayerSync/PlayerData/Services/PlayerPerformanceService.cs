@@ -208,6 +208,7 @@ public class PlayerPerformanceService
                 }
                 fileSize = fileEntry.Size;
             }
+            fileSize = MareSynchronos.Services.TextureCap.TextureCapService.Instance?.AdjustVramSize(pair.UserData, hash, fileSize) ?? fileSize; // fork: texture size cap
             vramUsage += fileSize;
         }
 
@@ -280,8 +281,14 @@ public class PlayerPerformanceService
         var pauseRspExceeded = false;
 
         // grab player data from glamourer string
-        _logger.LogTrace("Glamourer Dictionary: {data}", charaData.GlamourerData[API.Data.Enum.ObjectKind.Player].ToString());
-        var (race, gender, height) = GlamourerDecoder.GetRaceAndGender(charaData.GlamourerData[API.Data.Enum.ObjectKind.Player].ToString());
+        // some pairs send no glamourer data for the Player object kind; nothing to measure, so let the data apply
+        if (!charaData.GlamourerData.TryGetValue(API.Data.Enum.ObjectKind.Player, out var glamourerPlayerData) || string.IsNullOrEmpty(glamourerPlayerData))
+        {
+            _logger.LogDebug("No glamourer Player data for {name}, skipping RSP height check", pair.PlayerName);
+            return true;
+        }
+        _logger.LogTrace("Glamourer Dictionary: {data}", glamourerPlayerData);
+        var (race, gender, height) = GlamourerDecoder.GetRaceAndGender(glamourerPlayerData);
         _logger.LogTrace("Glamourer data: {race} {gender}", race, gender);
 
         // grab rsp data from penumbra manip string

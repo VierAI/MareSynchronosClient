@@ -1,4 +1,4 @@
-﻿using MareSynchronos.MareConfiguration;
+using MareSynchronos.MareConfiguration;
 using MareSynchronos.Services;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
@@ -18,13 +18,15 @@ public sealed class FileCompactor
 
     private readonly MareConfigService _mareConfigService;
     private readonly DalamudUtilService _dalamudUtilService;
+    private readonly BackgroundDiskWorker _disk;
 
-    public FileCompactor(ILogger<FileCompactor> logger, MareConfigService mareConfigService, DalamudUtilService dalamudUtilService)
+    public FileCompactor(ILogger<FileCompactor> logger, MareConfigService mareConfigService, DalamudUtilService dalamudUtilService, BackgroundDiskWorker disk)
     {
         _clusterSizes = new(StringComparer.Ordinal);
         _logger = logger;
         _mareConfigService = mareConfigService;
         _dalamudUtilService = dalamudUtilService;
+        _disk = disk;
         _efInfo = new WOF_FILE_COMPRESSION_INFO_V1
         {
             Algorithm = CompressionAlgorithm.XPRESS8K,
@@ -49,21 +51,31 @@ public sealed class FileCompactor
     public void CompactStorage(bool compress)
     {
         MassCompactRunning = true;
-
-        int currentFile = 1;
-        var allFiles = Directory.EnumerateFiles(_mareConfigService.Current.CacheFolder).ToList();
-        int allFilesCount = allFiles.Count;
-        foreach (var file in allFiles)
+        try
         {
-            Progress = $"{currentFile}/{allFilesCount}";
-            if (compress)
-                CompactFile(file);
-            else
-                DecompressFile(file);
-            currentFile++;
-        }
+            var allFiles = Directory.EnumerateFiles(_mareConfigService.Current.CacheFolder).ToList();
+            var tasks = new Task[allFiles.Count];
+            for (var i = 0; i < allFiles.Count; i++)
+            {
+                var index = i + 1;
+                var path = allFiles[i];
+                tasks[i] = _disk.RunIdleAsync(() =>
+                {
+                    Progress = $"{index}/{allFiles.Count}";
+                    if (compress)
+                        CompactFile(path);
+                    else
+                        DecompressFile(path);
+                });
+            }
 
-        MassCompactRunning = false;
+            Task.WaitAll(tasks);
+        }
+        finally
+        {
+            MassCompactRunning = false;
+            Progress = string.Empty;
+        }
     }
 
     public long GetFileSizeOnDisk(FileInfo fileInfo, bool? isNTFS = null)
@@ -87,20 +99,26 @@ public sealed class FileCompactor
         return ((size + clusterSize - 1) / clusterSize) * clusterSize;
     }
 
-    public async Task WriteAllBytesAsync(string filePath, byte[] decompressedFile, CancellationToken token)
+    public Task WriteAllBytesAsync(string filePath, byte[] decompressedFile, CancellationToken token)
     {
-        await File.WriteAllBytesAsync(filePath, decompressedFile, token).ConfigureAwait(false);
-
-        if (_dalamudUtilService.IsWine || !_mareConfigService.Current.UseCompactor)
-        {
-            return;
-        }
-
-        CompactFile(filePath);
+        return _disk.RunAsync(() => WriteAllBytes(filePath, decompressedFile), token);
     }
 
-    [DllImport("kernel32.dll")]
-    private static extern int DeviceIoControl(IntPtr hDevice, uint dwIoControlCode, IntPtr lpInBuffer, uint nInBufferSize, IntPtr lpOutBuffer, uint nOutBufferSize, out IntPtr lpBytesReturned, out IntPtr lpOverlapped);
+    public void WriteAllBytes(string filePath, byte[] decompressedFile)
+    {
+        LowPriorityFile.WriteAllBytes(filePath, decompressedFile);
+
+        if (_dalamudUtilService.IsWine || !_mareConfigService.Current.UseCompactor)
+            return;
+
+        // Compact after download writes drain. Do not await: this method runs on the disk thread,
+        // and waiting for idle work there would deadlock the worker.
+        var path = filePath;
+        _ = _disk.RunIdleAsync(() => CompactFile(path));
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern int DeviceIoControl(IntPtr hDevice, uint dwIoControlCode, IntPtr lpInBuffer, uint nInBufferSize, IntPtr lpOutBuffer, uint nOutBufferSize, out uint lpBytesReturned, IntPtr lpOverlapped);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern uint GetCompressedFileSizeW([In, MarshalAs(UnmanagedType.LPWStr)] string lpFileName,
@@ -158,12 +176,14 @@ public sealed class FileCompactor
         _logger.LogDebug("Removing compression from {file}", path);
         try
         {
-            using (var fs = new FileStream(path, FileMode.Open))
+            // Default FileStream is ReadWrite with Share.Read, which blocks the validation read.
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
             {
+                LowPriorityFile.TrySetVeryLow(fs.SafeFileHandle);
 #pragma warning disable S3869 // "SafeHandle.DangerousGetHandle" should not be called
                 var hDevice = fs.SafeFileHandle.DangerousGetHandle();
 #pragma warning restore S3869 // "SafeHandle.DangerousGetHandle" should not be called
-                _ = DeviceIoControl(hDevice, FSCTL_DELETE_EXTERNAL_BACKING, nint.Zero, 0, nint.Zero, 0, out _, out _);
+                _ = DeviceIoControl(hDevice, FSCTL_DELETE_EXTERNAL_BACKING, nint.Zero, 0, nint.Zero, 0, out _, nint.Zero);
             }
         }
         catch (Exception ex)
@@ -201,8 +221,10 @@ public sealed class FileCompactor
         ulong length = (ulong)Marshal.SizeOf(_efInfo);
         try
         {
-            using (var fs = new FileStream(path, FileMode.Open))
+            // Share the file so validation can read it while WOF still holds the handle.
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
             {
+                LowPriorityFile.TrySetVeryLow(fs.SafeFileHandle);
 #pragma warning disable S3869 // "SafeHandle.DangerousGetHandle" should not be called
                 var hFile = fs.SafeFileHandle.DangerousGetHandle();
 #pragma warning restore S3869 // "SafeHandle.DangerousGetHandle" should not be called

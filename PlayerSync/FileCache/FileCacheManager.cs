@@ -1200,7 +1200,8 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
 
         var originalPath = ResolveFilePathFromFileStore(fileCache.Store, fileCache.FilePathWithinFileStore);
         var normalizedExtension = ext.Trim().TrimStart('.').ToLowerInvariant();
-        if (string.IsNullOrWhiteSpace(normalizedExtension))
+        // Security fix: the extension comes from a pair's game path; same allow-list as GetCacheFilePath.
+        if (string.IsNullOrWhiteSpace(normalizedExtension) || !IsSafeCacheExtension(normalizedExtension))
         {
             throw new ArgumentException("A valid file extension must be provided.", nameof(ext));
         }
@@ -1307,8 +1308,55 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
     /// <returns>The full file path on disk</returns>
     public string GetCacheFilePath(string hash, string extension)
     {
+        // Security fix: hash and extension come from the server / other pairs. Only a 40-char hex hash and a short
+        // alphanumeric extension are allowed, and the result must stay inside the cache folder.
+        if (!IsValidFileHash(hash))
+        {
+            throw new InvalidDataException("Refusing cache file path: invalid file hash");
+        }
+        var safeExtension = extension?.ToLowerInvariant() ?? string.Empty;
+        if (!IsSafeCacheExtension(safeExtension))
+        {
+            throw new InvalidDataException("Refusing cache file path: unsafe file extension");
+        }
+
         // Local storage uses lowercase file names, while server DTOs use uppercase hashes.
-        return Path.Combine(_configService.Current.CacheFolder, hash.ToLowerInvariant() + "." + extension);
+        return EnsureInsideCacheFolder(Path.Combine(_configService.Current.CacheFolder, hash.ToLowerInvariant() + "." + safeExtension));
+    }
+
+    /// <summary>Temporary download file for <paramref name="hash"/> inside the cache folder (hash validated).</summary>
+    public string GetCacheTempFilePath(string hash)
+    {
+        if (!IsValidFileHash(hash))
+        {
+            throw new InvalidDataException("Refusing temp file path: invalid file hash");
+        }
+
+        return EnsureInsideCacheFolder(Path.Combine(_configService.Current.CacheFolder, hash.ToLowerInvariant() + "." + Guid.NewGuid().ToString("N") + ".bin"));
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex s_fileHashRegex = new("^[0-9A-Fa-f]{40}\\z", System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    private static readonly System.Text.RegularExpressions.Regex s_cacheExtensionRegex = new("^[a-z0-9]{1,8}\\z", System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    /// <summary>True for a 40-character hex (SHA1) file hash.</summary>
+    public static bool IsValidFileHash(string? hash) => hash != null && s_fileHashRegex.IsMatch(hash);
+
+    /// <summary>True for a lowercase alphanumeric extension of 1-8 characters (no dots or path separators).</summary>
+    public static bool IsSafeCacheExtension(string? extension) => extension != null && s_cacheExtensionRegex.IsMatch(extension);
+
+    private string EnsureInsideCacheFolder(string path)
+    {
+        var root = Path.GetFullPath(_configService.Current.CacheFolder);
+        if (!root.EndsWith(Path.DirectorySeparatorChar) && !root.EndsWith(Path.AltDirectorySeparatorChar))
+        {
+            root += Path.DirectorySeparatorChar;
+        }
+        var full = Path.GetFullPath(path);
+        if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("Refusing file path outside the cache folder");
+        }
+        return full;
     }
 
     /// <summary>

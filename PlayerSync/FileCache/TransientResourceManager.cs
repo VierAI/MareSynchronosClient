@@ -1,4 +1,4 @@
-﻿using MareSynchronos.API.Data.Enum;
+using MareSynchronos.API.Data.Enum;
 using MareSynchronos.MareConfiguration;
 using MareSynchronos.MareConfiguration.Configurations;
 using MareSynchronos.PlayerData.Data;
@@ -309,27 +309,27 @@ public sealed class TransientResourceManager : DisposableMediatorSubscriberBase
 
     private void Manager_PenumbraResourceLoadEvent(PenumbraResourceLoadMessage msg)
     { 
-        var gamePath = msg.GamePath.ToLowerInvariant();
         var gameObjectAddress = msg.GameObject;
 
+        // Fork perf: owner check first, so loads for untracked objects don't allocate a lowercased path.
         var owner = _playerRelatedPointers.Keys.FirstOrDefault(handler => handler.Address == gameObjectAddress && gameObjectAddress != nint.Zero);
         if (owner == null)
         {
             return;
         }
 
+        var gamePath = msg.GamePath.ToLowerInvariant();
+
         var objectKind = owner.ObjectKind;
         var filePath = msg.FilePath;
 
-        // ignore files already processed this frame
-        if (_cachedHandledPaths.Contains((objectKind, gamePath)))
-        {
-            return;
-        }
-
+        // ignore files already processed this frame (fork: check-and-add under the lock; loads also arrive off the framework thread)
         lock (_cacheAdditionLock)
         {
-            _cachedHandledPaths.Add((objectKind, gamePath));
+            if (!_cachedHandledPaths.Add((objectKind, gamePath)))
+            {
+                return;
+            }
         }
 
         // replace individual mtrl stuff

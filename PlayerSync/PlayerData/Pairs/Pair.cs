@@ -1,4 +1,4 @@
-﻿using MareSynchronos.API.Data;
+using MareSynchronos.API.Data;
 using MareSynchronos.API.Data.Enum;
 using MareSynchronos.API.Data.Extensions;
 using MareSynchronos.API.Dto.User;
@@ -69,6 +69,37 @@ public class Pair
     public string LastLoadedSoundSinceRedraw { get; set; } = string.Empty;
     public string HashedCID => _onlineUserIdentDto?.Ident ?? string.Empty;
     public ulong ContendId => CachedPlayer?.ContentId ?? 0;
+
+    // Fork: sound activity state machine, see Services/SoundActivity.cs.
+    private DateTimeOffset? _soundStateSince;
+    /// <summary>When the current sound state began: sound load while ACTIVE, or the start of the fade. Setting null resets the sound state.</summary>
+    public DateTimeOffset? SoundStateSince
+    {
+        get => _soundStateSince;
+        set
+        {
+            _soundStateSince = value;
+            if (value == null)
+            {
+                SoundState = MareSynchronos.Services.SoundState.None;
+                SoundLoopHasSound = false;
+                SoundLastLoadAt = null;
+            }
+        }
+    }
+    public MareSynchronos.Services.SoundState SoundState { get; set; } = MareSynchronos.Services.SoundState.None;
+    public bool SoundInLoop { get; set; }
+    public bool SoundLoopHasSound { get; set; }
+    /// <summary>Fork: was making noise when muted (for the unmute restore mark).</summary>
+    public bool SoundNoisyAtMute { get; set; }
+    /// <summary>Fork: .scd game paths in the pair's last applied data; loads outside it are not their own sound (null = nothing applied yet).</summary>
+    public HashSet<string>? SoundOwnScdPaths { get; set; }
+    public DateTimeOffset? SoundLastLoadAt { get; set; }
+    /// <summary>Fork 1205: last loaded sound was sustained (looping or long).</summary>
+    public bool SoundLastLoadSustained { get; set; }
+    /// <summary>Fork 1205: ACTIVE from one-shot sounds ends at this time (null = sustained, lasts while emoting).</summary>
+    public DateTimeOffset? SoundActiveUntil { get; set; }
+    public long SoundNextPollTick { get; set; }
     public nint Address => CachedPlayer?.PlayerCharacter ?? nint.Zero;
     public UserData UserData => UserPair.User;
     public ulong PlayerCharacterId => CachedPlayer?.PlayerCharacterId ?? ulong.MaxValue;
@@ -201,6 +232,13 @@ public class Pair
         }
 
         return DataHandler.ApplyCharacterDataAsync(applicationBase, data.CharaData, sequence, topLevelToken, forced);
+    }
+
+    /// <summary>Reapply Last Data from a menu or button: forced, and never skipped by the duplicate-apply debounce.</summary>
+    public void ReapplyCachedDataByUser()
+    {
+        DataHandler?.ForkBypassDebounceOnce();
+        ReapplyCachedData(forced: true);
     }
 
     public void ReapplyCachedData(bool forced = false)

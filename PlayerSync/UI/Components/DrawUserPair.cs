@@ -1,4 +1,4 @@
-﻿using Dalamud.Bindings.ImGui;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Colors;
 using Dalamud.Interface.Utility;
@@ -138,7 +138,7 @@ public class DrawUserPair
         {
             if (_uiSharedService.IconTextButton(FontAwesomeIcon.Sync, "Reload last data", _menuWidth, true))
             {
-                _pair.ReapplyCachedData(forced: true);
+                _pair.ReapplyCachedDataByUser();
                 ImGui.CloseCurrentPopup();
             }
             UiSharedService.AttachToolTip("This reapplies the last received character data to this character");
@@ -730,19 +730,19 @@ public class DrawUserPair
             }
         }
 
-        if (Pair.LastLoadedSoundSinceRedrawTime != null)
+        if (Pair.SoundStateSince != null)
         {
             var individualSoundsDisabled = (_pair.UserPair?.OwnPermissions.IsDisableSounds() ?? false) || (_pair.UserPair?.OtherPermissions.IsDisableSounds() ?? false);
             var individualAnimDisabled = (_pair.UserPair?.OwnPermissions.IsDisableAnimations() ?? false) || (_pair.UserPair?.OtherPermissions.IsDisableAnimations() ?? false);
             var individualVFXDisabled = (_pair.UserPair?.OwnPermissions.IsDisableVFX() ?? false) || (_pair.UserPair?.OtherPermissions.IsDisableVFX() ?? false);
             var individualIsSticky = _pair.UserPair!.OwnPermissions.IsSticky();
             var individualIcon = individualIsSticky ? FontAwesomeIcon.ArrowCircleUp : FontAwesomeIcon.InfoCircle;
-            var timepassed = DateTimeOffset.UtcNow - Pair.LastLoadedSoundSinceRedrawTime.Value;
+            var timepassed = DateTimeOffset.UtcNow - Pair.SoundStateSince.Value;
 
-            FontAwesomeIcon icon = FontAwesomeIcon.VolumeOff;
+            FontAwesomeIcon icon = SoundActivity.SpeakerIcon(Pair);
             float iconspacing = _uiSharedService.GetIconSize(individualIcon).X + spacingX;
 
-            var color = UiSharedService.TimePassedIconColor(timepassed);
+            var color = SoundActivity.IconColor(Pair, timepassed);
             if (individualAnimDisabled || individualSoundsDisabled || individualVFXDisabled || individualIsSticky)
             {
                 ImGui.SameLine(currentRightSide);
@@ -757,7 +757,7 @@ public class DrawUserPair
             _uiSharedService.IconText(icon, color);
 
             UiSharedService.AttachToolTip(
-                $"Started playing modded audio {UiSharedService.ApproxElapsedTimeToString(timepassed)}." +
+                SoundActivity.Describe(Pair, timepassed) +
                 $"{UiSharedService.TooltipSeparator}CTRL + Click to disable sound sync with {Pair.UserData.AliasOrUID}."
             );
 

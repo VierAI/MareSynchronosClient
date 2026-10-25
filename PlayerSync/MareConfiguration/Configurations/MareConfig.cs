@@ -1,8 +1,10 @@
-﻿using MareSynchronos.MareConfiguration.Models;
+using MareSynchronos.MareConfiguration.Models;
 using MareSynchronos.UI;
 using Microsoft.Extensions.Logging;
 using MareSynchronos.PlayerData.Handlers;
 using MareSynchronos.Services.Models;
+using MareSynchronos.Services;
+using System.Text.Json.Serialization;
 
 namespace MareSynchronos.MareConfiguration.Configurations;
 
@@ -88,6 +90,11 @@ public class MareConfig : IMareConfiguration
     public string OverrideCdnTimeZoneId { get; set; } = string.Empty;
     public bool IgnoreWarningOverrideCdnTimeZone { get; set; } = false;
     public bool ShowSoundSourceIndicator { get; set; } = true;
+    // Fork-only: stored in vierai-config.json, not in this file (see Services/VierAIConfig.cs)
+    [JsonIgnore]
+    public bool NamePlatePairedSoundIndicator { get => VierAIConfigStore.Current.NamePlatePairedSoundIndicator; set { VierAIConfigStore.Current.NamePlatePairedSoundIndicator = value; VierAIConfigStore.MarkDirty(); } }
+    [JsonIgnore]
+    public bool ShowNoiseMakersWindow { get => VierAIConfigStore.Current.ShowNoiseMakersWindow; set { VierAIConfigStore.Current.ShowNoiseMakersWindow = value; VierAIConfigStore.MarkDirty(); } }
     public bool ShowPairedIndicator { get; set; } = false;
     public bool ShowPermsInsteadOfFCTags { get; set; } = false;
     public SeStringTextColors PermsColorsEnabled { get; set; } = new(Foreground: 0x00FF00u, Glow: 0x010101u);

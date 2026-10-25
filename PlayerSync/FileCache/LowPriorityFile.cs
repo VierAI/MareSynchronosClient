@@ -1,0 +1,171 @@
+using Microsoft.Win32.SafeHandles;
+using System.Runtime.InteropServices;
+
+namespace MareSynchronos.FileCache;
+
+/// <summary>
+/// File helpers whose reads and writes are issued at very low I/O priority and in small chunks,
+/// so the game's normal-priority reads can be served while a download is hitting the disk.
+/// </summary>
+public static class LowPriorityFile
+{
+    private const int FileIoPriorityHintInfoClass = 12;
+    private const int IoPriorityHintVeryLow = 0;
+    private const int ChunkSize = 64 * 1024;
+
+    // Under Wine (macOS/Linux) the overlapped file I/O and the I/O-priority hint are not reliable ("General failure",
+    // runtime handle errors seen with 1.15.5.909), so Wine always uses plain synchronous I/O. Windows behaviour is unchanged.
+    private static readonly bool s_isWine = DetectWine();
+
+    /// <summary>True when running under Wine (macOS/Linux). Used to pick plain synchronous file I/O.</summary>
+    public static bool IsWine => s_isWine;
+
+    private static bool DetectWine()
+    {
+        try { return Dalamud.Utility.Util.IsWine(); }
+        catch { return false; }
+    }
+
+    public static FileStream Create(string path)
+    {
+        return Open(path, FileMode.Create, FileAccess.Write, FileShare.None, FileOptions.SequentialScan);
+    }
+
+    public static FileStream OpenRead(string path)
+    {
+        return Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, FileOptions.SequentialScan);
+    }
+
+    public static byte[] ReadAllBytes(string path)
+    {
+        using var stream = Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, FileOptions.SequentialScan);
+        var size = checked((int)stream.Length);
+        var result = new byte[size];
+        var offset = 0;
+        while (offset < size)
+        {
+            var read = stream.Read(result, offset, Math.Min(ChunkSize, size - offset));
+            if (read == 0)
+                break;
+            offset += read;
+        }
+
+        if (offset == size)
+            return result;
+
+        Array.Resize(ref result, offset);
+        return result;
+    }
+
+    public static Task<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
+    {
+        if (s_isWine)
+        {
+            // Plain synchronous read on a thread pool thread: no FileOptions.Asynchronous, no overlapped I/O, no priority hint.
+            return Task.Run(() => ReadAllBytesPlain(path), cancellationToken);
+        }
+
+        return ReadAllBytesAsyncCore(path, cancellationToken);
+    }
+
+    private static byte[] ReadAllBytesPlain(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 4096, FileOptions.None);
+        var size = checked((int)stream.Length);
+        var result = new byte[size];
+        var offset = 0;
+        while (offset < size)
+        {
+            var read = stream.Read(result, offset, size - offset);
+            if (read == 0)
+                break;
+            offset += read;
+        }
+
+        if (offset != size)
+            Array.Resize(ref result, offset);
+        return result;
+    }
+
+    private static async Task<byte[]> ReadAllBytesAsyncCore(string path, CancellationToken cancellationToken)
+    {
+        await using var stream = Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var size = checked((int)stream.Length);
+        var result = new byte[size];
+        var offset = 0;
+        while (offset < size)
+        {
+            var read = await stream.ReadAsync(result.AsMemory(offset, Math.Min(ChunkSize, size - offset)), cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+                break;
+            offset += read;
+        }
+
+        if (offset == size)
+            return result;
+
+        Array.Resize(ref result, offset);
+        return result;
+    }
+
+    public static void WriteAllBytes(string path, ReadOnlySpan<byte> data)
+    {
+        if (!s_isWine)
+        {
+            WriteChunked(path, data);
+            return;
+        }
+
+        try
+        {
+            WriteChunked(path, data);
+        }
+        catch (IOException)
+        {
+            // Wine "General failure" on the chunked stream: one retry with the plain framework call.
+            File.WriteAllBytes(path, data.ToArray());
+        }
+    }
+
+    private static void WriteChunked(string path, ReadOnlySpan<byte> data)
+    {
+        using var stream = Create(path);
+        while (data.Length > 0)
+        {
+            var count = Math.Min(ChunkSize, data.Length);
+            stream.Write(data[..count]);
+            data = data[count..];
+        }
+    }
+
+    public static void TrySetVeryLow(SafeFileHandle handle)
+    {
+        if (handle.IsInvalid)
+            return;
+
+        var info = new FileIoPriorityHintInfo { PriorityHint = IoPriorityHintVeryLow };
+        _ = SetFileInformationByHandle(handle, FileIoPriorityHintInfoClass, ref info, Marshal.SizeOf<FileIoPriorityHintInfo>());
+    }
+
+    private static FileStream Open(string path, FileMode mode, FileAccess access, FileShare share, FileOptions options)
+    {
+        if (s_isWine)
+        {
+            // Never request overlapped I/O or the low-priority hint under Wine.
+            return new FileStream(path, mode, access, share, ChunkSize, options & ~FileOptions.Asynchronous);
+        }
+
+        var stream = new FileStream(path, mode, access, share, ChunkSize, options);
+        TrySetVeryLow(stream.SafeFileHandle);
+        return stream;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileIoPriorityHintInfo
+    {
+        public int PriorityHint;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetFileInformationByHandle(SafeFileHandle hFile, int fileInformationClass, ref FileIoPriorityHintInfo lpFileInformation, int dwBufferSize);
+}

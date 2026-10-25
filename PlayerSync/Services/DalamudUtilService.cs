@@ -1,4 +1,4 @@
-﻿using Dalamud.Game.ClientState.Conditions;
+using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Plugin.Services;
@@ -33,7 +33,7 @@ using TargetType = MareSynchronos.Services.Models.TargetType;
 
 namespace MareSynchronos.Services;
 
-public class DalamudUtilService : IHostedService, IMediatorSubscriber
+public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
 {
     public readonly record struct ObjectTablePlayersFrameworkUpdate(ulong ContentId, string Ident, string Name, bool IsVisible);
 
@@ -561,6 +561,10 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         {
             ptr = GetPlayerCharacter().Address;
         }
+        else if (LiveObjectIndex(ptr.Value) < 0)
+        {
+            return string.Empty; // fork crash fix: stale address (despawn/DC hop)
+        }
 
         return ((BattleChara*)ptr)->Character.ContentId.ToString().GetHash256();
     }
@@ -582,6 +586,8 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         {
             return IntPtr.Zero;
         }
+
+        if (LiveObjectIndex(playerPointer.Value) < 0) return IntPtr.Zero; // fork crash fix: stale address
 
         var mgr = CharacterManager.Instance();
         if ((IntPtr)mgr == IntPtr.Zero)
@@ -626,6 +632,8 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         {
             return IntPtr.Zero;
         }
+
+        if (LiveObjectIndex(playerPointer.Value) < 0) return IntPtr.Zero; // fork crash fix: stale address
 
         if (_classJobIdsIgnoredForPets.Contains(((Character*)playerPointer.Value)->CharacterData.ClassJob))
         {
@@ -873,6 +881,12 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         }).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Completes after the next framework tick (Dalamud IFramework.DelayTicks). Unlike RunOnFrameworkThread, this never runs
+    /// inline, so work done after it starts on a later frame than work done before it.
+    /// </summary>
+    public Task WaitFrameworkTicksAsync(long ticks = 1, CancellationToken cancellationToken = default) => _framework.DelayTicks(ticks, cancellationToken);
+
     public async Task<T> RunOnFrameworkThread<T>(Func<T> func, [CallerMemberName] string callerMember = "", [CallerFilePath] string callerFilePath = "", [CallerLineNumber] int callerLineNumber = 0)
     {
         var fileName = Path.GetFileNameWithoutExtension(callerFilePath);
@@ -1106,6 +1120,8 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         });
     }
 
+    private const int MaxNewFrameworkCharactersPerFrame = 8;
+
     private unsafe void ScanFrameworkCharacters()
     {
         EnsureIsOnFramework();
@@ -1122,6 +1138,7 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         if (objectTableAvailable)
         {
             nint localPlayerAddress = localPlayer!.Address;
+            int newCharactersThisFrame = 0;
             for (int i = 0; i < 199; i += 2) // we only scan players here
             {
                 if (_objectTable[i] is not IBattleChara chara || chara.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc || !chara.IsValid())
@@ -1141,12 +1158,19 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
                     continue;
                 }
 
-                _playersSeenThisFrame.Add(contentId);
-
                 if (!_frameworkCharacters.ContainsKey(contentId))
                 {
+                    // Fork perf (login / plugin start / busy zones): hash at most a few new players per frame. The rest are
+                    // treated as not seen yet and picked up on the next frames, so their pair setup is spread out too.
+                    if (newCharactersThisFrame >= MaxNewFrameworkCharactersPerFrame)
+                    {
+                        continue;
+                    }
+                    newCharactersThisFrame++;
                     _frameworkCharacters.Add(contentId, (contentId.ToString().GetHash256(), chara.Name.ToString()));
                 }
+
+                _playersSeenThisFrame.Add(contentId);
             }
         }
 
@@ -1258,8 +1282,12 @@ public class DalamudUtilService : IHostedService, IMediatorSubscriber
         }
     }
 
+    /// <summary>Fork perf: incremented once at the start of every framework update; lets callers cache per-frame results.</summary>
+    public long FrameworkUpdateCount { get; private set; }
+
     private unsafe void FrameworkOnUpdate(IFramework framework)
     {
+        FrameworkUpdateCount++;
         bool isNormalFrameworkUpdate = DateTime.UtcNow < _delayedFrameworkUpdateCheck.AddSeconds(1);
 
         ScanFrameworkCharacters(); // check if we see/don't see players around us and let PairManager know

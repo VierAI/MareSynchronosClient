@@ -1,6 +1,7 @@
-﻿using Dalamud.Plugin;
+using Dalamud.Plugin;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using MareSynchronos.MareConfiguration.Models;
+using MareSynchronos.PlayerData.Handlers;
 using MareSynchronos.Services;
 using MareSynchronos.Services.Mediator;
 using Microsoft.Extensions.Logging;
@@ -81,6 +82,8 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
 
         CheckAPI();
         CheckModDirectory();
+
+        Mediator.Subscribe<FrameworkUpdateMessage>(this, (_) => { if (!_pendingSoundLoads.IsEmpty) DrainPendingSoundLoads(); });
 
         Mediator.Subscribe<PenumbraRedrawCharacterMessage>(this, (msg) =>
         {
@@ -364,17 +367,49 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
 
     private void ResourceLoaded(IntPtr ptr, string arg1, string arg2)
     {
-        if (ptr != IntPtr.Zero && string.Compare(arg1, arg2, ignoreCase: true, System.Globalization.CultureInfo.InvariantCulture) != 0)
+        // Fork perf: this fires for every redirected file load. Cheap checks first, ordinal compare instead of culture-aware.
+        if (ptr == IntPtr.Zero || string.Equals(arg1, arg2, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
         {
             _mareMediator.Publish(new PenumbraResourceLoadMessage(ptr, arg1, arg2));
-            if (_dalamudUtil.IsOnFrameworkThread && arg1.EndsWith(".scd", StringComparison.OrdinalIgnoreCase))
+            bool isSound = arg1.EndsWith(".scd", StringComparison.OrdinalIgnoreCase);
+            if (!isSound)
+            {
+                return;
+            }
+
+            if (!_dalamudUtil.IsOnFrameworkThread)
+            {
+                // Bug fix: sounds embedded in a VFX (.avfx sub-files) are loaded off the game thread; they used to be dropped,
+                // so a DJ whose music is played by a VFX never showed up in Noises. Queue them for the next framework tick.
+                if (PairSoundRouter.HasAnyHandler && _pendingSoundLoads.Count < 256) _pendingSoundLoads.Enqueue((ptr, arg1, arg2));
+            }
+            else if (PairSoundRouter.HasAnyHandler)
             {
                 ulong contentId = _dalamudUtil.GetContentIdForObjectAddressOnFramework(ptr);
-                if (contentId != 0)
+                // Fork perf: straight to that player's PairHandler (if any) instead of every PairHandler.
+                if (contentId != 0 && PairSoundRouter.HasHandler(contentId))
                 {
-                    _mareMediator.Publish(new PenumbraSoundResourceLoadMessage(contentId, arg2));
+                    PairSoundRouter.Dispatch(new PenumbraSoundResourceLoadMessage(contentId, arg2, arg1));
                 }
             }
+        }
+    }
+
+    private readonly System.Collections.Concurrent.ConcurrentQueue<(nint Ptr, string GamePath, string FilePath)> _pendingSoundLoads = new();
+
+    /// <summary>Attributes queued off-thread .scd loads on the framework thread (no work when the queue is empty).</summary>
+    private void DrainPendingSoundLoads()
+    {
+        while (_pendingSoundLoads.TryDequeue(out var load))
+        {
+            // A stale address simply matches no visible player (the lookup compares against the live object table).
+            ulong contentId = _dalamudUtil.GetContentIdForObjectAddressOnFramework(load.Ptr);
+            if (contentId != 0 && PairSoundRouter.HasHandler(contentId))
+                PairSoundRouter.Dispatch(new PenumbraSoundResourceLoadMessage(contentId, load.FilePath, load.GamePath));
         }
     }
 

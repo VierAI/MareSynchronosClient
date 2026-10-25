@@ -1,4 +1,4 @@
-﻿using FFXIVClientStructs.FFXIV.Client.Game.Character;
+using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 using FFXIVClientStructs.Havok.Animation;
 using FFXIVClientStructs.Havok.Common.Base.Container.Array;
@@ -93,7 +93,7 @@ public sealed class XivDataAnalyzer
             return bones;
         }
         byte[] havokData;
-        using (BinaryReader reader = new(File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.Read)))
+        using (BinaryReader reader = new(File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)))
         {
             // most of this shit is from vfxeditor, surely nothing will change in the pap format :copium:
             reader.ReadInt32(); // ignore

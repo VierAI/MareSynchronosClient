@@ -1,4 +1,4 @@
-﻿using Dalamud.Bindings.ImGui;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Colors;
 using Dalamud.Interface.Utility;
@@ -83,7 +83,9 @@ public class DrawFolderGroup : DrawFolderBase
 
             ImGui.TextUnformatted("[" + OnlinePairs.ToString() + "]");
         }
-        UiSharedService.AttachToolTip(OnlinePairs + " online" + Environment.NewLine + TotalPairs + " total");
+        UiSharedService.AttachToolTip(OnlinePairs + " online" + Environment.NewLine + TotalPairs + " total"
+            + (SyncshellUniqueCount.Enabled ? Environment.NewLine + SyncshellUniqueCount.TooltipLine(SyncshellUniqueCount.Get(_pairManager, _groupFullInfoDto.GID), TotalPairs) : string.Empty));
+        SyncshellUniqueCount.Draw(_pairManager, _groupFullInfoDto.GID, TotalPairs); // fork
 
         ImGui.SameLine();
         if (IsOwner)
