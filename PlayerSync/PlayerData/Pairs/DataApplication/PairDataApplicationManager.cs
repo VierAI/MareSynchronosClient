@@ -141,7 +141,9 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
     {
         if (!_pairManager.TryGetPairByUserData(dto.User, out var pair) || pair == null)
         {
-            throw new InvalidOperationException("No user found for " + dto.User);
+            // Fork: data for a pair we no longer have (unpaired or left the shell mid-flight, or a reconnect race). Drop it.
+            Logger.LogDebug("Dropping character data for unknown pair {uid}", dto.User.UID);
+            return;
         }
 
         CharacterDataApplication queuedData;
@@ -564,7 +566,7 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                     ResetBackoff(pair);
                     Mediator.Publish(new EventMessage(new DataApplicationEvent(applicationBase, DataApplicationStatus.Completed, pair.PlayerName, pair.UserData,
                         nameof(ApplyPairDataAsync), EventSeverity.Informational,
-                        $"Data application task for {pair.PairUIDName} completed in {stopwatch!.ElapsedMilliseconds}ms")));
+                        $"Data application task for {pair.PairUIDName} completed in {stopwatch!.ElapsedMilliseconds}ms{QueueSuffix(pair)}")));
 
                     Logger.LogDebug("[BASE-{appBase}] Queued data application finished for {pair} in {elapsedMs}ms",
                         applicationBase, pair.PairUIDName, stopwatch!.ElapsedMilliseconds);
@@ -720,5 +722,17 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
         _dataApplicationManagerTask = null;
         _pendingDeferredTask = null;
     }
-}
 
+    // Club fix: tier and longest download slot wait, so a slow apply shows whether it was the queue or the download.
+    private static string QueueSuffix(Pair pair)
+    {
+        var q = MareSynchronos.WebAPI.Files.DownloadPriorityQueue.Instance;
+        if (q == null) return string.Empty;
+        try
+        {
+            var tier = q.GetTier(pair);
+            return $" (tier {tier} {MareSynchronos.WebAPI.Files.PriorityTiers.Name(tier)}, longest queue wait {q.TakeQueueWaitMs(pair)}ms)";
+        }
+        catch { return string.Empty; }
+    }
+}

@@ -124,6 +124,21 @@ public class CompactUi : WindowMediatorSubscriberBase
                     ImGui.Text("Open PlayerSync Help");
                     ImGui.EndTooltip();
                 }
+            },
+            new TitleBarButton()
+            {
+                Icon = FontAwesomeIcon.ChartLine,
+                Click = (msg) =>
+                {
+                    Mediator.Publish(new UiToggleMessage(typeof(UsageUi)));
+                },
+                IconOffset = new(2,1),
+                ShowTooltip = () =>
+                {
+                    ImGui.BeginTooltip();
+                    ImGui.Text("Open PlayerSync Usage (transfer totals and graph)");
+                    ImGui.EndTooltip();
+                }
             }
         };
 

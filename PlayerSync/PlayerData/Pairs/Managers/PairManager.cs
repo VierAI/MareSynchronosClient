@@ -529,12 +529,31 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         });
     }
 
+    // Fork: a mass reapply (cutscene end, filter change) used to start every pair's cached apply in the same tick, bypassing the
+    // apply queue. Visible pairs go first, then the rest, spread over about 3 s (at least 50 ms apart); a new sweep replaces a running one.
+    private CancellationTokenSource? _reapplySweepCts;
+
     private void ReapplyPairData()
     {
-        foreach (var pair in _allClientPairs.Select(k => k.Value))
+        var pairs = _allClientPairs.Values.Where(p => p.HasCachedData).OrderByDescending(p => p.IsVisible).ToList();
+        _reapplySweepCts?.Cancel();
+        var cts = _reapplySweepCts = new CancellationTokenSource();
+        if (pairs.Count == 0) return;
+        var gap = TimeSpan.FromMilliseconds(Math.Max(50, 3000 / pairs.Count));
+        Logger.LogDebug("Reapplying cached data for {count} pair(s), {gap} ms apart", pairs.Count, (int)gap.TotalMilliseconds);
+        _ = Task.Run(async () =>
         {
-            pair.ReapplyCachedData(forced: true);
-        }
+            try
+            {
+                for (var i = 0; i < pairs.Count; i++)
+                {
+                    if (i > 0) await Task.Delay(gap, cts.Token).ConfigureAwait(false);
+                    pairs[i].ReapplyCachedData(forced: true);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { Logger.LogWarning(ex, "Staggered reapply failed"); }
+        });
     }
 
     public void RecreateLazy()

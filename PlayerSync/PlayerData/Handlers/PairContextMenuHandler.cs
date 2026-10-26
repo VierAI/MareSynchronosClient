@@ -1,4 +1,4 @@
-﻿using Dalamud.Game.Gui.ContextMenu;
+using Dalamud.Game.Gui.ContextMenu;
 using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Plugin.Services;
 using MareSynchronos.API.Data.Extensions;
@@ -108,6 +108,14 @@ namespace MareSynchronos.PlayerData.Handlers
             var currentTargetPair = pairs.SingleOrDefault(u => u.Address == target);
             if (currentTargetPair != null)
                 AddContextMenu(currentTargetPair, args);
+
+            // Fork: override entry only for players paused by an automatic threshold pause (PairAutoPauseOverride.cs).
+            if (args.Target is MenuTargetDefault autoTarget && autoTarget.TargetObject?.Address == target
+                && PairAutoPauseOverride.TryGetAutoPauseReason(currentTargetPair ?? PairAutoPauseOverride.FindPausedPair(target, _pairManager, _dalamudUtilService), _serverConfigurationManager, out var autoReason))
+            {
+                var autoPair = currentTargetPair ?? PairAutoPauseOverride.FindPausedPair(target, _pairManager, _dalamudUtilService);
+                if (autoPair != null) PairAutoPauseOverride.AddMenuItem(args, autoPair, autoReason, _performanceConfigService, Mediator);
+            }
         }
 
         private void AddContextMenu(Pair pair, IMenuOpenedArgs args)

@@ -55,6 +55,7 @@ public class ProgressableStreamContent : StreamContent
         var uploaded = 0;
 
         using (_streamToWrite)
+        try
         {
             while (true)
             {
@@ -73,6 +74,11 @@ public class ProgressableStreamContent : StreamContent
                     await Task.Delay(100).ConfigureAwait(false);
                 }
             }
+        }
+        finally
+        {
+            // 1211: what this upload actually sent goes to the usage graph once, when it ends or is cancelled
+            MareSynchronos.Services.Usage.TransferUsage.AddUpload(uploaded);
         }
     }
 

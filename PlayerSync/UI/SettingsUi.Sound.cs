@@ -1,4 +1,5 @@
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility.Raii;
 using MareSynchronos.Services;
 using MareSynchronos.Services.Mediator;
 
@@ -18,7 +19,8 @@ public partial class SettingsUi
         }
         _uiShared.DrawHelpText("Adds a green speaker next to the name of a visible pair while modded sounds are loading for them." + Environment.NewLine +
             "It shows while the player is in a looping emote and a modded sound file was loaded for them (vanilla sounds are not seen)." + Environment.NewLine +
-            "It may take a moment to show up or disappear in game.");
+            "It may take a moment to show up or disappear in game." + Environment.NewLine +
+            "Sound detection is off entirely while Debug > \"Disable sound indicators\" is checked (then this, the Noises window and the Pair Analysis Sound column show nothing).");
 
         var showNoiseMakers = _configService.Current.ShowNoiseMakersWindow;
         if (ImGui.Checkbox("Show Noises window", ref showNoiseMakers))
@@ -49,13 +51,5 @@ public partial class SettingsUi
             MareSynchronos.Services.VierAIConfigStore.MarkDirty();
         }
         _uiShared.DrawHelpText("How long a muted player stays in the Noises window after your mouse last hovered their row. Hovering the row resets the timer. 5 to 60 seconds, default 15.");
-
-        var showUnique = MareSynchronos.Services.VierAIConfigStore.Current.ShowSyncshellUniqueCount;
-        if (ImGui.Checkbox("Show people only reachable through each syncshell (green number)", ref showUnique))
-        {
-            MareSynchronos.Services.VierAIConfigStore.Current.ShowSyncshellUniqueCount = showUnique;
-            MareSynchronos.Services.VierAIConfigStore.MarkDirty();
-        }
-        _uiShared.DrawHelpText("Next to each syncshell in the main window: how many members you would lose by leaving it (not directly paired and in none of your other syncshells).");
     }
 }

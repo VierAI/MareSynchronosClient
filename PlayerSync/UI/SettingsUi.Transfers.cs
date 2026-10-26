@@ -26,6 +26,7 @@ public partial class SettingsUi
         new(TransfersTabs.Preload, "Preload", DrawTransfersPreload),
         new(TransfersTabs.Priority, "Priority", DrawTransfersPriority),
         new(TransfersTabs.Current, "Current", DrawTransfersCurrent),
+        new(TransfersTabs.Usage, "Usage", DrawTransfersUsage),
     ];
 
     private enum TransfersTabs
@@ -34,7 +35,8 @@ public partial class SettingsUi
         Overlay,
         Preload,
         Priority,
-        Current
+        Current,
+        Usage
     }
 
     private void DrawTransferSettings()
@@ -193,6 +195,15 @@ public partial class SettingsUi
 
         if (!showUploading) ImGui.EndDisabled();
         if (!showTransferBars) ImGui.EndDisabled();
+    }
+
+    private readonly MareSynchronos.UI.Components.TransferUsageView _transferUsageView = new();
+
+    // Fork (1.15.5.1211): same view as the Usage window (main window title bar, chart icon).
+    private void DrawTransfersUsage()
+    {
+        _uiShared.DrawHelpText("Also available as its own window from the chart icon in the main window title bar.");
+        _transferUsageView.Draw(_uiShared);
     }
 
     private void DrawTransfersCurrent()

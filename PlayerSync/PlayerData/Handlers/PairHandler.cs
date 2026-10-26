@@ -111,30 +111,42 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         // Next build: only the pair's own synced sound files count (see SoundActivity.IsOwnSound).
         if (!SoundActivity.IsOwnSound(Pair, resourceLoad.GamePath)) return;
 
-        Pair.LastLoadedSoundSinceRedrawTime = DateTimeOffset.UtcNow;
-        Pair.LastLoadedSoundSinceRedraw = resourceLoad.FilePath;
-
         // Fork: sound activity state machine and Noise makers window.
-        // 1205: one-shot vs sustained from the SCD header (cached; read off the game thread the first time).
+        // 1210: the SCD header decides failed / short / looping / long (cached; read off the game thread the first time).
+        // A failed load (file missing or unreadable) never counts as noise; it is only remembered for the tooltip.
         var filePath = resourceLoad.FilePath;
-        var sustained = ScdInfo.TryGetCached(filePath);
-        var activeChanged = SoundActivity.OnSoundLoaded(Pair, DateTimeOffset.UtcNow, sustained ?? false);
-        Mediator.Publish(new PairSoundLoadedMessage(Pair, resourceLoad.GamePath, filePath));
-        if (activeChanged) Mediator.Publish(new PairSoundActiveChangedMessage(Pair));
-        if (sustained == null)
+        var gamePath = resourceLoad.GamePath;
+        var loadedAt = DateTimeOffset.UtcNow;
+        var info = ScdInfo.TryGetInfo(filePath);
+        if (info != null)
         {
-            var loadedAt = Pair.SoundLastLoadAt;
-            _ = ScdInfo.ClassifyAsync(filePath).ContinueWith(t =>
-            {
-                if (t.Status != TaskStatus.RanToCompletion || !t.Result) return;
-                _ = _dalamudUtil.RunOnFrameworkThread(() =>
-                {
-                    // Still the same load: upgrade it to sustained.
-                    if (Pair.SoundLastLoadAt != loadedAt) return;
-                    if (SoundActivity.OnSoundLoaded(Pair, loadedAt ?? DateTimeOffset.UtcNow, sustained: true)) Mediator.Publish(new PairSoundActiveChangedMessage(Pair));
-                });
-            }, TaskScheduler.Default);
+            ApplySoundLoad(gamePath, filePath, loadedAt, info.Value);
+            return;
         }
+        _ = ScdInfo.ClassifyInfoAsync(filePath).ContinueWith(t =>
+        {
+            var result = t.Status == TaskStatus.RanToCompletion ? t.Result : ScdClass.Failed;
+            _ = _dalamudUtil.RunOnFrameworkThread(() =>
+            {
+                if (_charaHandler == null || !IsVisible) return;
+                ApplySoundLoad(gamePath, filePath, loadedAt, result);
+            });
+        }, TaskScheduler.Default);
+    }
+
+    private void ApplySoundLoad(string gamePath, string filePath, DateTimeOffset loadedAt, ScdClass info)
+    {
+        if (!info.Valid)
+        {
+            Pair.SoundLastFailedAt = loadedAt;
+            Logger.LogDebug("Sound load for {pair} ignored as failed: {gamePath} -> {filePath}", Pair.UserData.AliasOrUID, gamePath, filePath);
+            return;
+        }
+        Pair.LastLoadedSoundSinceRedrawTime = loadedAt;
+        Pair.LastLoadedSoundSinceRedraw = filePath;
+        var activeChanged = SoundActivity.OnSoundLoaded(Pair, loadedAt, info);
+        Mediator.Publish(new PairSoundLoadedMessage(Pair, gamePath, filePath));
+        if (activeChanged) Mediator.Publish(new PairSoundActiveChangedMessage(Pair));
     }
 
     protected override void Dispose(bool disposing)

@@ -102,9 +102,33 @@ public static class SoundActivity
 
     /// <summary>Tooltip text for the speaker icon.</summary>
     public static string Describe(Pair pair, TimeSpan since)
-        => pair.SoundState == SoundState.Active
+    {
+        var text = pair.SoundState == SoundState.Active
             ? $"Making noise now (modded sound in a looping emote), started {UiSharedService.ApproxElapsedTimeToString(since)}."
             : $"Last made modded noise {UiSharedService.ApproxElapsedTimeToString(since)}.";
+        // 1210: failed .scd loads are ignored for the state; mention a recent one.
+        var failed = pair.SoundLastFailedAt;
+        if (failed != null && (DateTimeOffset.UtcNow - failed.Value).TotalSeconds <= FadeSeconds) text += "\nA sound file failed to load.";
+        return text;
+    }
+
+    /// <summary>1211: short state for tooltips and sorting: ACTIVE, FADING, failed (only a failed load recently), or none.</summary>
+    public static string StateLabel(Pair pair, DateTimeOffset now)
+    {
+        if (pair.SoundState == SoundState.Active) return "ACTIVE";
+        if (IsListed(pair, now)) return "FADING";
+        if (pair.SoundLastFailedAt != null && (now - pair.SoundLastFailedAt.Value).TotalSeconds <= FadeSeconds) return "failed";
+        return "none";
+    }
+
+    /// <summary>1211: sort rank for the state (higher = more relevant): ACTIVE 3, FADING 2, failed 1, none 0.</summary>
+    public static int StateRank(Pair pair, DateTimeOffset now) => StateLabel(pair, now) switch
+    {
+        "ACTIVE" => 3,
+        "FADING" => 2,
+        "failed" => 1,
+        _ => 0,
+    };
 
     /// <summary>True while the pair should still be listed (ACTIVE, or FADING and not fully faded).</summary>
     public static bool IsListed(Pair pair, DateTimeOffset now)
@@ -128,16 +152,31 @@ public static class SoundActivity
 
     // All transitions return true when the ACTIVE flag changed (callers publish PairSoundActiveChangedMessage).
 
-    /// <summary>1.15.5.1205: a one-shot sound keeps ACTIVE this long (each new load restarts it); sustained sounds last while emoting.</summary>
-    public const double OneShotActiveSeconds = 15;
+    /// <summary>1.15.5.1210: a short sound keeps ACTIVE this long after its last successful load (each new load restarts it);
+    /// looping and long sounds last while emoting. Was 15 s in 1205; live tests showed short repeats need 20 s or more.</summary>
+    public const double OneShotActiveSeconds = 20;
 
     /// <summary>A .scd file was loaded for the pair (any of its objects). <paramref name="sustained"/>: looping or long (see <see cref="ScdInfo"/>).</summary>
     public static bool OnSoundLoaded(Pair pair, DateTimeOffset now, bool sustained = false)
+        => OnSoundLoaded(pair, now, new ScdClass(true, sustained, 0));
+
+    /// <summary>
+    /// 1.15.5.1210: a successfully loaded .scd (failed loads never get here). Rules:
+    /// - In a loop: ACTIVE. Looping or long sounds stay ACTIVE while the loop runs; short ones for <see cref="OneShotActiveSeconds"/>
+    ///   after the last load.
+    /// - Not in a loop: a long non-looping sound (a song) is ACTIVE for its length; anything else only (re)starts the fade.
+    /// </summary>
+    public static bool OnSoundLoaded(Pair pair, DateTimeOffset now, ScdClass info)
     {
+        var sustained = info.Sustained;
         lock (pair)
         {
             pair.SoundLastLoadAt = now;
             pair.SoundLastLoadSustained = sustained;
+            pair.SoundLastLoadSeconds = info.Seconds;
+            pair.SoundLastLoadLooped = info.Looped;
+            pair.SoundLastLoadInLoop = pair.SoundInLoop;
+            if (!pair.SoundInLoop) pair.SoundSongPos = null; // set by the next poll
             if (pair.SoundInLoop)
             {
                 pair.SoundLoopHasSound = true;
@@ -145,7 +184,7 @@ public static class SoundActivity
                 {
                     // Sustained wins; a one-shot extends a one-shot window but never shortens a sustained one.
                     if (sustained) pair.SoundActiveUntil = null;
-                    else if (pair.SoundActiveUntil != null) pair.SoundActiveUntil = now.AddSeconds(OneShotActiveSeconds);
+                    else if (pair.SoundActiveUntil != null) pair.SoundActiveUntil = Later(pair.SoundActiveUntil.Value, now.AddSeconds(OneShotActiveSeconds));
                     return false;
                 }
                 pair.SoundState = SoundState.Active;
@@ -154,12 +193,46 @@ public static class SoundActivity
                 return true;
             }
 
+            // A song played outside a loop (not necessarily looping): ACTIVE for its length.
+            if (info.Long && !info.Looped)
+            {
+                var until = now.AddSeconds(info.Seconds);
+                var was = pair.SoundState == SoundState.Active;
+                if (!was) pair.SoundStateSince = now;
+                pair.SoundState = SoundState.Active;
+                pair.SoundActiveUntil = pair.SoundActiveUntil == null && was ? null : Later(pair.SoundActiveUntil ?? until, until);
+                return !was;
+            }
+
             // One-shot: never ACTIVE, (re)start the fade.
             var wasActive = pair.SoundState == SoundState.Active;
-            pair.SoundState = SoundState.Fading;
+            if (wasActive && pair.SoundActiveUntil != null && now < pair.SoundActiveUntil.Value) return false; // a song is still playing
+            StartFade(pair, "oneShot");
             pair.SoundStateSince = now;
+            pair.SoundActiveUntil = null;
             return wasActive;
         }
+    }
+
+    private static DateTimeOffset Later(DateTimeOffset a, DateTimeOffset b) => a > b ? a : b;
+
+    /// <summary>A song outside an emote ends when the player moves more than this (meters).</summary>
+    public const float SongMoveEndMeters = 0.3f;
+
+    /// <summary>Starts a fade now with its reason (call inside lock (pair)).</summary>
+    private static void StartFade(Pair pair, string reason)
+    {
+        pair.SoundState = SoundState.Fading;
+        pair.SoundEndReason = reason;
+        pair.SoundSongPos = null;
+    }
+
+    /// <summary>End time of the last long, non-looping sound (a song) if it is still playing.</summary>
+    private static DateTimeOffset? SongEnd(Pair pair, DateTimeOffset now)
+    {
+        if (pair.SoundLastLoadAt == null || pair.SoundLastLoadLooped || pair.SoundLastLoadSeconds < ScdInfo.SustainedSeconds) return null;
+        var end = pair.SoundLastLoadAt.Value.AddSeconds(pair.SoundLastLoadSeconds);
+        return end > now ? end : null;
     }
 
     /// <summary>Loop state of the pair's character, from a poll.</summary>
@@ -177,6 +250,7 @@ public static class SoundActivity
                 if (pair.SoundLastLoadAt != null && (now - pair.SoundLastLoadAt.Value).TotalSeconds <= LoopStartGraceSeconds)
                 {
                     pair.SoundLoopHasSound = true;
+                    pair.SoundLastLoadInLoop = true; // loaded with the loop start: tied to this emote
                     var wasActive = pair.SoundState == SoundState.Active;
                     pair.SoundState = SoundState.Active;
                     pair.SoundStateSince = pair.SoundLastLoadAt;
@@ -188,8 +262,18 @@ public static class SoundActivity
 
             pair.SoundLoopHasSound = false;
             if (pair.SoundState != SoundState.Active) return false;
-            pair.SoundState = SoundState.Fading;
+            // 1210: a song keeps playing for its length after the loop/performance ends.
+            // Steering 2026-10-25: a song that loaded during this emote ends with the emote; only a song that
+            // started outside an emote (bard performance, DJ music) keeps playing for its length. Every fade uses NoisesFadeSeconds.
+            var songEnd = pair.SoundLastLoadInLoop ? null : SongEnd(pair, now);
+            if (songEnd != null)
+            {
+                pair.SoundActiveUntil = songEnd;
+                return false;
+            }
+            StartFade(pair, "loopEnded");
             pair.SoundStateSince = now;
+            pair.SoundActiveUntil = null;
             return true;
         }
     }
@@ -216,9 +300,20 @@ public static class SoundActivity
         // Fork: ACTIVE also needs the character to be emoting right now: a looping mode AND a current emote id on its
         // EmoteController (Performance has no emote id and counts as is). Two field reads per poll, visible pairs only.
         var chara = (Character*)characterAddress;
+        // Steering 2026-10-25: a song that started outside an emote ends when the player walks away (> 0.3 m).
+        if (EndSongOnMove(pair, chara->Position, DateTimeOffset.UtcNow)) return true;
         var mode = chara->Mode;
-        var inLoop = IsLoopingMode(mode) && (mode == CharacterModes.Performance || chara->EmoteController.EmoteId != 0);
-        return OnLoopPolled(pair, inLoop, DateTimeOffset.UtcNow);
+        var emoteId = chara->EmoteController.EmoteId;
+        var inLoop = IsLoopingMode(mode) && (mode == CharacterModes.Performance || emoteId != 0);
+        var now = DateTimeOffset.UtcNow;
+        // 1210 'still noisy' signal: ACTIVE belongs to the loop it started in. Switching straight to another loop or emote
+        // (no idle poll in between) ends it and starts the check over for the new loop.
+        var key = inLoop ? ((int)mode << 16) | emoteId : 0;
+        var changed = false;
+        if (inLoop && pair.SoundInLoop && key != pair.SoundLoopKey)
+            changed = OnLoopPolled(pair, false, now);
+        pair.SoundLoopKey = key;
+        return OnLoopPolled(pair, inLoop, now) | changed;
     }
 
     /// <summary>
@@ -237,18 +332,20 @@ public static class SoundActivity
         }
     }
 
+    /// <remarks>1.15.5.1210 (leave-clears): the Noises entry ends right away instead of fading for NoisesFadeSeconds.</remarks>
     public static bool OnUnloaded(Pair pair)
     {
         lock (pair)
         {
             pair.SoundNextPollTick = 0;
-            if (!pair.SoundInLoop && pair.SoundState != SoundState.Active) return false;
+            var wasActive = pair.SoundState == SoundState.Active;
             pair.SoundInLoop = false;
             pair.SoundLoopHasSound = false;
-            if (pair.SoundState != SoundState.Active) return false;
-            pair.SoundState = SoundState.Fading;
-            pair.SoundStateSince = DateTimeOffset.UtcNow;
-            return true;
+            pair.SoundLoopKey = 0;
+            pair.SoundActiveUntil = null;
+            pair.SoundState = SoundState.None;
+            pair.SoundStateSince = null;
+            return wasActive;
         }
     }
 
@@ -264,7 +361,7 @@ public static class SoundActivity
         lock (pair)
         {
             if (pair.SoundState != SoundState.Active) return false;
-            pair.SoundState = SoundState.Fading;
+            StartFade(pair, "soundRemoved");
             pair.SoundLoopHasSound = false;
             pair.SoundStateSince = DateTimeOffset.UtcNow;
             // Muted while noisy: an unmute restore may mark them noisy again right away (see TakeNoisyAtMute). Only for a
@@ -278,12 +375,26 @@ public static class SoundActivity
         }
     }
 
+    private static bool EndSongOnMove(Pair pair, Vector3 pos, DateTimeOffset now)
+    {
+        lock (pair)
+        {
+            if (pair.SoundState != SoundState.Active || pair.SoundInLoop || pair.SoundLastLoadInLoop || pair.SoundActiveUntil == null) return false;
+            if (pair.SoundSongPos is not Vector3 start) { pair.SoundSongPos = pos; return false; }
+            if (Vector3.Distance(start, pos) <= SongMoveEndMeters) return false;
+            StartFade(pair, "moved");
+            pair.SoundStateSince = now;
+            pair.SoundActiveUntil = null;
+            return true;
+        }
+    }
+
     private static bool EndOneShot(Pair pair, DateTimeOffset now)
     {
         lock (pair)
         {
             if (pair.SoundState != SoundState.Active || pair.SoundActiveUntil == null || now < pair.SoundActiveUntil.Value) return false;
-            pair.SoundState = SoundState.Fading;
+            StartFade(pair, "timeEnded");
             pair.SoundStateSince = now;
             pair.SoundActiveUntil = null;
             return true;

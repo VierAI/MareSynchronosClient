@@ -122,9 +122,9 @@ public class DrawFolderNoises
         var rowMin = ImGui.GetCursorScreenPos();
         var rowMax = new Vector2(rowMin.X + UiSharedService.GetWindowContentRegionWidth() - ImGui.GetCursorPosX(), rowMin.Y + ImGui.GetFrameHeight());
 
-        var since = now - pair.SoundStateSince!.Value;
+        var since = now - (pair.SoundStateSince ?? now);
         ImGui.AlignTextToFramePadding();
-        MutedRowLinger.DrawSpeaker(_uiSharedService, pair, pair.UserPair!.OwnPermissions.IsDisableSounds(), since);
+        var speaker = NoiseRowButtons.Speaker(pair, since, _uiSharedService, _apiController); // 1210: click = mute toggle
 
         ImGui.SameLine();
         ImGui.AlignTextToFramePadding();
@@ -137,6 +137,6 @@ public class DrawFolderNoises
 
         var rowHovered = ImGui.IsMouseHoveringRect(rowMin, rowMax) && ImGui.IsWindowHovered();
         if (rowHovered) _mutedLinger.Touch(pair.UserData.UID, now);
-        _hover.Row(pair, rowHovered, overButton: buttons.Hovered);
+        _hover.Row(pair, rowHovered, overButton: buttons.Hovered || speaker.Hovered);
     }
 }

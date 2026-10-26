@@ -21,6 +21,7 @@ public sealed class DownloadPriorityQueue
         public int Tier { get; set; }
         public required long Sequence { get; init; }
         public required TaskCompletionSource Tcs { get; init; }
+        public long EnqueuedTick { get; } = Environment.TickCount64;
         // Players that need this file; the tier is the best tier among them (re-evaluated by Retier). Guarded by _lock.
         public List<Pair> Pairs { get; } = [];
     }
@@ -34,12 +35,46 @@ public sealed class DownloadPriorityQueue
     private readonly Dictionary<string, List<Pair>> _holderPairs = new(StringComparer.Ordinal);
     private Func<bool> _tryAcquireSlot = () => false;
     private long _sequence;
+    // Club fix: longest slot wait per player UID since the last completed apply (for the "completed in" line). Guarded by _lock.
+    private readonly Dictionary<string, long> _waitMs = new(StringComparer.Ordinal);
+
+    /// <summary>The running queue, for read-only debug readers (the debug IPC and the apply log line).</summary>
+    public static DownloadPriorityQueue? Instance { get; private set; }
 
     public DownloadPriorityQueue(ILogger<DownloadPriorityQueue> logger, InGameFriendService friends)
     {
         _logger = logger;
         _friends = friends;
         PriorityWorkGate.TierResolver = GetTier;
+        Instance = this;
+    }
+
+    /// <summary>Longest download slot wait (ms) for this player since the last call, then resets it.</summary>
+    public long TakeQueueWaitMs(Pair pair)
+    {
+        lock (_lock)
+        {
+            return _waitMs.Remove(pair.UserData.UID, out var ms) ? ms : 0;
+        }
+    }
+
+    /// <summary>Read-only queue view for one player: files waiting for a slot, best position among all waiting files
+    /// (1 = next, 0 = nothing waiting) and files holding a slot right now.</summary>
+    public (int Waiting, int BestPosition, int Running) GetQueueInfo(Pair pair)
+    {
+        lock (_lock)
+        {
+            var ordered = _waiters.OrderBy(w => w.Tier).ThenBy(w => w.Sequence).ToList();
+            int waiting = 0, best = 0;
+            for (var i = 0; i < ordered.Count; i++)
+            {
+                if (!ordered[i].Pairs.Contains(pair)) continue;
+                waiting++;
+                if (best == 0) best = i + 1;
+            }
+            var running = _holderPairs.Values.Count(l => l.Contains(pair));
+            return (waiting, best, running);
+        }
     }
 
     /// <summary>Called once by the orchestrator: tries to take a free slot from the semaphore without waiting.</summary>
@@ -56,7 +91,7 @@ public sealed class DownloadPriorityQueue
         var alias = pair.UserData.Alias;
         var listed = cfg.UIDsToPrioritize.Exists(p =>
             string.Equals(p, uid, StringComparison.Ordinal) || (!string.IsNullOrEmpty(alias) && string.Equals(p, alias, StringComparison.Ordinal)));
-        return PriorityTiers.Classify(listed, _friends.IsFriend(pair.HashedCID), pair.IsDirectlyPaired && !pair.IsOneSidedPair);
+        return PriorityTiers.Classify(listed, _friends.IsFriend(pair.HashedCID), _friends.IsPartyMember(pair.HashedCID), pair.IsDirectlyPaired && !pair.IsOneSidedPair);
     }
 
     /// <summary>Starts waiting for a slot. The slot has been taken from the semaphore when the task completes.</summary>
@@ -191,6 +226,12 @@ public sealed class DownloadPriorityQueue
                 _waiters.Remove(next);
                 _holders[next.Key] = next.Tier;
                 _holderPairs[next.Key] = next.Pairs;
+                var waited = Environment.TickCount64 - next.EnqueuedTick;
+                foreach (var wp in next.Pairs)
+                {
+                    var uid = wp.UserData.UID;
+                    if (!_waitMs.TryGetValue(uid, out var prev) || waited > prev) _waitMs[uid] = waited;
+                }
                 next.Tcs.TrySetResult();
             }
         }

@@ -100,6 +100,19 @@ public class Pair
     /// <summary>Fork 1205: ACTIVE from one-shot sounds ends at this time (null = sustained, lasts while emoting).</summary>
     public DateTimeOffset? SoundActiveUntil { get; set; }
     public long SoundNextPollTick { get; set; }
+    /// <summary>Fork 1210: estimated length (s) of the last successfully loaded sound and whether it has loop points.</summary>
+    public double SoundLastLoadSeconds { get; set; }
+    public bool SoundLastLoadLooped { get; set; }
+    /// <summary>The last sound loaded while the character was in an emote loop (a song tied to that emote).</summary>
+    public bool SoundLastLoadInLoop { get; set; }
+    /// <summary>Why the current fade started (loopEnded, oneShot, timeEnded, soundRemoved, moved), or null.</summary>
+    public string? SoundEndReason { get; set; }
+    /// <summary>Position when a song outside an emote started (a move ends it), or null.</summary>
+    public System.Numerics.Vector3? SoundSongPos { get; set; }
+    /// <summary>Fork 1210: mode + emote id of the loop the pair is in (a different loop starts the sound check over).</summary>
+    public int SoundLoopKey { get; set; }
+    /// <summary>Fork 1210: last time one of the pair's sound files failed to load (ignored for ACTIVE; tooltip only).</summary>
+    public DateTimeOffset? SoundLastFailedAt { get; set; }
     public nint Address => CachedPlayer?.PlayerCharacter ?? nint.Zero;
     public UserData UserData => UserPair.User;
     public ulong PlayerCharacterId => CachedPlayer?.PlayerCharacterId ?? ulong.MaxValue;

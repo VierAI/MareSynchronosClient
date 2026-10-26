@@ -28,8 +28,18 @@ public class VierAIConfig
     // Seconds a muted row stays in the Noises window after the mouse last hovered it (5-300).
     public int NoisesMutedHideSeconds { get; set; } = 15;
 
+
+    // 1.15.5.1210: Auto sync nearby animations (AutoAnimationSync): restart both looping emotes when a nearby pair and you
+    // are both in one. Radius in metres (0.1-3). The intro replay is a separate experimental switch.
+    public bool AutoSyncNearbyAnimations { get; set; } = false;
+    public float AutoSyncNearbyRadius { get; set; } = 1.0f;
+    public bool AutoSyncIntroReplay { get; set; } = false;
+
     // Main window: show a green "(N)" next to each syncshell = members you reach through no other syncshell or direct pair.
     public bool ShowSyncshellUniqueCount { get; set; } = true;
+
+    // 1.15.5.1216: let local debugging tools read visible pair info over the PSync.GetPairStates IPC. Off = it returns an empty array.
+    public bool AllowLocalDebugPairInfo { get; set; } = false;
 
     // Wine only: the user dismissed the "cache folder may be cloud-synced" warning in Settings (see CacheFolderHealthCheck).
     public bool CacheFolderWarningDismissed { get; set; } = false;
@@ -45,7 +55,7 @@ public class VierAIConfig
     public bool ReapplyScaleAfterRedraw { get; set; } = true;
 
     // Download priority (were in playerperformance.json)
-    // Priority tiers (schema 3): tier 0 = UIDsToPrioritize, tier 1 = in-game friends, tier 2 = direct syncs, tier 3 = everyone else. All always on;
+    // Priority tiers (schema 3): tier 0 = UIDsToPrioritize, tier 1 = in-game friends, tier 2 = party members, tier 3 = direct syncs, tier 4 = everyone else. All always on;
     // free download slots go to the best waiting tier. Old fields (PrioritizeFriends, PrioritizeInGameFriends, PrioritizeDirectSyncs,
     // PriorityReservedSlots, NonPriorityDownloadMode, NonPriorityLimitMBps) are ignored on load and dropped on the next save.
     public List<string> UIDsToPrioritize { get; set; } = new();
@@ -263,6 +273,9 @@ public static class VierAIConfigStore
         Try(nameof(VierAIConfig.ReapplyScaleAfterRedraw), el => target.ReapplyScaleAfterRedraw = el.GetBoolean());
         Try(nameof(VierAIConfig.ShowSyncshellUniqueCount), el => target.ShowSyncshellUniqueCount = el.GetBoolean());
         Try(nameof(VierAIConfig.NoisesMutedHideSeconds), el => target.NoisesMutedHideSeconds = Math.Clamp(el.GetInt32(), 5, 60));
+        Try(nameof(VierAIConfig.AutoSyncNearbyAnimations), el => target.AutoSyncNearbyAnimations = el.GetBoolean());
+        Try(nameof(VierAIConfig.AutoSyncNearbyRadius), el => target.AutoSyncNearbyRadius = Math.Clamp(el.GetSingle(), 0.1f, 3f));
+        Try(nameof(VierAIConfig.AutoSyncIntroReplay), el => target.AutoSyncIntroReplay = el.GetBoolean());
         Try(nameof(VierAIConfig.NoisesFadeSeconds), el => target.NoisesFadeSeconds = Math.Clamp(el.GetInt32(), 10, 300));
         Try(nameof(VierAIConfig.TextureCapEnabled), el => target.TextureCapEnabled = el.GetBoolean());
         Try(nameof(VierAIConfig.TextureCapTinyMaxCm), el => target.TextureCapTinyMaxCm = el.GetSingle());

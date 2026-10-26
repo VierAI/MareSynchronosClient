@@ -1,3 +1,4 @@
+using FFXIVClientStructs.FFXIV.Client.Game.Group;
 using FFXIVClientStructs.FFXIV.Client.UI.Info;
 using Dalamud.Plugin.Services;
 using MareSynchronos.Services.Mediator;
@@ -24,6 +25,13 @@ public sealed unsafe class InGameFriendService : DisposableMediatorSubscriberBas
     private readonly IFramework _framework;
     private readonly DalamudUtilService _dalamudUtil;
     private volatile FrozenSet<string> _friendIdents = FrozenSet<string>.Empty;
+    // Fork: party and alliance members (normal and cross-world, all alliance groups), same hashed content ids. Refreshed every PartyInterval.
+    private static readonly TimeSpan PartyInterval = TimeSpan.FromSeconds(3);
+    private volatile FrozenSet<string> _partyIdents = FrozenSet<string>.Empty;
+    private DateTime _nextPartyRefresh = DateTime.MinValue;
+
+    /// <summary>Number of other party/alliance members in the last snapshot. Shown in the Priority tab.</summary>
+    public static volatile int PartyCount;
     private DateTime _nextRefresh = DateTime.MinValue;
     private int _lastLoggedCount = -1;
 
@@ -40,6 +48,8 @@ public sealed unsafe class InGameFriendService : DisposableMediatorSubscriberBas
         Mediator.Subscribe<DalamudLogoutMessage>(this, (_) =>
         {
             _friendIdents = FrozenSet<string>.Empty;
+            _partyIdents = FrozenSet<string>.Empty;
+            PartyCount = 0;
             CurrentCount = 0;
             _lastLoggedCount = -1;
         });
@@ -52,10 +62,19 @@ public sealed unsafe class InGameFriendService : DisposableMediatorSubscriberBas
     /// <summary>True if this pair ident (hashed content id) belongs to someone on the in-game friends list. Safe from any thread.</summary>
     public bool IsFriend(string? ident) => !string.IsNullOrEmpty(ident) && _friendIdents.Contains(ident);
 
+    /// <summary>True if this pair ident (hashed content id) is in your party (normal or cross-world). Safe from any thread.</summary>
+    public bool IsPartyMember(string? ident) => !string.IsNullOrEmpty(ident) && _partyIdents.Contains(ident);
+
     private void Tick()
     {
         if (!_framework.IsInFrameworkUpdateThread) return;
         var now = DateTime.UtcNow;
+        if (now >= _nextPartyRefresh)
+        {
+            _nextPartyRefresh = now + PartyInterval;
+            try { if (_dalamudUtil.IsLoggedIn) RefreshParty(); }
+            catch (Exception ex) { Logger.LogDebug(ex, "Could not read the party list"); }
+        }
         if (now < _nextRefresh) return;
         _nextRefresh = now + (_friendIdents.Count == 0 ? EmptyRetryInterval : RefreshInterval);
         try
@@ -99,5 +118,48 @@ public sealed unsafe class InGameFriendService : DisposableMediatorSubscriberBas
             _lastLoggedCount = set.Count;
             Logger.LogInformation("In-game friends list: {count} friend(s) known for download priority", set.Count);
         }
+    }
+
+    private void RefreshParty()
+    {
+        // Fork: light party plus the whole alliance (normal alliance members and every cross-world group). You are left out.
+        var set = new HashSet<string>(StringComparer.Ordinal);
+        var ps = FFXIVClientStructs.FFXIV.Client.Game.UI.PlayerState.Instance();
+        var self = ps != null ? ps->ContentId : 0UL;
+        void Add(ulong cid)
+        {
+            if (cid != 0 && cid != self) set.Add(cid.ToString().GetHash256());
+        }
+        var gm = GroupManager.Instance();
+        if (gm != null)
+        {
+            var group = &gm->MainGroup;
+            for (var i = 0; i < group->MemberCount && i < 8; i++)
+                Add(group->PartyMembers[i].ContentId);
+            if (group->IsAlliance)
+            {
+                var alliance = group->AllianceMembers;
+                for (var i = 0; i < alliance.Length; i++)
+                    Add(alliance[i].ContentId);
+            }
+        }
+        if (InfoProxyCrossRealm.IsCrossRealmParty())
+        {
+            var proxy = InfoProxyCrossRealm.Instance();
+            var groups = proxy != null ? Math.Min((int)proxy->GroupCount, 6) : 1;
+            for (var g = 0; g < groups; g++)
+            {
+                var count = InfoProxyCrossRealm.GetGroupMemberCount(g);
+                for (var i = 0; i < count && i < 8; i++)
+                {
+                    var m = InfoProxyCrossRealm.GetGroupMember((uint)i, g);
+                    if (m != null) Add(m->ContentId);
+                }
+            }
+        }
+        var previous = _partyIdents;
+        _partyIdents = set.ToFrozenSet(StringComparer.Ordinal);
+        PartyCount = set.Count; // you are not in the list
+        if (!previous.SetEquals(_partyIdents)) Mediator.Publish(new PriorityChangedMessage());
     }
 }

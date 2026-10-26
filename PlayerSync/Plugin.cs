@@ -124,6 +124,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddSingleton<InGameFriendService>();
             collection.AddSingleton<DownloadPriorityQueue>();
             collection.AddSingleton<SoundActivityTracker>();
+            collection.AddSingleton<AutoAnimationSync>(); // fork 1210
             collection.AddSingleton<FileTransferOrchestrator>();
             collection.AddSingleton((s) => new PreloaderService(
                 s.GetRequiredService<FileCacheManager>(), s.GetRequiredService<FileUploadManager>(),
@@ -277,6 +278,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddScoped<WindowMediatorSubscriberBase, CharaDataHubUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, PairAnalysisViewerUI>();
             collection.AddScoped<WindowMediatorSubscriberBase, NoiseMakersUi>();
+            collection.AddScoped<WindowMediatorSubscriberBase, UsageUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, PairingRequestsUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, PairingRequestsNoticeUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, EditProfileUi>((s) => new EditProfileUi(s.GetRequiredService<ILogger<EditProfileUi>>(),
@@ -302,6 +304,8 @@ public sealed class Plugin : IDalamudPlugin
                 s.GetRequiredService<MareMediator>(), dataManager));
             collection.AddHostedService(p => p.GetRequiredService<ConfigurationSaveService>());
             collection.AddHostedService(p => p.GetRequiredService<VierAIConfigService>());
+            collection.AddSingleton<MareSynchronos.Services.Usage.TransferUsageService>();
+            collection.AddHostedService(p => p.GetRequiredService<MareSynchronos.Services.Usage.TransferUsageService>());
             collection.AddHostedService(p => p.GetRequiredService<MareMediator>());
             collection.AddHostedService(p => p.GetRequiredService<NotificationService>());
             collection.AddHostedService(p => p.GetRequiredService<NamePlateManagerService>());
@@ -323,6 +327,9 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddHostedService(p => p.GetRequiredService<AnimationBindGuard>());
             collection.AddHostedService<StageSavedNotificationService>();
             collection.AddHostedService<CacheFolderHealthCheck>();
+            collection.AddHostedService(p => p.GetRequiredService<AutoAnimationSync>()); // fork 1210
+            collection.AddHostedService(p => new MareSynchronos.Interop.Ipc.PSyncDebugIpc(p.GetRequiredService<ILogger<MareSynchronos.Interop.Ipc.PSyncDebugIpc>>(), pluginInterface,
+                p.GetRequiredService<PairManager>(), p.GetRequiredService<DalamudUtilService>(), p.GetRequiredService<MareSynchronos.Services.Events.EventAggregator>(), p.GetRequiredService<MareMediator>(), p.GetRequiredService<ServerConfigurationManager>())); // fork 1210
             //collection.AddHostedService(p => p.GetRequiredService<PlayerIdleStatusService>());
             collection.AddHostedService<SkeletonMappingFix>();
         })

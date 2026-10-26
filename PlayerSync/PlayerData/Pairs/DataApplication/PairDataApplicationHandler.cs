@@ -27,6 +27,8 @@ namespace MareSynchronos.PlayerData.Pairs;
 
 public sealed partial class PairDataApplicationHandler : DisposableMediatorSubscriberBase
 {
+    private int _drawTimeouts;
+    private DateTime _drawBackoffUntil = DateTime.MinValue;
     private sealed record DataApplication
     {
         public required Guid ApplicationBase;
@@ -202,14 +204,20 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
         await _dalamudUtil.RunOnFrameworkThread(() =>
         {
             _penumbraCollection ??= _ipcManager.Penumbra.CreateTemporaryCollectionOnFramework(Logger, Pair.UserData.UID);
-            var visibility = _dalamudUtil.GetFrameworkCharacterVisibilityByContentId(Pair.ContendId);
-            if (visibility?.Ready == true)
+            // Fork crash guard: read the draw state fresh in this tick instead of the cached ModelReady flag, so the
+            // collection is never swapped while the character is mid-draw. Not ready: the data application assigns it later.
+            _dalamudUtil.TryActOnFramework(Pair.ContendId, (chara, address) =>
             {
-                _dalamudUtil.TryActOnFramework(Pair.ContendId, (chara, _) =>
+                var drawState = _dalamudUtil.GetCharacterDrawStateFromFramework(address, requireRenderable: true);
+                if (drawState.State == DrawState.Ready)
                 {
                     _ipcManager.Penumbra.AssignTemporaryCollection(Logger, _penumbraCollection.Value, chara.ObjectIndex);
-                }, out _);
-            }
+                }
+                else
+                {
+                    Logger.LogDebug("Skipping initial collection assign for {this}, draw state {condition}", this, drawState.Condition);
+                }
+            }, out _);
         }).ConfigureAwait(false);
         if (_initialized)
         {
@@ -1157,7 +1165,29 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
 
             Logger.LogDebug("[BASE-{applicationId}] Starting application task for {this}: {appId}", applicationBase, this, applicationId);
             Logger.LogDebug("[{applicationId}] Waiting for initial draw for for {handler}", applicationId, _charaHandler);
-            var drawResult = await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, _charaHandler!, applicationId, 10000, cancellationToken).ConfigureAwait(false);
+            // Fork: draw-timeout backoff. A player who keeps timing out (usually culled at the edge of a crowd) gets only a
+            // short, silent draw check until the backoff window ends, and only the first timeout of each window is logged.
+            var inDrawBackoff = DateTime.UtcNow < _drawBackoffUntil;
+            var drawResult = await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, _charaHandler!, applicationId, inDrawBackoff ? 500 : 10000, cancellationToken, logTimeout: false).ConfigureAwait(false);
+            if (drawResult == DrawWaitResult.TimedOut)
+            {
+                if (!inDrawBackoff)
+                {
+                    _drawTimeouts++;
+                    var backoff = TimeSpan.FromSeconds(Math.Min(120, 10 * Math.Pow(2, Math.Min(_drawTimeouts - 1, 4))));
+                    _drawBackoffUntil = DateTime.UtcNow + backoff;
+                    Logger.LogWarning("[{applicationId}] Timed out waiting for {handler} to draw ({count} in a row), backing off {seconds}s", applicationId, _charaHandler, _drawTimeouts, (int)backoff.TotalSeconds);
+                }
+                else
+                {
+                    Logger.LogDebug("[{applicationId}] {handler} still not drawn (draw backoff)", applicationId, _charaHandler);
+                }
+            }
+            else if (drawResult == DrawWaitResult.Ready)
+            {
+                _drawTimeouts = 0;
+                _drawBackoffUntil = DateTime.MinValue;
+            }
             if (drawResult != DrawWaitResult.Ready)
             {
                 throw new PairDataApplicationException(PairDataExceptionReason.InvalidCharacterState,
@@ -1378,6 +1408,14 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
 
                                 if (!penumbraApplied && (updateModdedPaths || updateManip))
                                 {
+                                    // Fork crash guard: same-tick draw re-check right before the collection swap. The pre-apply wait ran
+                                    // ticks earlier; the character may have started a new draw since. Defer through the normal retry path.
+                                    var assignDrawState = _dalamudUtil.GetCharacterDrawStateFromFramework(playerAddress, requireRenderable: true);
+                                    if (assignDrawState.State != DrawState.Ready)
+                                    {
+                                        throw new PairDataApplicationException(PairDataExceptionReason.InvalidCharacterState,
+                                            $"Character data application deferred because the player is drawing ({assignDrawState.Condition})");
+                                    }
                                     if (updateModdedPaths)
                                     {
                                         IIpcCaller.GetIPCTimeToCompletion(() => _ipcManager.Penumbra.AssignTemporaryCollection(Logger, penumbraCollection, playerIndex), out penumbraAssignTempTime);

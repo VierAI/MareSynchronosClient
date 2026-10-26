@@ -72,6 +72,15 @@ public partial class SettingsUi
         }
 
         ImGuiHelpers.ScaledDummy(5);
+        bool allowDebugPairInfo = MareSynchronos.Services.VierAIConfigStore.Current.AllowLocalDebugPairInfo;
+        if (ImGui.Checkbox("Allow local debug tools to read pair info", ref allowDebugPairInfo))
+        {
+            MareSynchronos.Services.VierAIConfigStore.Current.AllowLocalDebugPairInfo = allowDebugPairInfo;
+            MareSynchronos.Services.VierAIConfigStore.MarkDirty();
+        }
+        _uiShared.DrawHelpText("Lets other local plugins read the names, load state and pause reasons of visible paired players through the PSync.GetPairStates IPC. Read-only; no UIDs are shared. Off by default.");
+
+        ImGuiHelpers.ScaledDummy(5);
         bool stopWhining = _configService.Current.DebugStopWhining;
         if (ImGui.Checkbox("Do not notify for modified game files or enabled LOD", ref stopWhining))
         {

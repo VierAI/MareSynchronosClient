@@ -245,7 +245,7 @@ internal class NoiseMakersUi : WindowMediatorSubscriberBase
         var pauseWidth = NoiseRowButtons.PauseWidth(_uiSharedService);
         var speakerWidth = _uiSharedService.GetIconSize(FontAwesomeIcon.VolumeDown).X;
         // Fork: fixed width (name column sized for a typical long name, NoiseNameFit.cs); longer names are clipped with an ellipsis.
-        var rowWidth = speakerWidth + spacingX + NoiseNameFit.NameWidth() + (spacingX * 2) + muteWidth + spacingX + pauseWidth;
+        var rowWidth = speakerWidth + spacingX + NoiseNameFit.NameWidth() + (spacingX * 2) + pauseWidth; // 1210: no mute button (speaker toggles)
 
         _hover.BeginFrame();
         foreach (var pair in rows)
@@ -270,9 +270,9 @@ internal class NoiseMakersUi : WindowMediatorSubscriberBase
         var rowMax = new Vector2(rowMin.X + rowWidth, rowMin.Y + ImGui.GetFrameHeight());
 
         // Activity speaker, same colors as the main window (with the wave crescent while active).
-        var since = now - pair.SoundStateSince!.Value;
+        var since = now - (pair.SoundStateSince ?? now);
         ImGui.AlignTextToFramePadding();
-        MutedRowLinger.DrawSpeaker(_uiSharedService, pair, muted, since);
+        var speaker = NoiseRowButtons.Speaker(pair, since, _uiSharedService, _apiController); // 1210: click = mute toggle
 
         ImGui.SameLine();
         ImGui.AlignTextToFramePadding();
@@ -289,8 +289,8 @@ internal class NoiseMakersUi : WindowMediatorSubscriberBase
         var buttons = _windowHovered
             ? NoiseRowButtons.Draw(pair, endX, _uiSharedService, _apiController, Mediator)
             : NoiseRowButtons.Placeholder(endX, _uiSharedService);
-        var buttonHovered = buttons.Hovered;
-        if (buttons.MuteClicked) _pins[uid] = now;
+        var buttonHovered = buttons.Hovered || speaker.Hovered;
+        if (speaker.MuteClicked) _pins[uid] = now;
         if (buttons.PauseClicked)
         {
             _pins.Remove(uid);

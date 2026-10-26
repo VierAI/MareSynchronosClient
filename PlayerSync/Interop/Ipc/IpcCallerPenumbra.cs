@@ -83,7 +83,7 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         CheckAPI();
         CheckModDirectory();
 
-        Mediator.Subscribe<FrameworkUpdateMessage>(this, (_) => { if (!_pendingSoundLoads.IsEmpty) DrainPendingSoundLoads(); });
+        Mediator.Subscribe<FrameworkUpdateMessage>(this, (_) => { if (!_pendingSoundLoads.IsEmpty) DrainPendingSoundLoads(); ProcessDeferredRedraws(); });
 
         Mediator.Subscribe<PenumbraRedrawCharacterMessage>(this, (msg) =>
         {
@@ -304,6 +304,25 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         }
     }
 
+    // Fork crash guard: redraw requests by object address. Pending = sent to Penumbra, waiting for GameObjectRedrawn.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<nint, DateTime> _pendingRedraws = new();
+    // Deferred = skipped because the object was mid-draw; retried on the framework thread until it is drawn.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<nint, (Guid ApplicationId, DateTime Since)> _deferredRedraws = new();
+    private static readonly TimeSpan PendingRedrawTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan DeferredRedrawTimeout = TimeSpan.FromSeconds(10);
+
+    private static unsafe CharacterRedrawBlock GetRedrawBlock(nint address)
+    {
+        var gameObject = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)address;
+        if (gameObject->DrawObject == null) return CharacterRedrawBlock.NoDrawObject;
+        var model = gameObject->GetCharacterBase();
+        if (model == null) return CharacterRedrawBlock.NoDrawObject;
+        if (model->HasModelInSlotLoaded != 0 || model->HasModelFilesInSlotLoaded != 0) return CharacterRedrawBlock.Loading;
+        return CharacterRedrawBlock.None;
+    }
+
+    private enum CharacterRedrawBlock { None, NoDrawObject, Loading }
+
     public unsafe bool RedrawOnFramework(ILogger logger, Guid applicationId, nint address)
     {
         _dalamudUtil.EnsureIsOnFramework();
@@ -312,10 +331,64 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
             return false;
         }
 
-        var chara = (Character*)address;
-        var idx = chara->ObjectIndex;
-        _penumbraRedraw!.Invoke(idx, setting: RedrawType.Redraw);
+        if (_pendingRedraws.TryGetValue(address, out var sentAt) && DateTime.UtcNow - sentAt < PendingRedrawTimeout)
+        {
+            // The earlier redraw may already be loading files from the previous collection state (e.g. mid outfit change), so folding into it can leave stale or missing parts. Queue one follow-up redraw for after it completes.
+            logger.LogDebug("[{applicationId}] Redraw for object {address:X} queued, previous redraw still pending", applicationId, address);
+            _deferredRedraws.AddOrUpdate(address, (applicationId, DateTime.UtcNow), (_, old) => (applicationId, old.Since));
+            return true;
+        }
+
+        var block = GetRedrawBlock(address);
+        if (block != CharacterRedrawBlock.None)
+        {
+            logger.LogDebug("[{applicationId}] Redraw for object {address:X} deferred, object is {block}", applicationId, address, block);
+            _deferredRedraws.AddOrUpdate(address, (applicationId, DateTime.UtcNow), (_, old) => (applicationId, old.Since));
+            return true;
+        }
+
+        _deferredRedraws.TryRemove(address, out _);
+        SendRedraw(address);
         return true;
+    }
+
+    private unsafe void SendRedraw(nint address)
+    {
+        var idx = ((Character*)address)->ObjectIndex;
+        _pendingRedraws[address] = DateTime.UtcNow;
+        _penumbraRedraw!.Invoke(idx, setting: RedrawType.Redraw);
+    }
+
+    private void ProcessDeferredRedraws()
+    {
+        if (_deferredRedraws.IsEmpty || !APIAvailable || _dalamudUtil.IsZoning) return;
+        foreach (var (address, entry) in _deferredRedraws)
+        {
+            // The object may have despawned or the slot been reused; only act on an address still in the object table.
+            if (_dalamudUtil.GetCharacterFromObjectTableByAddressWhenAlreadyOnFrameworkThread(address) == null)
+            {
+                _deferredRedraws.TryRemove(address, out _);
+                Logger.LogDebug("[{applicationId}] Deferred redraw for {address:X} dropped, object gone", entry.ApplicationId, address);
+                continue;
+            }
+            if (_pendingRedraws.TryGetValue(address, out var sentAt) && DateTime.UtcNow - sentAt < PendingRedrawTimeout) continue;
+
+            var block = GetRedrawBlock(address);
+            var timedOut = DateTime.UtcNow - entry.Since > DeferredRedrawTimeout;
+            if (block == CharacterRedrawBlock.None || (timedOut && block == CharacterRedrawBlock.Loading))
+            {
+                // Drawn now (or stuck loading too long): send it so no stale mods stay on screen.
+                _deferredRedraws.TryRemove(address, out _);
+                Logger.LogDebug("[{applicationId}] Sending deferred redraw for {address:X} ({block})", entry.ApplicationId, address, block);
+                SendRedraw(address);
+            }
+            else if (timedOut)
+            {
+                // Still no draw object: its next draw loads from the current collection anyway, nothing stale to clear.
+                _deferredRedraws.TryRemove(address, out _);
+                Logger.LogDebug("[{applicationId}] Deferred redraw for {address:X} dropped, no draw object", entry.ApplicationId, address);
+            }
+        }
     }
 
     public void RemoveTemporaryCollectionOnFramework(ILogger logger, Guid applicationId, Guid collId)
@@ -362,6 +435,7 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
 
     private void RedrawEvent(IntPtr objectAddress, int objectTableIndex)
     {
+        _pendingRedraws.TryRemove(objectAddress, out _);
         _mareMediator.Publish(new PenumbraRedrawMessage(objectAddress, objectTableIndex, false));
     }
 

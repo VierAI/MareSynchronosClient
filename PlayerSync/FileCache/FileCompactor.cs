@@ -214,6 +214,8 @@ public sealed class FileCompactor
         return info.Algorithm == CompressionAlgorithm.XPRESS8K;
     }
 
+    private static bool IsSharingViolation(IOException ex) => (ex.HResult & 0xFFFF) is 32 or 33;
+
     private void WOFCompressFile(string path)
     {
         var efInfoPtr = Marshal.AllocHGlobal(Marshal.SizeOf(_efInfo));
@@ -221,24 +223,41 @@ public sealed class FileCompactor
         ulong length = (ulong)Marshal.SizeOf(_efInfo);
         try
         {
-            // Share the file so validation can read it while WOF still holds the handle.
-            using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
+            // Club fix: a file that is still open elsewhere (game or a reader) is retried once after a short delay, then skipped.
+            for (var attempt = 0; attempt < 2; attempt++)
             {
-                LowPriorityFile.TrySetVeryLow(fs.SafeFileHandle);
-#pragma warning disable S3869 // "SafeHandle.DangerousGetHandle" should not be called
-                var hFile = fs.SafeFileHandle.DangerousGetHandle();
-#pragma warning restore S3869 // "SafeHandle.DangerousGetHandle" should not be called
-                if (fs.SafeFileHandle.IsInvalid)
+                try
                 {
-                    _logger.LogWarning("Invalid file handle to {file}", path);
-                }
-                else
-                {
-                    var ret = WofSetFileDataLocation(hFile, WOF_PROVIDER_FILE, efInfoPtr, length);
-                    if (!(ret == 0 || ret == unchecked((int)0x80070158)))
+                    // Share the file so validation can read it while WOF still holds the handle.
+                    using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
                     {
-                        _logger.LogWarning("Failed to compact {file}: {ret}", path, ret.ToString("X"));
+                        LowPriorityFile.TrySetVeryLow(fs.SafeFileHandle);
+#pragma warning disable S3869 // "SafeHandle.DangerousGetHandle" should not be called
+                        var hFile = fs.SafeFileHandle.DangerousGetHandle();
+#pragma warning restore S3869 // "SafeHandle.DangerousGetHandle" should not be called
+                        if (fs.SafeFileHandle.IsInvalid)
+                        {
+                            _logger.LogWarning("Invalid file handle to {file}", path);
+                        }
+                        else
+                        {
+                            var ret = WofSetFileDataLocation(hFile, WOF_PROVIDER_FILE, efInfoPtr, length);
+                            if (!(ret == 0 || ret == unchecked((int)0x80070158)))
+                            {
+                                _logger.LogWarning("Failed to compact {file}: {ret}", path, ret.ToString("X"));
+                            }
+                        }
                     }
+                    break;
+                }
+                catch (IOException ex) when (attempt == 0 && IsSharingViolation(ex))
+                {
+                    Thread.Sleep(250);
+                }
+                catch (IOException ex) when (IsSharingViolation(ex))
+                {
+                    _logger.LogDebug("Skipped compacting {path}: still in use", path);
+                    break;
                 }
             }
         }

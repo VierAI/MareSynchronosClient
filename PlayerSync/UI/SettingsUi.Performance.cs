@@ -19,9 +19,9 @@ public partial class SettingsUi
     private IReadOnlyList<UiNav.Tab<PerformanceTabs>> PerformanceTabsList => _performanceTabs ??=
         [
             new(PerformanceTabs.Texture, "Auto Texture Compression", DrawPerformanceTextureCompression),
+            new(PerformanceTabs.TextureCap, "Texture Size Cap", DrawPerformanceTextureCap),
             new(PerformanceTabs.Threshold, "Auto Threshold Pausing", DrawPerformanceThresholdPausing),
             new(PerformanceTabs.Height, "Auto Height Pausing", DrawPerformanceHeightPausing),
-            new(PerformanceTabs.TextureCap, "Texture Size Cap", DrawPerformanceTextureCap),
         ];
 
     private enum PerformanceTabs

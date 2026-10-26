@@ -196,6 +196,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     private async Task DownloadFileThrottled(Uri requestUrl, string destinationFilename, string fileHash, IProgress<long> progress, DownloadDataCallback? callback, CancellationToken ct, bool withToken = true)
     {
         HttpResponseMessage response = null!;
+        long usageBytes = 0; // 1211: added to the usage graph once, when this transfer ends or is cancelled
         try
         {
             response = await _orchestrator.SendRequestAsync(HttpMethod.Get, requestUrl, ct, HttpCompletionOption.ResponseHeadersRead, withToken).ConfigureAwait(false);
@@ -307,6 +308,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), ct).ConfigureAwait(false);
 
                     progress.Report(bytesRead);
+                    usageBytes += bytesRead;
                 }
 
                 Logger.LogDebug("{requestUrl} downloaded to {tempPath}", requestUrl, destinationFilename);
@@ -331,6 +333,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
         finally
         {
+            MareSynchronos.Services.Usage.TransferUsage.AddDownload(usageBytes);
             if (stream != null)
             {
                 lock (_downloadInfoLock)
@@ -566,7 +569,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                         }
                         var finalFilename = _fileDbManager.GetCacheFilePath(directDownload.Hash, fileExtension);
                         Logger.LogDebug("Decompressing direct download {hash} from {compressedFile} to {finalFile}", directDownload.Hash, tempFilename, finalFilename);
-                        byte[] compressedBytes = await LowPriorityFile.ReadAllBytesAsync(tempFilename, token).ConfigureAwait(false);
+                        byte[] compressedBytes = await LowPriorityFile.ReadAllBytesAsync(tempFilename, CancellationToken.None).ConfigureAwait(false);
                         var decompressedBytes = LZ4Wrapper.Unwrap(compressedBytes);
                         var downloadedHash = Convert.ToHexString(SHA1.HashData(decompressedBytes));
                         if (!string.Equals(downloadedHash, directDownload.Hash, StringComparison.OrdinalIgnoreCase))
@@ -574,10 +577,16 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                             throw new InvalidDataException($"Downloaded file hash mismatch: expected {directDownload.Hash}, got {downloadedHash}");
                         }
                         await _fileCompactor.WriteAllBytesAsync(finalFilename, decompressedBytes, CancellationToken.None).ConfigureAwait(false);
-                        if (await PersistFileToStorageAsync(downloadedHash, finalFilename, ct).ConfigureAwait(false))
+                        if (await PersistFileToStorageAsync(downloadedHash, finalFilename, CancellationToken.None).ConfigureAwait(false))
                         {
                             Logger.LogDebug("Finished direct download of {hash}.", directDownload.Hash);
                         }
+                    }
+                    // Fork: the bytes are already on disk, so the decompress and cache write above run to the end even if the
+                    // batch is cancelled (no token), so the file is not fetched twice. A cancel PSync caused itself is not an error.
+                    catch (OperationCanceledException ex)
+                    {
+                        Logger.LogDebug(ex, "Cache write of {hash} was cancelled", directDownload.Hash);
                     }
                     catch (Exception ex)
                     {
@@ -669,7 +678,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            Logger.LogWarning("File cache creation was cancelled");
+            Logger.LogDebug("File cache creation was cancelled");
 
             return false;
         }

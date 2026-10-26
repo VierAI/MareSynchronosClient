@@ -26,9 +26,11 @@ public partial class SettingsUi
     private const string PriorityTier1Text = "Tier 1: in-game friends";
     private const string PriorityHelpInGameFriends = "People on your in-game (FFXIV) friends list. Only the real friends list counts, not PlayerSync pairs. " +
         "The list is read from the game every few seconds, so it can take a moment after login.";
-    private const string PriorityTier2Text = "Tier 2: direct syncs";
+    private const string PriorityTierPartyText = "Tier 2: party/alliance members";
+    private const string PriorityHelpParty = "People in your party, including a cross-world party (not alliance). Read from the game every few seconds.";
+    private const string PriorityTier2Text = "Tier 3: direct syncs";
     private const string PriorityHelpDirectSyncs = "Players you are directly paired with on both sides (not just syncshell members).";
-    private const string PriorityTier3Text = "Tier 3: everyone else.";
+    private const string PriorityTier3Text = "Tier 4: everyone else.";
 
     private string _uidToAddForPriority = string.Empty;
     private int _selectedPriorityEntry = -1;
@@ -126,6 +128,10 @@ public partial class SettingsUi
             ImGui.SameLine();
             ImGui.TextDisabled($"({InGameFriendService.CurrentCount} friends found)");
             _uiShared.DrawHelpText(PriorityHelpInGameFriends);
+            ImGui.TextUnformatted(PriorityTierPartyText);
+            ImGui.SameLine();
+            ImGui.TextDisabled($"({InGameFriendService.PartyCount} in party/alliance)");
+            _uiShared.DrawHelpText(PriorityHelpParty);
             ImGui.TextUnformatted(PriorityTier2Text);
             _uiShared.DrawHelpText(PriorityHelpDirectSyncs);
             ImGui.TextUnformatted(PriorityTier3Text);

@@ -13,6 +13,7 @@ using MareSynchronos.Services;
 using MareSynchronos.Services.Models;
 using MareSynchronos.Services.Mediator;
 using MareSynchronos.Services.ServerConfiguration;
+using MareSynchronos.UI.Components;
 using MareSynchronos.UI.ModernUi;
 using MareSynchronos.Utils;
 using MareSynchronos.WebAPI;
@@ -325,7 +326,7 @@ internal class PairAnalysisViewerUI : WindowMediatorSubscriberBase
                         }
                         int cmp = sortBy switch
                         {
-                            SortByID.Sound => Nullable.Compare(a.SoundStateSince, b.SoundStateSince),
+                            SortByID.Sound => SoundSortCompare(a, b),
                             SortByID.UID => string.Compare(a.UserData.UID, b.UserData.UID, StringComparison.OrdinalIgnoreCase),
                             SortByID.Name => string.Compare(a.PlayerName ?? "", b.PlayerName ?? "", StringComparison.OrdinalIgnoreCase),
                             SortByID.FileSize => a.LastAppliedDataBytes.CompareTo(b.LastAppliedDataBytes),
@@ -540,29 +541,12 @@ internal class PairAnalysisViewerUI : WindowMediatorSubscriberBase
                     float indent2 = (cellWidth2 - iconSize2.X) * 0.5f;
                     ImGui.SetCursorPosX(ImGui.GetCursorPosX() + indent2);
 
-                    if (pair.SoundStateSince != null)
+                    // 1211: same speaker as the Noises window (state + failed-load tooltip, click to mute/unmute).
+                    var soundSince = pair.SoundStateSince ?? pair.SoundLastFailedAt;
+                    if (soundSince != null || (pair.UserPair?.OwnPermissions.IsDisableSounds() ?? false))
                     {
-                        var timepassed = DateTimeOffset.UtcNow - pair.SoundStateSince.Value;
-
-                        FontAwesomeIcon icon = SoundActivity.SpeakerIcon(pair);
-
-                        var color = SoundActivity.IconColor(pair, timepassed);                 
-
-                        _uiSharedService.IconText(icon, color);
-
-                        UiSharedService.AttachToolTip(
-                            SoundActivity.Describe(pair, timepassed) +
-                            $"{UiSharedService.TooltipSeparator}CTRL + Click to disable sound sync with {pair.UserData.AliasOrUID}."
-                        );
-
-                        if (ImGui.IsItemClicked(ImGuiMouseButton.Left) && UiSharedService.CtrlPressed())
-                        {
-                            var perm = pair.UserPair!.OwnPermissions;
-
-                            perm.SetSticky(true);
-                            perm.SetDisableSounds(true);
-                            _ = _apiController.UserSetPairPermissions(new(pair.UserData, perm));
-                        }
+                        var timepassed = soundSince != null ? DateTimeOffset.UtcNow - soundSince.Value : TimeSpan.Zero;
+                        NoiseRowButtons.Speaker(pair, timepassed, _uiSharedService, _apiController);
                     }
 
                     // Button options Column
@@ -1001,5 +985,13 @@ internal class PairAnalysisViewerUI : WindowMediatorSubscriberBase
     {
         CenterInCell(ImGui.GetFrameHeight());
         _uiSharedService.BooleanToColoredIcon(ok, invert);
+    }
+
+    /// <summary>1211: Sound column sort: by state (ACTIVE, FADING, failed, none), then by when the state began.</summary>
+    private static int SoundSortCompare(Pair a, Pair b)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var r = SoundActivity.StateRank(a, now).CompareTo(SoundActivity.StateRank(b, now));
+        return r != 0 ? r : Nullable.Compare(a.SoundStateSince, b.SoundStateSince);
     }
 }

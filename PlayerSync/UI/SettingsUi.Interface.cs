@@ -27,6 +27,7 @@ public partial class SettingsUi
         new(InterfaceTabs.Notes, "Notes", DrawInterfaceNotes),
         new(InterfaceTabs.Notifications, "Notifications", DrawInterfaceNotifications),
         new(InterfaceTabs.ContextMenu, "Context Menu", DrawInterfaceContext),
+        new(InterfaceTabs.Animations, "Animations", DrawAnimationSettings), // fork
     ];
 
     private enum InterfaceTabs
@@ -35,7 +36,8 @@ public partial class SettingsUi
         Game,
         Notes,
         Notifications,
-        ContextMenu
+        ContextMenu,
+        Animations,
     }
 
     private void DrawInterfaceSettings()
@@ -192,6 +194,13 @@ public partial class SettingsUi
             Mediator.Publish(new RefreshUiMessage());
         }
         _uiShared.DrawHelpText("This will group up all Syncshells in a special 'All Syncshells' folder in the main UI.");
+        var showUnique = MareSynchronos.Services.VierAIConfigStore.Current.ShowSyncshellUniqueCount;
+        if (ImGui.Checkbox("Show people only reachable through each syncshell (green number)", ref showUnique))
+        {
+            MareSynchronos.Services.VierAIConfigStore.Current.ShowSyncshellUniqueCount = showUnique;
+            MareSynchronos.Services.VierAIConfigStore.MarkDirty();
+        }
+        _uiShared.DrawHelpText("Next to each syncshell in the main window: how many members you would lose by leaving it (not directly paired and in none of your other syncshells).");
 
         if (ImGui.Checkbox("Show player name for visible players", ref showNameInsteadOfNotes))
         {
@@ -694,7 +703,6 @@ public partial class SettingsUi
         }
 
         _lastTab = "General";
-
         _uiShared.BigText("Context Menu Options Order");
         ImGuiHelpers.ScaledDummy(2);
 

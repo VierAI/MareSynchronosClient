@@ -922,7 +922,7 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
         return Task.CompletedTask;
     }
 
-    public async Task<DrawWaitResult> WaitWhileCharacterIsDrawing(ILogger logger, GameObjectHandler handler, Guid redrawId, int timeOut = 5000, CancellationToken ct = default)
+    public async Task<DrawWaitResult> WaitWhileCharacterIsDrawing(ILogger logger, GameObjectHandler handler, Guid redrawId, int timeOut = 5000, CancellationToken ct = default, bool logTimeout = true)
     {
         var timer = Stopwatch.StartNew();
         while (true)
@@ -941,7 +941,7 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
             TimeSpan remaining = TimeSpan.FromMilliseconds(timeOut) - timer.Elapsed;
             if (remaining <= TimeSpan.Zero)
             {
-                logger.LogWarning("[{redrawId}] Timed out waiting for {handler} condition: {condition}", redrawId, handler, state.Condition);
+                if (logTimeout) logger.LogWarning("[{redrawId}] Timed out waiting for {handler} condition: {condition}", redrawId, handler, state.Condition);
 
                 return DrawWaitResult.TimedOut;
             }
