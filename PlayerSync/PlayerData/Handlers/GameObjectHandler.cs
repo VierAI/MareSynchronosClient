@@ -114,6 +114,8 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
 
     // do not use this
     public IntPtr Address { get; private set; } = IntPtr.Zero;
+    /// <summary>1225: the draw object seen on the last framework check (changes on every redraw or recreate).</summary>
+    public nint DrawObjectAddress { get; private set; } = nint.Zero;
     public ulong ContentId { get; }
     public DrawCondition CurrentDrawCondition { get; set; } = DrawCondition.None;
     public bool ModelReady
@@ -283,6 +285,7 @@ public sealed class GameObjectHandler : DisposableMediatorSubscriberBase, IHighP
         _objectIndex = gameObject->ObjectIndex;
         PlayerCharacterId = (ulong)gameObject->EntityId;
         var drawObjectAddress = (nint)gameObject->DrawObject;
+        DrawObjectAddress = drawObjectAddress;
         var chara = (Character*)address;
         var name = chara->GameObject.NameString;
         bool nameChange = !string.Equals(name, Name, StringComparison.Ordinal);

@@ -25,6 +25,24 @@ public class DownloadUi : WindowMediatorSubscriberBase
     private readonly DownloadPriorityQueue _priorityQueue;
     private readonly ConcurrentDictionary<GameObjectHandler, bool> _uploadingPlayers = new();
 
+    // 1.15.5.1404: live download throughput at the top of the downloads window. Log scale (1 KiB/s to 1 GiB/s), 0.5 s buckets,
+    // 30 s rolling history. Bytes are counted from the change in each file group's TransferredBytes between frames.
+    private const int SpeedBucketMs = 500;
+    private const int SpeedBuckets = 60;
+    private const int SpeedCurrentBuckets = 4; // "now" = average of the last 2 s
+    private const float SpeedGraphHeight = 30f;
+    private const double SpeedLogMin = 10; // log2(1 KiB/s)
+    private const double SpeedLogMax = 30; // log2(1 GiB/s)
+    private readonly double[] _speedHistory = new double[SpeedBuckets];
+    private readonly Dictionary<FileDownloadStatus, long> _speedLastSeen = new();
+    private readonly HashSet<FileDownloadStatus> _speedSeenNow = new();
+    private int _speedHead;
+    private long _speedBucketStartMs;
+    private long _speedBucketBytes;
+    private long _speedLastSampleMs;
+    private double _speedCurrent;
+    private double _speedPeak;
+
     public DownloadUi(ILogger<DownloadUi> logger, DalamudUtilService dalamudUtilService, MareConfigService configService,
         FileUploadManager fileTransferManager, MareMediator mediator, UiSharedService uiShared, PerformanceCollectorService performanceCollectorService,
         DownloadPriorityQueue priorityQueue)
@@ -79,6 +97,16 @@ public class DownloadUi : WindowMediatorSubscriberBase
     {
         if (_configService.Current.ShowTransferWindow)
         {
+            try
+            {
+                SampleSpeed();
+                if (!_currentDownloads.IsEmpty) DrawSpeedGraph();
+            }
+            catch
+            {
+                // ignore errors thrown from UI
+            }
+
             try
             {
                 var currentUploads = _fileTransferManager.CurrentUploadList;
@@ -266,7 +294,13 @@ public class DownloadUi : WindowMediatorSubscriberBase
             Flags |= ImGuiWindowFlags.NoBackground;
             Flags |= ImGuiWindowFlags.NoInputs;
             Flags |= ImGuiWindowFlags.NoResize;
+            // 1.15.5.1409: take mouse input only while the cursor is over last frame's graph (or a graph drag is running),
+            // so the graph can be dragged to move the window; the rest of the window stays click-through and NoMove.
+            var mouse = ImGui.GetIO().MousePos;
+            var overGraph = _graphRectValid && mouse.X >= _graphMin.X && mouse.Y >= _graphMin.Y && mouse.X <= _graphMax.X && mouse.Y <= _graphMax.Y;
+            if (_graphDragging || overGraph) Flags &= ~ImGuiWindowFlags.NoInputs;
         }
+        _graphRectValid = false;
 
         // Size the window from its content: 2 lines per transfer, 2 for uploads, widest line, all scaled by the UI scale.
         var scale = ImGuiHelpers.GlobalScale;
@@ -284,6 +318,8 @@ public class DownloadUi : WindowMediatorSubscriberBase
                     width = Math.Max(width, ImGui.CalcTextSize($"Compressing+Uploading {uploads}/{uploads}").X);
                     if (_currentDownloads.Any()) extra += 8f * scale;
                 }
+
+                if (!_currentDownloads.IsEmpty) extra += (SpeedGraphHeight + 6f) * scale; // 1.15.5.1404 speed graph
 
                 var rows = ActiveRows(out var waitingCount);
                 foreach (var item in rows)
@@ -314,6 +350,133 @@ public class DownloadUi : WindowMediatorSubscriberBase
             MaximumSize = new Vector2(width, height),
         };
     }
+
+    // 1.15.5.1404: counts the bytes moved since the last frame into the current 0.5 s bucket and rolls the buckets.
+    private void SampleSpeed()
+    {
+        var now = Environment.TickCount64;
+        var recent = _speedLastSampleMs != 0 && now - _speedLastSampleMs < 1000;
+        _speedLastSampleMs = now;
+        if (_speedBucketStartMs == 0) _speedBucketStartMs = now;
+
+        long delta = 0;
+        _speedSeenNow.Clear();
+        foreach (var batch in _currentDownloads)
+        {
+            foreach (var kv in batch.Value)
+            {
+                var st = kv.Value;
+                if (st == null) continue;
+                var t = st.TransferredBytes;
+                _speedSeenNow.Add(st);
+                if (_speedLastSeen.TryGetValue(st, out var last))
+                {
+                    if (t > last) delta += t - last;
+                }
+                else if (recent && t > 0)
+                {
+                    delta += t; // new file group since the last frame: everything it moved so far is new
+                }
+                _speedLastSeen[st] = t;
+            }
+        }
+        if (_speedLastSeen.Count != _speedSeenNow.Count)
+        {
+            foreach (var gone in _speedLastSeen.Keys.Where(k => !_speedSeenNow.Contains(k)).ToList()) _speedLastSeen.Remove(gone);
+        }
+        _speedBucketBytes += delta;
+
+        if (now - _speedBucketStartMs > (long)SpeedBucketMs * SpeedBuckets)
+        {
+            // idle longer than the whole history: start over
+            Array.Clear(_speedHistory);
+            _speedHead = 0;
+            _speedBucketBytes = recent ? _speedBucketBytes : 0;
+            _speedBucketStartMs = now;
+        }
+        while (now - _speedBucketStartMs >= SpeedBucketMs)
+        {
+            _speedHistory[_speedHead] = _speedBucketBytes * 1000.0 / SpeedBucketMs;
+            _speedBucketBytes = 0;
+            _speedHead = (_speedHead + 1) % SpeedBuckets;
+            _speedBucketStartMs += SpeedBucketMs;
+        }
+
+        double sum = 0, peak = 0;
+        for (int i = 1; i <= SpeedBuckets; i++)
+        {
+            var v = _speedHistory[(_speedHead - i + SpeedBuckets) % SpeedBuckets];
+            if (i <= SpeedCurrentBuckets) sum += v;
+            if (v > peak) peak = v;
+        }
+        _speedCurrent = sum / SpeedCurrentBuckets;
+        _speedPeak = peak;
+    }
+
+    private static float SpeedFrac(double bytesPerSec)
+    {
+        if (bytesPerSec <= 0) return 0f;
+        var f = (Math.Log2(bytesPerSec) - SpeedLogMin) / (SpeedLogMax - SpeedLogMin);
+        return (float)Math.Clamp(f, 0, 1);
+    }
+
+    private static string FormatSpeed(double bytesPerSec)
+    {
+        var ci = System.Globalization.CultureInfo.InvariantCulture;
+        if (bytesPerSec < 1024) return bytesPerSec.ToString("0", ci) + " B/s";
+        if (bytesPerSec < 1024d * 1024) return (bytesPerSec / 1024).ToString("0.0", ci) + " KiB/s";
+        if (bytesPerSec < 1024d * 1024 * 1024) return (bytesPerSec / (1024d * 1024)).ToString("0.0", ci) + " MiB/s";
+        return (bytesPerSec / (1024d * 1024 * 1024)).ToString("0.00", ci) + " GiB/s";
+    }
+
+    // 1.15.5.1404: the throughput graph. Oldest bucket on the left, newest on the right; faint lines at 10 KiB/s, 100 KiB/s,
+    // 1 MiB/s, 10 MiB/s and 100 MiB/s.
+    private void DrawSpeedGraph()
+    {
+        var scale = ImGuiHelpers.GlobalScale;
+        var width = Math.Max(50f * scale, ImGui.GetContentRegionAvail().X);
+        var height = SpeedGraphHeight * scale;
+        var drawList = ImGui.GetWindowDrawList();
+        var p0 = ImGui.GetCursorScreenPos();
+        var p1 = p0 + new Vector2(width, height);
+
+        drawList.AddRectFilled(p0, p1, UiSharedService.Color(0, 0, 0, 120), 2);
+        foreach (var mark in new[] { 10d * 1024, 100d * 1024, 1024d * 1024, 10d * 1024 * 1024, 100d * 1024 * 1024 })
+        {
+            var y = p1.Y - SpeedFrac(mark) * height;
+            drawList.AddLine(new Vector2(p0.X, y), new Vector2(p1.X, y), UiSharedService.Color(255, 255, 255, 40), 1f);
+        }
+
+        var barW = width / (SpeedBuckets - 1);
+        for (int i = 1; i < SpeedBuckets; i++)
+        {
+            var v = _speedHistory[(_speedHead + i) % SpeedBuckets]; // i = 1 is the oldest finished bucket, SpeedBuckets-1 the newest
+            var frac = SpeedFrac(v);
+            if (frac <= 0) continue;
+            var x = p0.X + (i - 1) * barW;
+            drawList.AddRectFilled(new Vector2(x, p1.Y - frac * height), new Vector2(x + Math.Max(1f, barW - 1f), p1.Y),
+                UiSharedService.Color(50, 205, 50, 190), 0f);
+        }
+
+        var text = $"{FormatSpeed(_speedCurrent)} ({FormatSpeed(_speedPeak)} peak)";
+        UiSharedService.DrawOutlinedFont(drawList, text, new Vector2(p0.X + 1f * scale, p0.Y + 1f),
+            UiSharedService.Color(255, 255, 255, 255), UiSharedService.Color(0, 0, 0, 255), 1);
+
+        // 1.15.5.1409: click and drag the graph to move the downloads window (no need to enable the move option).
+        _graphMin = p0; _graphMax = p1; _graphRectValid = true;
+        ImGui.InvisibleButton("##psyncSpeedGraphDrag", new Vector2(width, height));
+        _graphDragging = ImGui.IsItemActive();
+        if (_graphDragging && ImGui.IsMouseDragging(ImGuiMouseButton.Left, 0f))
+        {
+            var delta = ImGui.GetIO().MouseDelta;
+            if (delta.X != 0 || delta.Y != 0) ImGui.SetWindowPos(ImGui.GetWindowPos() + delta); // persisted via imgui.ini, same as the move mode
+        }
+        if (ImGui.IsItemHovered() || _graphDragging) ImGui.SetMouseCursor(ImGuiMouseCursor.ResizeAll);
+        ImGui.Dummy(new Vector2(width, 2f * scale));
+    }
+
+    private Vector2 _graphMin, _graphMax;
+    private bool _graphRectValid, _graphDragging;
 
     // The transfers shown in the list: batches with a file downloading or decompressing right now (at most ParallelDownloads).
     // Everything else (waiting for a slot) is only counted.

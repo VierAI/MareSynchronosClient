@@ -9,6 +9,7 @@ using MareSynchronos.Services.Mediator;
 using MareSynchronos.WebAPI.Files.Models;
 using Microsoft.Extensions.Logging;
 using PlayerSync.FileCache;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Json;
@@ -193,7 +194,360 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     private delegate void DownloadDataCallback(Span<byte> data);
 
-    private async Task DownloadFileThrottled(Uri requestUrl, string destinationFilename, string fileHash, IProgress<long> progress, DownloadDataCallback? callback, CancellationToken ct, bool withToken = true)
+    // 1225: download pipeline tuning. Under Wine every file and socket call goes through the single wineserver
+    // thread, so a batch of 19+ files arriving at once stalls the game. Batches are started a few files at a time,
+    // small files stay in memory (no temp file write, read back and delete), and decompress + hash + write run as
+    // one throttled step off the game thread. PC values keep the old throughput.
+    private const int StreamBufferSize = 128 * 1024;
+    private const int MaxReadSlice = 256 * 1024;
+    private const long InMemoryFileLimit = 32L * 1024 * 1024;
+    private const long InMemoryBudget = 192L * 1024 * 1024;
+    private const int MaxHttpRetries = 2;
+    private static long s_inMemoryBytes;
+    private static readonly SemaphoreSlim s_finalizeGate = new(LowPriorityFile.IsWine ? 1 : 3);
+
+    // 1.15.5.1226: Wine only. Big bursts (60-108 files from several players at once) still bunched up their file starts across
+    // batches, so new transfers are capped for the whole plugin: at most WineMaxFileStartsPerSecond in any rolling second and
+    // at least WineMinFileStartGapMs apart. A waiter that is cancelled takes no start. PC is not affected.
+    private const int WineMaxFileStartsPerSecond = 10;
+    private const int WineMinFileStartGapMs = 50;
+    private static readonly object s_wineStartLock = new();
+    private static readonly Queue<DateTime> s_wineStarts = new();
+
+    // 1.15.5.1227: throttled summary of the Wine start cap so logs show it pacing. One Information line per window of at least
+    // WineCapLogWindowMs with starts in it (starts, how many had to wait, longest wait); a window left open when a burst ends
+    // (no start for WineCapLogIdleMs) is written at the next start.
+    private const int WineCapLogWindowMs = 1000;
+    private const int WineCapLogIdleMs = 2000;
+    private static DateTime s_wineCapWindowStart;
+    private static DateTime s_wineCapLastStart;
+    private static int s_wineCapStarts;
+    private static int s_wineCapWaited;
+    private static double s_wineCapMaxWaitMs;
+
+    private readonly record struct WineCapSummary(int Starts, int Waited, double MaxWaitMs, double WindowMs);
+
+    private static async Task WineFileStartPaceAsync(ILogger logger, CancellationToken token)
+    {
+        if (!LowPriorityFile.IsWine) return;
+
+        var firstTry = DateTime.UtcNow;
+        var hadToWait = false;
+        while (true)
+        {
+            TimeSpan wait;
+            WineCapSummary? closedIdle = null;
+            WineCapSummary? closedWindow = null;
+            lock (s_wineStartLock)
+            {
+                var now = DateTime.UtcNow;
+                while (s_wineStarts.Count > 0 && now - s_wineStarts.Peek() >= TimeSpan.FromSeconds(1)) s_wineStarts.Dequeue();
+                var gapWait = TimeSpan.Zero;
+                if (s_wineStarts.Count > 0)
+                {
+                    var last = s_wineStarts.Last();
+                    var sinceLast = now - last;
+                    if (sinceLast < TimeSpan.FromMilliseconds(WineMinFileStartGapMs)) gapWait = TimeSpan.FromMilliseconds(WineMinFileStartGapMs) - sinceLast;
+                }
+                var windowWait = s_wineStarts.Count >= WineMaxFileStartsPerSecond ? s_wineStarts.Peek().AddSeconds(1) - now : TimeSpan.Zero;
+                wait = gapWait > windowWait ? gapWait : windowWait;
+                if (wait <= TimeSpan.Zero)
+                {
+                    s_wineStarts.Enqueue(now);
+
+                    // 1227 summary bookkeeping (counters only, logging happens outside the lock)
+                    if (s_wineCapStarts > 0 && (now - s_wineCapLastStart).TotalMilliseconds >= WineCapLogIdleMs)
+                    {
+                        closedIdle = new WineCapSummary(s_wineCapStarts, s_wineCapWaited, s_wineCapMaxWaitMs, (s_wineCapLastStart - s_wineCapWindowStart).TotalMilliseconds);
+                        s_wineCapStarts = 0;
+                    }
+
+                    if (s_wineCapStarts == 0)
+                    {
+                        s_wineCapWindowStart = now;
+                        s_wineCapWaited = 0;
+                        s_wineCapMaxWaitMs = 0;
+                    }
+
+                    s_wineCapStarts++;
+                    s_wineCapLastStart = now;
+                    if (hadToWait)
+                    {
+                        s_wineCapWaited++;
+                        var waitedMs = (now - firstTry).TotalMilliseconds;
+                        if (waitedMs > s_wineCapMaxWaitMs) s_wineCapMaxWaitMs = waitedMs;
+                    }
+
+                    var windowMs = (now - s_wineCapWindowStart).TotalMilliseconds;
+                    if (windowMs >= WineCapLogWindowMs)
+                    {
+                        closedWindow = new WineCapSummary(s_wineCapStarts, s_wineCapWaited, s_wineCapMaxWaitMs, windowMs);
+                        s_wineCapStarts = 0;
+                    }
+                }
+            }
+
+            if (closedIdle is { } idle) LogWineCapSummary(logger, idle);
+            if (closedWindow is { } win) LogWineCapSummary(logger, win);
+            if (wait <= TimeSpan.Zero) return;
+
+            hadToWait = true;
+            await Task.Delay(wait + TimeSpan.FromMilliseconds(1), token).ConfigureAwait(false);
+        }
+    }
+
+    private static void LogWineCapSummary(ILogger logger, WineCapSummary s)
+    {
+        logger.LogInformation("Wine file-start cap: {starts} starts in {windowMs:0} ms, {waited} waited, max wait {maxWaitMs:0} ms (cap {cap}/s, min gap {gap} ms)",
+            s.Starts, s.WindowMs, s.Waited, s.MaxWaitMs, WineMaxFileStartsPerSecond, WineMinFileStartGapMs);
+    }
+
+    private sealed class DownloadedPayload
+    {
+        public byte[]? Memory { get; init; }
+        public long ReservedBytes { get; set; }
+        public string? TempFile { get; init; }
+
+        public void ReleaseReservation()
+        {
+            if (ReservedBytes > 0)
+            {
+                Interlocked.Add(ref s_inMemoryBytes, -ReservedBytes);
+                ReservedBytes = 0;
+            }
+        }
+    }
+
+    private static bool IsRetryableStatus(HttpStatusCode? code) =>
+        code is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests
+        || (code.HasValue && (int)code.Value >= 500 && (int)code.Value <= 599);
+
+    private string BuildHeaderDump(HttpResponseMessage response)
+    {
+        var headersBuilder = new StringBuilder();
+        if (response.RequestMessage == null) return string.Empty;
+        headersBuilder.AppendLine("DefaultRequestHeaders:");
+        foreach (var header in _orchestrator.DefaultRequestHeaders)
+        {
+            foreach (var value in header.Value)
+            {
+                headersBuilder.AppendLine($"\"{header.Key}\": \"{value}\"");
+            }
+        }
+        headersBuilder.AppendLine("RequestMessage.Headers:");
+        foreach (var header in response.RequestMessage.Headers)
+        {
+            foreach (var value in header.Value)
+            {
+                headersBuilder.AppendLine($"\"{header.Key}\": \"{value}\"");
+            }
+        }
+        if (response.RequestMessage.Content != null)
+        {
+            headersBuilder.AppendLine("RequestMessage.Content.Headers:");
+            foreach (var header in response.RequestMessage.Content.Headers)
+            {
+                foreach (var value in header.Value)
+                {
+                    headersBuilder.AppendLine($"\"{header.Key}\": \"{value}\"");
+                }
+            }
+        }
+        if (response.Headers.TryGetValues("CF-RAY", out var rayValues))
+        {
+            headersBuilder.AppendLine("ResponseMessage.Headers.Cloudflare:");
+            foreach (var value in rayValues)
+            {
+                headersBuilder.AppendLine($"\"Cf-Ray\": \"{value}\"");
+            }
+        }
+        if (response.Headers.TryGetValues("CF-CACHE-STATUS", out var cacheValues))
+        {
+            headersBuilder.AppendLine("ResponseMessage.Headers.Cloudflare:");
+            foreach (var value in cacheValues)
+            {
+                headersBuilder.AppendLine($"\"Cf-Cache-Status\": \"{value}\"");
+            }
+        }
+        return headersBuilder.ToString();
+    }
+
+    private async Task<HttpResponseMessage> SendDownloadRequestAsync(Uri requestUrl, string fileHash, CancellationToken ct, bool withToken)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            HttpResponseMessage? response = null;
+            try
+            {
+                response = await _orchestrator.SendRequestAsync(HttpMethod.Get, requestUrl, ct, HttpCompletionOption.ResponseHeadersRead, withToken).ConfigureAwait(false);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    // Dump some helpful debugging info
+                    string responseText = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                    Logger.LogWarning("Unsuccessful status code for {requestUrl} is {statusCode}, request headers: \n{headers}\n, response text: \n\"{responseText}\"", requestUrl, response.StatusCode, BuildHeaderDump(response), responseText);
+
+                    // Raise an exception etc
+                    response.EnsureSuccessStatusCode();
+                }
+                else if (Logger.IsEnabled(LogLevel.Debug))
+                {
+                    Logger.LogDebug("Successful response for {requestUrl} is {statusCode}, request headers: \n{headers}", requestUrl, response.StatusCode, BuildHeaderDump(response));
+                }
+
+                return response;
+            }
+            catch (HttpRequestException ex)
+            {
+                response?.Dispose();
+                Logger.LogWarning(ex, "Error during download of {requestUrl}, HttpStatusCode: {code}", requestUrl, ex.StatusCode);
+                if (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Unauthorized)
+                {
+                    if (ex.StatusCode is HttpStatusCode.NotFound)
+                        await ReportFileMissing(fileHash, ct).ConfigureAwait(false);
+
+                    throw new InvalidDataException($"Http error {ex.StatusCode} (cancelled: {ct.IsCancellationRequested}): {requestUrl}", ex);
+                }
+
+                // 1225: a server error, timeout or rate limit (or a dropped connection before any body byte) is retried
+                // twice with a short backoff before the file is given up for this round.
+                if (attempt < MaxHttpRetries && (ex.StatusCode == null || IsRetryableStatus(ex.StatusCode)) && !ct.IsCancellationRequested)
+                {
+                    var delay = TimeSpan.FromMilliseconds(750 * (attempt + 1) + Random.Shared.Next(250));
+                    Logger.LogInformation("{hash}: retrying download in {delay} ms (attempt {attempt} of {max})", fileHash, (int)delay.TotalMilliseconds, attempt + 2, MaxHttpRetries + 1);
+                    await Task.Delay(delay, ct).ConfigureAwait(false);
+                    continue;
+                }
+
+                throw;
+            }
+            catch
+            {
+                response?.Dispose();
+                throw;
+            }
+        }
+    }
+
+    private async Task<DownloadedPayload> DownloadFileThrottled(Uri requestUrl, string tempFilename, string fileHash, IProgress<long> progress, DownloadDataCallback? callback, CancellationToken ct, bool withToken = true)
+    {
+        long usageBytes = 0; // 1211: added to the usage graph once, when this transfer ends or is cancelled
+        var response = await SendDownloadRequestAsync(requestUrl, fileHash, ct, withToken).ConfigureAwait(false);
+
+        ThrottledStream? stream = null;
+        byte[]? memory = null;
+        long reserved = 0;
+        bool toFile = false;
+        try
+        {
+            var length = response.Content.Headers.ContentLength;
+            if (length is > 0 and <= InMemoryFileLimit)
+            {
+                if (Interlocked.Add(ref s_inMemoryBytes, length.Value) <= InMemoryBudget)
+                {
+                    reserved = length.Value;
+                    memory = new byte[length.Value];
+                }
+                else
+                {
+                    Interlocked.Add(ref s_inMemoryBytes, -length.Value);
+                }
+            }
+            toFile = memory == null;
+
+            var limit = _orchestrator.DownloadLimitFor(fileHash);
+            Logger.LogTrace("Starting Download with a speed limit of {limit} to {target}", limit, toFile ? tempFilename : "memory");
+            stream = new ThrottledStream(await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false), limit) { Tag = fileHash };
+
+            lock (_downloadInfoLock)
+            {
+                _activeDownloadStreams.Add(stream);
+            }
+
+            if (memory != null)
+            {
+                int offset = 0;
+                int bytesRead;
+                while (offset < memory.Length
+                    && (bytesRead = await stream.ReadAsync(memory.AsMemory(offset, Math.Min(MaxReadSlice, memory.Length - offset)), ct).ConfigureAwait(false)) > 0)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    callback?.Invoke(memory.AsSpan(offset, bytesRead));
+                    offset += bytesRead;
+                    progress.Report(bytesRead);
+                    usageBytes += bytesRead;
+                }
+
+                if (offset != memory.Length)
+                {
+                    throw new InvalidDataException($"Download of {fileHash} ended early: {offset} of {memory.Length} bytes");
+                }
+
+                Logger.LogDebug("{requestUrl} downloaded to memory ({bytes} bytes)", requestUrl, memory.Length);
+                return new DownloadedPayload { Memory = memory, ReservedBytes = reserved };
+            }
+
+            var buffer = ArrayPool<byte>.Shared.Rent(StreamBufferSize);
+            try
+            {
+                var fileStream = LowPriorityFile.Create(tempFilename); // fork: low-priority I/O (Wine)
+                await using (fileStream.ConfigureAwait(false))
+                {
+                    int bytesRead;
+                    while ((bytesRead = await stream.ReadAsync(buffer.AsMemory(0, StreamBufferSize), ct).ConfigureAwait(false)) > 0)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        callback?.Invoke(buffer.AsSpan(0, bytesRead));
+                        await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), ct).ConfigureAwait(false);
+                        progress.Report(bytesRead);
+                        usageBytes += bytesRead;
+                    }
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+
+            Logger.LogDebug("{requestUrl} downloaded to {tempPath}", requestUrl, tempFilename);
+            return new DownloadedPayload { TempFile = tempFilename };
+        }
+        catch (Exception ex)
+        {
+            if (reserved > 0) Interlocked.Add(ref s_inMemoryBytes, -reserved);
+            if (toFile && ex is not OperationCanceledException)
+            {
+                try
+                {
+                    if (!tempFilename.IsNullOrEmpty())
+                        File.Delete(tempFilename);
+                }
+                catch
+                {
+                    // ignore if file deletion fails
+                }
+            }
+            throw;
+        }
+        finally
+        {
+            MareSynchronos.Services.Usage.TransferUsage.AddDownload(usageBytes);
+            if (stream != null)
+            {
+                lock (_downloadInfoLock)
+                {
+                    _activeDownloadStreams.Remove(stream);
+                }
+
+                await stream.DisposeAsync().ConfigureAwait(false);
+            }
+
+            response.Dispose();
+        }
+    }
+
+    // 1.15.5.1403 DownloadPipeline legacy: the 1224 transfer (temp file only, no HTTP retry), verbatim.
+    private async Task DownloadFileThrottledLegacy(Uri requestUrl, string destinationFilename, string fileHash, IProgress<long> progress, DownloadDataCallback? callback, CancellationToken ct, bool withToken = true)
     {
         HttpResponseMessage response = null!;
         long usageBytes = 0; // 1211: added to the usage graph once, when this transfer ends or is cancelled
@@ -475,10 +829,38 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         Logger.LogInformation("Priority tier {tier} ({tierName}) for {name} ({uid}): {count} file(s)", batchTier, PriorityTiers.Name(batchTier),
             batchInfo.DisplayName, batchInfo.Pair?.UserData.AliasOrUID ?? "-", directDownloads.Count);
 
+        // 1225: one lookup table instead of a linear search over every replacement for each file (new pipeline only).
+        Dictionary<string, FileReplacementData>? replacementByDownloadHash = null;
+        // 1.15.5.1410: new (1225+) download pipeline only; the DownloadPipeline switch is gone.
+        {
+            replacementByDownloadHash = new Dictionary<string, FileReplacementData>(StringComparer.OrdinalIgnoreCase);
+            foreach (var f in fileReplacement)
+            {
+                if (f.GamePaths == null || !f.GamePaths.Any()) continue;
+                replacementByDownloadHash.TryAdd(compressionSubstitutions.GetValueOrDefault(f.Hash, f.Hash), f);
+            }
+        }
+
+        // 1225: bounded per-batch parallelism (was one task per file). The global slot limit still decides how many
+        // transfers really run; this only stops a big batch from opening every file and socket at the same moment.
+        // Under Wine a batch is fed a few files at a time and file starts are spaced out a little.
+        var configured = _orchestrator.ConfiguredParallelDownloads;
+        var parallelism = LowPriorityFile.IsWine ? Math.Clamp(configured, 2, 6) : Math.Clamp(configured + 2, 4, 16);
+        parallelism = Math.Max(1, Math.Min(parallelism, directDownloads.Count));
+        var startSpacing = LowPriorityFile.IsWine && directDownloads.Count > parallelism ? TimeSpan.FromMilliseconds(15) : TimeSpan.Zero;
+        // 1228 DownloadCaps legacy (pre-1225, read once per batch): one task per file at once, no start spacing.
+
+        var pacerLock = new object();
+        var nextStart = DateTime.UtcNow;
+        if (directDownloads.Count > parallelism)
+        {
+            Logger.LogDebug("Batch {name}: {count} files, {parallel} at a time", batchInfo.DisplayName, directDownloads.Count, parallelism);
+        }
+
         // Start downloading each of the direct downloads
         var directDownloadsTask = directDownloads.Count == 0 ? Task.CompletedTask : Parallel.ForEachAsync(directDownloads, new ParallelOptions()
         {
-            MaxDegreeOfParallelism = directDownloads.Count,
+            MaxDegreeOfParallelism = parallelism,
             CancellationToken = ct,
         },
         async (directDownload, token) =>
@@ -486,10 +868,23 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
             if (!_downloadStatus.TryGetValue(directDownload.DirectDownloadUrl!, out var downloadTracker) || downloadTracker == null)
                 return;
 
-            await _orchestrator.GetOrStartDownloadTask(directDownload.Hash,
+            if (startSpacing > TimeSpan.Zero)
+            {
+                TimeSpan wait;
+                lock (pacerLock)
+                {
+                    var now = DateTime.UtcNow;
+                    if (nextStart < now) nextStart = now;
+                    wait = nextStart - now;
+                    nextStart += startSpacing;
+                }
+                if (wait > TimeSpan.Zero) await Task.Delay(wait, token).ConfigureAwait(false);
+            }
+
+            await _orchestrator.JoinOrStartDownloadAsync(directDownload.Hash,
                 (_, bytesDownloaded) => downloadTracker.TransferredBytes += bytesDownloaded,
                 (status) => downloadTracker.DownloadStatus = status,
-                async (hash, progress, statusCallback) =>
+                async (hash, progress, statusCallback, transferToken) =>
                 {
                     if (!FileCacheManager.IsValidFileHash(directDownload.Hash))
                     {
@@ -501,7 +896,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     try
                     {
                         statusCallback.Invoke(DownloadStatus.WaitingForSlot);
-                        await _orchestrator.WaitForDownloadSlotAsync(directDownload.Hash, batchTier, token, batchInfo.Pair).ConfigureAwait(false);
+                        await _orchestrator.WaitForDownloadSlotAsync(directDownload.Hash, batchTier, transferToken, batchInfo.Pair).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException)
                     {
@@ -511,8 +906,12 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     }
 
                     var tempFilename = _fileDbManager.GetCacheTempFilePath(directDownload.Hash);
+                    DownloadedPayload payload;
                     try
                     {
+                        // 1226: Wine-only per-second cap on new transfers (slot already held; cancellation releases it below)
+                        await WineFileStartPaceAsync(Logger, transferToken).ConfigureAwait(false);
+
                         // Download the compressed file directly
                         statusCallback.Invoke(DownloadStatus.Downloading);
 
@@ -533,9 +932,9 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 #if DEBUG
                         Logger.LogDebug("Beginning direct download of {hash} from {url} with key {key}", directDownload.Hash, directDownload.DirectDownloadUrl!, directDownload.MungeKey ?? "<none>");
 #else
-                    Logger.LogDebug("Beginning direct download of {hash} from {url}", directDownload.Hash, directDownload.DirectDownloadUrl!);
+                        Logger.LogDebug("Beginning direct download of {hash} from {url}", directDownload.Hash, directDownload.DirectDownloadUrl!);
 #endif
-                        await DownloadFileThrottled(new Uri(directDownload.DirectDownloadUrl!), tempFilename, directDownload.Hash, progress, munge, token, withToken: false).ConfigureAwait(false);
+                        payload = await DownloadFileThrottled(new Uri(directDownload.DirectDownloadUrl!), tempFilename, directDownload.Hash, progress, munge, transferToken, withToken: false).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException ex)
                     {
@@ -555,34 +954,41 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                         return;
                     }
 
-                    // Decompress from tempFilename to finalFilename
+                    // 1225: the network slot is free as soon as the bytes are in; the cache write below has its own gate.
+                    _orchestrator.ReleaseDownloadSlot(directDownload.Hash);
+
+                    // Decompress from the download to the final file
                     statusCallback.Invoke(DownloadStatus.Decompressing);
 
                     try
                     {
-                        var fileExtension = fileReplacement.First(f => string.Equals(compressionSubstitutions.GetValueOrDefault(f.Hash, f.Hash), directDownload.Hash, StringComparison.OrdinalIgnoreCase)).GamePaths[0].Split(".")[^1].ToLowerInvariant();
-                        // Security fix: the extension comes from the pair's game path; never let it reach the file system unchecked.
-                        if (!FileCacheManager.IsSafeCacheExtension(fileExtension))
+                        if (!replacementByDownloadHash!.TryGetValue(directDownload.Hash, out var replacementForHash))
                         {
-                            Logger.LogWarning("Skipping download of {hash}: unsafe file extension in the pair's game path", directDownload.Hash);
+                            throw new InvalidOperationException($"No file replacement for downloaded hash {directDownload.Hash}");
+                        }
+                        var fileExtension = replacementForHash.GamePaths[0].Split(".")[^1].ToLowerInvariant();
+                        // Security fix: the extension comes from the pair's game path; never let it reach the file system unchecked.
+                        var origin = MareSynchronos.Services.PSyncFileSafety.OriginOf(directDownload.DirectDownloadUrl);
+                        MareSynchronos.Services.PSyncFileSafety.RecordOrigin(batchInfo.Pair?.UserData.UID, origin);
+                        // 1.15.5.1217: only known game mod file types are written to the cache (allowlist).
+                        if (!FileCacheManager.IsSafeCacheExtension(fileExtension) || !MareSynchronos.Services.PSyncFileSafety.IsAllowedExtension(fileExtension))
+                        {
+                            Logger.LogWarning("PSync file safety: BLOCKED {hash} from {origin} for {pair}: file type '.{ext}' is not an allowed game mod type",
+                                directDownload.Hash, origin, batchInfo.Pair?.UserData.AliasOrUID ?? "unknown", FileCacheManager.IsSafeCacheExtension(fileExtension) ? fileExtension : "(invalid)");
+                            // Per pair only (audit M1): the type comes from this pair's game path, not from the file bytes.
+                            MareSynchronos.Services.PSyncFileSafety.CountBlocked();
+                            MareSynchronos.Services.PSyncFileSafety.RefuseForPair(batchInfo.Pair?.UserData.UID, directDownload.Hash);
                             return;
                         }
                         var finalFilename = _fileDbManager.GetCacheFilePath(directDownload.Hash, fileExtension);
-                        Logger.LogDebug("Decompressing direct download {hash} from {compressedFile} to {finalFile}", directDownload.Hash, tempFilename, finalFilename);
-                        byte[] compressedBytes = await LowPriorityFile.ReadAllBytesAsync(tempFilename, CancellationToken.None).ConfigureAwait(false);
-                        var decompressedBytes = LZ4Wrapper.Unwrap(compressedBytes);
-                        var downloadedHash = Convert.ToHexString(SHA1.HashData(decompressedBytes));
-                        if (!string.Equals(downloadedHash, directDownload.Hash, StringComparison.OrdinalIgnoreCase))
-                        {
-                            throw new InvalidDataException($"Downloaded file hash mismatch: expected {directDownload.Hash}, got {downloadedHash}");
-                        }
-                        await _fileCompactor.WriteAllBytesAsync(finalFilename, decompressedBytes, CancellationToken.None).ConfigureAwait(false);
-                        if (await PersistFileToStorageAsync(downloadedHash, finalFilename, CancellationToken.None).ConfigureAwait(false))
+                        Logger.LogDebug("Decompressing direct download {hash} to {finalFile}", directDownload.Hash, finalFilename);
+                        var stored = await Task.Run(() => DecompressVerifyAndWriteAsync(directDownload, payload, finalFilename, origin, fileExtension, batchInfo), CancellationToken.None).ConfigureAwait(false);
+                        if (stored != null && await PersistFileToStorageAsync(directDownload.Hash, finalFilename, stored.Value.Size, stored.Value.LastWriteUtc).ConfigureAwait(false))
                         {
                             Logger.LogDebug("Finished direct download of {hash}.", directDownload.Hash);
                         }
                     }
-                    // Fork: the bytes are already on disk, so the decompress and cache write above run to the end even if the
+                    // Fork: the bytes are already in, so the decompress and cache write above run to the end even if the
                     // batch is cancelled (no token), so the file is not fetched twice. A cancel PSync caused itself is not an error.
                     catch (OperationCanceledException ex)
                     {
@@ -594,11 +1000,11 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                     }
                     finally
                     {
-                        _orchestrator.ReleaseDownloadSlot(directDownload.Hash);
-                        DeleteTemporaryDownloadFile(tempFilename);
+                        payload.ReleaseReservation();
+                        if (payload.TempFile != null) DeleteTemporaryDownloadFile(payload.TempFile);
                     }
 
-                }, batchTier, batchInfo.Pair).ConfigureAwait(true);
+                }, token, batchTier, batchInfo.Pair).ConfigureAwait(false);
             downloadTracker.TransferredFiles = 1;
         });
 
@@ -608,6 +1014,185 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         Logger.LogDebug("Download end: {id}", batchInfo.DisplayName);
 
         ClearDownload();
+    }
+
+    /// <summary>
+    /// 1.15.5.1403 DownloadPipeline legacy: one direct download exactly as in 1.15.5.1224 (55051917). The download slot is held
+    /// through the transfer, read-back, decompress, hash and write; the bytes go to the temp file only (no in-memory buffer);
+    /// decompress runs inline (no shared finalize gate); the DB row is saved per file; the batch token cancels at once.
+    /// </summary>
+    private async Task DownloadDirectFileLegacyAsync(DownloadFileTransfer directDownload, IProgress<long> progress, Action<DownloadStatus> statusCallback,
+        int batchTier, DownloadBatchInfo batchInfo, List<FileReplacementData> fileReplacement, Dictionary<string, string> compressionSubstitutions, CancellationToken token)
+    {
+        if (!FileCacheManager.IsValidFileHash(directDownload.Hash))
+        {
+            Logger.LogWarning("Skipping direct download with an invalid file hash");
+            RemoveDownload(directDownload);
+            return;
+        }
+
+        try
+        {
+            statusCallback.Invoke(DownloadStatus.WaitingForSlot);
+            await _orchestrator.WaitForDownloadSlotAsync(directDownload.Hash, batchTier, token, batchInfo.Pair).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            Logger.LogDebug("{hash}: Detected cancellation of file queued for direct download, canceling.", directDownload.Hash);
+            RemoveDownload(directDownload);
+            return;
+        }
+
+        var tempFilename = _fileDbManager.GetCacheTempFilePath(directDownload.Hash);
+        try
+        {
+            // 1226 WineStartCap (own switch; returns at once while WineStartCap is legacy, the default)
+            await WineFileStartPaceAsync(Logger, token).ConfigureAwait(false);
+
+            // Download the compressed file directly
+            statusCallback.Invoke(DownloadStatus.Downloading);
+
+            DownloadDataCallback? munge = null;
+            if (directDownload.MungeKey != null)
+            {
+                long mungeOffset = 0;
+                byte[] mungeKeyBytes = Encoding.ASCII.GetBytes(directDownload.MungeKey);
+                munge = span =>
+                {
+                    for (int i = 0; i < span.Length; i++)
+                    {
+                        span[i] = (byte)(span[i] ^ mungeKeyBytes[mungeOffset]);
+                        mungeOffset = (mungeOffset + 1) % mungeKeyBytes.Length;
+                    }
+                };
+            }
+#if DEBUG
+            Logger.LogDebug("Beginning direct download of {hash} from {url} with key {key}", directDownload.Hash, directDownload.DirectDownloadUrl!, directDownload.MungeKey ?? "<none>");
+#else
+            Logger.LogDebug("Beginning direct download of {hash} from {url}", directDownload.Hash, directDownload.DirectDownloadUrl!);
+#endif
+            await DownloadFileThrottledLegacy(new Uri(directDownload.DirectDownloadUrl!), tempFilename, directDownload.Hash, progress, munge, token, withToken: false).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex)
+        {
+            Logger.LogDebug("{hash}: Detected cancellation of direct download, discarding file.", directDownload.Hash);
+            _orchestrator.ReleaseDownloadSlot(directDownload.Hash);
+            DeleteTemporaryDownloadFile(tempFilename);
+            Logger.LogDebug(ex, "{hash}: Error during direct download.", directDownload.Hash);
+            RemoveDownload(directDownload);
+            return;
+        }
+        catch (Exception ex)
+        {
+            _orchestrator.ReleaseDownloadSlot(directDownload.Hash);
+            DeleteTemporaryDownloadFile(tempFilename);
+            Logger.LogError(ex, "{hash}: Error during direct download.", directDownload.Hash);
+            RemoveDownload(directDownload);
+            return;
+        }
+
+        // Decompress from tempFilename to finalFilename
+        statusCallback.Invoke(DownloadStatus.Decompressing);
+
+        try
+        {
+            var fileExtension = fileReplacement.First(f => string.Equals(compressionSubstitutions.GetValueOrDefault(f.Hash, f.Hash), directDownload.Hash, StringComparison.OrdinalIgnoreCase)).GamePaths[0].Split(".")[^1].ToLowerInvariant();
+            // Security fix: the extension comes from the pair's game path; never let it reach the file system unchecked.
+            var origin = MareSynchronos.Services.PSyncFileSafety.OriginOf(directDownload.DirectDownloadUrl);
+            MareSynchronos.Services.PSyncFileSafety.RecordOrigin(batchInfo.Pair?.UserData.UID, origin);
+            // 1.15.5.1217: only known game mod file types are written to the cache (allowlist).
+            if (!FileCacheManager.IsSafeCacheExtension(fileExtension) || !MareSynchronos.Services.PSyncFileSafety.IsAllowedExtension(fileExtension))
+            {
+                Logger.LogWarning("PSync file safety: BLOCKED {hash} from {origin} for {pair}: file type '.{ext}' is not an allowed game mod type",
+                    directDownload.Hash, origin, batchInfo.Pair?.UserData.AliasOrUID ?? "unknown", FileCacheManager.IsSafeCacheExtension(fileExtension) ? fileExtension : "(invalid)");
+                // Per pair only (audit M1): the type comes from this pair's game path, not from the file bytes.
+                MareSynchronos.Services.PSyncFileSafety.CountBlocked();
+                MareSynchronos.Services.PSyncFileSafety.RefuseForPair(batchInfo.Pair?.UserData.UID, directDownload.Hash);
+                return;
+            }
+            var finalFilename = _fileDbManager.GetCacheFilePath(directDownload.Hash, fileExtension);
+            Logger.LogDebug("Decompressing direct download {hash} from {compressedFile} to {finalFile}", directDownload.Hash, tempFilename, finalFilename);
+            byte[] compressedBytes = await LowPriorityFile.ReadAllBytesAsync(tempFilename, CancellationToken.None).ConfigureAwait(false);
+            var decompressedBytes = LZ4Wrapper.Unwrap(compressedBytes);
+            var downloadedHash = Convert.ToHexString(SHA1.HashData(decompressedBytes));
+            if (!string.Equals(downloadedHash, directDownload.Hash, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException($"Downloaded file hash mismatch: expected {directDownload.Hash}, got {downloadedHash}");
+            }
+            if (MareSynchronos.Services.PSyncFileSafety.LooksExecutable(decompressedBytes))
+            {
+                Logger.LogWarning("PSync file safety: BLOCKED {hash} from {origin} for {pair}: content looks like a program or archive, not a '.{ext}' game file",
+                    directDownload.Hash, origin, batchInfo.Pair?.UserData.AliasOrUID ?? "unknown", fileExtension);
+                PSyncForbid(directDownload);
+                return;
+            }
+            await _fileCompactor.WriteAllBytesAsync(finalFilename, decompressedBytes, CancellationToken.None).ConfigureAwait(false);
+            if (await PersistFileToStorageLegacyAsync(downloadedHash, finalFilename, CancellationToken.None).ConfigureAwait(false))
+            {
+                Logger.LogDebug("Finished direct download of {hash}.", directDownload.Hash);
+            }
+        }
+        // Fork: the bytes are already on disk, so the decompress and cache write above run to the end even if the
+        // batch is cancelled (no token), so the file is not fetched twice. A cancel PSync caused itself is not an error.
+        catch (OperationCanceledException ex)
+        {
+            Logger.LogDebug(ex, "Cache write of {hash} was cancelled", directDownload.Hash);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Exception downloading {hash} from {url}", directDownload.Hash, directDownload.DirectDownloadUrl!);
+        }
+        finally
+        {
+            _orchestrator.ReleaseDownloadSlot(directDownload.Hash);
+            DeleteTemporaryDownloadFile(tempFilename);
+        }
+    }
+
+    /// <summary>
+    /// 1225: decompress, hash check, safety check and the cache write as one step behind a small gate
+    /// (1 at a time under Wine, 3 elsewhere), always on a pool thread. Returns the size and last-write time
+    /// stamped on the file, or null when the file was blocked.
+    /// </summary>
+    private async Task<(long Size, DateTime LastWriteUtc)?> DecompressVerifyAndWriteAsync(DownloadFileTransfer directDownload, DownloadedPayload payload, string finalFilename, string origin, string fileExtension, DownloadBatchInfo batchInfo)
+    {
+        await s_finalizeGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            byte[] compressedBytes = payload.Memory ?? await LowPriorityFile.ReadAllBytesAsync(payload.TempFile!, CancellationToken.None).ConfigureAwait(false);
+            var decompressedBytes = LZ4Wrapper.Unwrap(compressedBytes);
+            compressedBytes = null!;
+            payload.ReleaseReservation();
+            var downloadedHash = Convert.ToHexString(SHA1.HashData(decompressedBytes));
+            if (!string.Equals(downloadedHash, directDownload.Hash, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException($"Downloaded file hash mismatch: expected {directDownload.Hash}, got {downloadedHash}");
+            }
+            if (MareSynchronos.Services.PSyncFileSafety.LooksExecutable(decompressedBytes))
+            {
+                Logger.LogWarning("PSync file safety: BLOCKED {hash} from {origin} for {pair}: content looks like a program or archive, not a '.{ext}' game file",
+                    directDownload.Hash, origin, batchInfo.Pair?.UserData.AliasOrUID ?? "unknown", fileExtension);
+                PSyncForbid(directDownload);
+                return null;
+            }
+
+            var creationUtc = RandomDayInThePast();
+            var lastWriteUtc = RandomDayInThePast();
+            await _fileCompactor.WriteAllBytesWithTimesAsync(finalFilename, decompressedBytes, creationUtc, DateTime.UtcNow, lastWriteUtc, CancellationToken.None).ConfigureAwait(false);
+            return (decompressedBytes.LongLength, lastWriteUtc);
+        }
+        finally
+        {
+            s_finalizeGate.Release();
+        }
+    }
+
+    private static DateTime RandomDayInThePast()
+    {
+        DateTime start = new(1995, 1, 1, 1, 1, 1, DateTimeKind.Utc);
+        int range = (DateTime.UtcNow.Date - start.Date).Days;
+
+        return start.AddDays(Random.Shared.Next(range));
     }
 
     private void DeleteTemporaryDownloadFile(string path)
@@ -645,7 +1230,42 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         await _orchestrator.SendRequestAsync(HttpMethod.Post, MareFiles.ServerFilesReportFile(_orchestrator.FilesCdnUri!), hash, ct).ConfigureAwait(false);
     }
 
-    private async Task<bool> PersistFileToStorageAsync(string fileHash, string filePath, CancellationToken cancellationToken)
+    private void PSyncForbid(FileTransfer transfer)
+    {
+        MareSynchronos.Services.PSyncFileSafety.CountBlocked();
+        lock (_orchestrator.ForbiddenTransfers)
+        {
+            if (!_orchestrator.ForbiddenTransfers.Exists(f => string.Equals(f.Hash, transfer.Hash, StringComparison.OrdinalIgnoreCase)))
+                _orchestrator.ForbiddenTransfers.Add(transfer);
+        }
+    }
+
+    private async Task<bool> PersistFileToStorageAsync(string fileHash, string filePath, long size, DateTime lastWriteUtc)
+    {
+        try
+        {
+            // 1225: times were stamped on the write handle and the size is known, so no stat or reopen here;
+            // the DB row is saved together with other files that finished at the same time.
+            var entry = await _fileDbManager.PersistVerifiedDownloadAsync(filePath, fileHash, size, lastWriteUtc).ConfigureAwait(false);
+            if (entry == null)
+            {
+                Logger.LogError("Could not create or update the file cache for {path}", filePath);
+
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Error creating file cache");
+
+            return false;
+        }
+    }
+
+    // 1.15.5.1403 DownloadPipeline legacy: the 1224 per-file DB save (stat, set times, one commit per file), verbatim.
+    private async Task<bool> PersistFileToStorageLegacyAsync(string fileHash, string filePath, CancellationToken cancellationToken)
     {
         try
         {

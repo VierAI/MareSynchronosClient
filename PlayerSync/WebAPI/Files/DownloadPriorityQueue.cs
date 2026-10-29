@@ -77,6 +77,15 @@ public sealed class DownloadPriorityQueue
         }
     }
 
+    /// <summary>1.15.5.1401: totals for the debug IPC: files waiting for a slot and slots held right now.</summary>
+    public (int Waiting, int Running) GetTotals()
+    {
+        lock (_lock)
+        {
+            return (_waiters.Count, _holders.Count);
+        }
+    }
+
     /// <summary>Called once by the orchestrator: tries to take a free slot from the semaphore without waiting.</summary>
     public void SetSlotAcquirer(Func<bool> tryAcquireSlot) => _tryAcquireSlot = tryAcquireSlot;
 
@@ -237,12 +246,31 @@ public sealed class DownloadPriorityQueue
         }
     }
 
+    private static int DistanceBucket(Waiter w)
+    {
+        float best = float.MaxValue;
+        foreach (var p in w.Pairs)
+        {
+            var d = MareSynchronos.Services.PSyncCrowd.DistanceOf(p.UserData.UID);
+            if (d < best) best = d;
+        }
+        return best >= 10_000f ? int.MaxValue : (int)(best / 10f);
+    }
+
     private Waiter PickNextLocked()
     {
+        // 1.15.5.1217: tier first, then distance (10-yalm buckets so small movements do not reshuffle), then arrival order.
         var pick = _waiters[0];
+        var pickBucket = DistanceBucket(pick);
         foreach (var w in _waiters)
         {
-            if (w.Tier < pick.Tier || (w.Tier == pick.Tier && w.Sequence < pick.Sequence)) pick = w;
+            if (w.Tier > pick.Tier) continue;
+            var bucket = DistanceBucket(w);
+            if (w.Tier < pick.Tier || bucket < pickBucket || (bucket == pickBucket && w.Sequence < pick.Sequence))
+            {
+                pick = w;
+                pickBucket = bucket;
+            }
         }
 
         return pick;

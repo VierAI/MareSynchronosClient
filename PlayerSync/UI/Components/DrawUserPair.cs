@@ -142,6 +142,12 @@ public class DrawUserPair
                 ImGui.CloseCurrentPopup();
             }
             UiSharedService.AttachToolTip("This reapplies the last received character data to this character");
+            if (_uiSharedService.IconTextButton(FontAwesomeIcon.CloudDownloadAlt, "Force re-download", _menuWidth, true))
+            {
+                _ = _pair.ForceRedownloadAsync();
+                ImGui.CloseCurrentPopup();
+            }
+            UiSharedService.AttachToolTip("Deletes this user's files from the PlayerSync cache and downloads and applies them again." + Environment.NewLine + "Use this when they look broken or files are missing.");
         }
         if (_stageConfigService.Current.EnableStageFeatures)
         {
@@ -157,6 +163,13 @@ public class DrawUserPair
             _ = _apiController.CyclePauseAsync(_pair.UserData);
             ImGui.CloseCurrentPopup();
         }
+        var psyncBlocked = MareSynchronos.Services.PSyncCrowd.IsBlocked(_pair);
+        if (_uiSharedService.IconTextButton(psyncBlocked ? FontAwesomeIcon.CheckCircle : FontAwesomeIcon.Ban, psyncBlocked ? "Unblock user" : "Block user", _menuWidth, true))
+        {
+            MareSynchronos.Services.PSyncBlocklist.Toggle(_pair);
+            ImGui.CloseCurrentPopup();
+        }
+        UiSharedService.AttachToolTip("Block: nothing from this user is downloaded or applied, and they stop getting your data. Separate from pause, kept across restarts.");
         ImGui.Separator();
 
         ImGui.TextUnformatted("Pair Permission Functions");
@@ -397,6 +410,21 @@ public class DrawUserPair
                     ? FontAwesomeIcon.User : FontAwesomeIcon.Users));
             userPairText = _pair.UserData.AliasOrUID + " is offline";
         }
+        else if (MareSynchronos.Services.PSyncCrowd.IsBlocked(_pair))
+        {
+            _uiSharedService.IconText(FontAwesomeIcon.Ban, ImGuiColors.DalamudRed);
+            userPairText = _pair.UserData.AliasOrUID + " is blocked";
+        }
+        else if (_pair.IsVisible && MareSynchronos.Services.PSyncCrowd.IsNotDrawn(_pair.UserData.UID))
+        {
+            _uiSharedService.IconText(FontAwesomeIcon.EyeSlash, ImGuiColors.DalamudGrey);
+            userPairText = _pair.UserData.AliasOrUID + " is nearby but not drawn by the game: " + _pair.PlayerName;
+        }
+        else if (_pair.IsVisible && MareSynchronos.Services.PSyncCrowd.IsBudgetHeld(_pair.UserData.UID))
+        {
+            _uiSharedService.IconText(FontAwesomeIcon.Memory, ImGuiColors.DalamudOrange);
+            userPairText = _pair.UserData.AliasOrUID + " is visible but held by your memory budget: " + _pair.PlayerName;
+        }
         else if (_pair.IsVisible)
         {
             _uiSharedService.IconText(FontAwesomeIcon.Eye, ImGuiColors.ParsedGreen);
@@ -438,6 +466,17 @@ public class DrawUserPair
                 userPairText += Environment.NewLine + "Approx. Triangle Count (excl. Vanilla): "
                     + (_pair.LastAppliedDataTris > 1000 ? (_pair.LastAppliedDataTris / 1000d).ToString("0.0'k'") : _pair.LastAppliedDataTris);
             }
+        }
+
+        var psyncWait = MareSynchronos.Services.PSyncCrowd.DescribeWait(_pair);
+        if (!string.IsNullOrEmpty(psyncWait))
+        {
+            userPairText += UiSharedService.TooltipSeparator + "Status: " + psyncWait;
+        }
+        var psyncOrigin = MareSynchronos.Services.PSyncFileSafety.OriginFor(_pair.UserData.UID);
+        if (!string.IsNullOrEmpty(psyncOrigin))
+        {
+            userPairText += Environment.NewLine + "Files from: " + psyncOrigin;
         }
 
         if (_syncedGroups.Any())
@@ -488,7 +527,10 @@ public class DrawUserPair
 
     private void DrawName(float leftSide, float rightSide)
     {
-        _displayHandler.DrawPairText(_id, _pair, leftSide, () => rightSide - leftSide);
+        // The name gets exactly the space between the left icons and the right-side items (minus the profile icon drawn
+        // after it) and is ellipsized to fit, so it never draws under the speaker, perf label or buttons.
+        var nameWidth = Math.Max(0f, rightSide - leftSide - _displayHandler.ProfileIconReserve(_pair));
+        _displayHandler.DrawPairText(_id, _pair, leftSide, () => nameWidth);
     }
 
     private void DrawPairedClientMenu()
@@ -589,20 +631,38 @@ public class DrawUserPair
                 ImGui.EndPopup();
             }
         }
+
+        // PSync: speaker = the same mute toggle as the Noises window (NoiseRowButtons.Speaker -> ToggleMute: your own
+        // DisableSounds pair permission, sticky when muting). Drawn right next to the pause button; row order (right to left):
+        // menu, pause, speaker, info icon, perf warning, character data, syncshell role, then the name. It shows the modded
+        // sound state (active/fading) while there is one, and a red muted speaker for visible pairs you muted.
+        var ownSoundsMuted = _pair.UserPair!.OwnPermissions.IsDisableSounds();
+        if (Pair.SoundStateSince != null || (_pair.IsVisible && ownSoundsMuted))
+        {
+            var since = Pair.SoundStateSince is { } st ? DateTimeOffset.UtcNow - st : TimeSpan.Zero;
+            var speakerIcon = ownSoundsMuted ? FontAwesomeIcon.VolumeMute : SoundActivity.SpeakerIcon(Pair);
+            currentRightSide -= _uiSharedService.GetIconSize(speakerIcon).X + spacingX;
+            ImGui.SameLine(currentRightSide);
+            ImGui.AlignTextToFramePadding();
+            NoiseRowButtons.Speaker(_pair, since, _uiSharedService, _apiController);
+        }
+
         if (_pair.IsPaired)
         {
             var individualSoundsDisabled = (_pair.UserPair?.OwnPermissions.IsDisableSounds() ?? false) || (_pair.UserPair?.OtherPermissions.IsDisableSounds() ?? false);
             var individualAnimDisabled = (_pair.UserPair?.OwnPermissions.IsDisableAnimations() ?? false) || (_pair.UserPair?.OtherPermissions.IsDisableAnimations() ?? false);
             var individualVFXDisabled = (_pair.UserPair?.OwnPermissions.IsDisableVFX() ?? false) || (_pair.UserPair?.OtherPermissions.IsDisableVFX() ?? false);
             var individualIsSticky = _pair.UserPair!.OwnPermissions.IsSticky();
-            var individualIcon = individualIsSticky ? FontAwesomeIcon.ArrowCircleUp : FontAwesomeIcon.InfoCircle;
+            // PSync row layout: the yellow "i" only shows when a permission differs (sound/anim/VFX off on either side).
+            // Sticky (preferred permissions) alone no longer adds an icon; when the "i" shows, its tooltip still lists sticky.
+            var individualIcon = FontAwesomeIcon.InfoCircle;
 
-            if (individualAnimDisabled || individualSoundsDisabled || individualVFXDisabled || individualIsSticky)
+            if (individualAnimDisabled || individualSoundsDisabled || individualVFXDisabled)
             {
                 currentRightSide -= (_uiSharedService.GetIconSize(individualIcon).X + spacingX);
 
                 ImGui.SameLine(currentRightSide);
-                using (ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.DalamudYellow, individualAnimDisabled || individualSoundsDisabled || individualVFXDisabled))
+                using (ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.DalamudYellow))
                     _uiSharedService.IconText(individualIcon);
                 if (ImGui.IsItemHovered())
                 {
@@ -613,7 +673,7 @@ public class DrawUserPair
 
                     if (individualIsSticky)
                     {
-                        _uiSharedService.IconText(individualIcon);
+                        _uiSharedService.IconText(FontAwesomeIcon.ArrowCircleUp);
                         ImGui.SameLine(40 * ImGuiHelpers.GlobalScale);
                         ImGui.AlignTextToFramePadding();
                         ImGui.TextUnformatted("Preferred permissions enabled");
@@ -680,6 +740,42 @@ public class DrawUserPair
             }
         }
 
+        // PSync perf warning (Visible section only): shows ONLY the metric(s) over your warning threshold, e.g. "277M" or
+        // "325kT" (both: "277M · 325kT"). Yellow = over warning, red = over auto-pause. Nothing is shown when nothing is over.
+        if (_pair.IsVisible && MareSynchronos.Services.VierAIConfigStore.Current.PerfWarningInVisiblePane)
+        {
+            var w = MareSynchronos.Services.PSyncPerfWarning.Evaluate(_pair, _performanceConfigService.Current);
+            if (w.Any)
+            {
+                var parts = new List<(string Text, bool Red)>(2);
+                if (w.VramWarn) parts.Add((MareSynchronos.Services.PSyncPerfWarning.VramText(_pair.LastAppliedApproximateVRAMBytes), w.VramPause));
+                if (w.TrisWarn) parts.Add((MareSynchronos.Services.PSyncPerfWarning.TrisText(_pair.LastAppliedDataTris), w.TrisPause));
+                var sepText = MareSynchronos.Services.PSyncPerfWarning.Separator;
+                var sepWidth = ImGui.CalcTextSize(sepText).X;
+                float labelWidth = 0;
+                foreach (var p in parts) labelWidth += ImGui.CalcTextSize(p.Text).X;
+                if (parts.Count > 1) labelWidth += sepWidth;
+                currentRightSide -= labelWidth + spacingX;
+                ImGui.SameLine(currentRightSide);
+                ImGui.AlignTextToFramePadding();
+                var x = currentRightSide;
+                for (int pi = 0; pi < parts.Count; pi++)
+                {
+                    if (pi > 0)
+                    {
+                        ImGui.SameLine(x, 0);
+                        using (ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.DalamudYellow)) ImGui.TextUnformatted(sepText);
+                        x += sepWidth;
+                    }
+                    ImGui.SameLine(x, 0);
+                    using (ImRaii.PushColor(ImGuiCol.Text, parts[pi].Red ? ImGuiColors.DalamudRed : ImGuiColors.DalamudYellow))
+                        ImGui.TextUnformatted(parts[pi].Text);
+                    UiSharedService.AttachToolTip(MareSynchronos.Services.PSyncPerfWarning.Tooltip(_pair, w));
+                    x += ImGui.CalcTextSize(parts[pi].Text).X;
+                }
+            }
+        }
+
         if (_charaDataManager.SharedWithYouData.TryGetValue(_pair.UserData, out var sharedData))
         {
             currentRightSide -= (_uiSharedService.GetIconSize(FontAwesomeIcon.Running).X + (spacingX / 2f));
@@ -727,47 +823,6 @@ public class DrawUserPair
                 ImGui.SameLine(currentRightSide);
                 _uiSharedService.IconText(icon);
                 UiSharedService.AttachToolTip(text);
-            }
-        }
-
-        if (Pair.SoundStateSince != null)
-        {
-            var individualSoundsDisabled = (_pair.UserPair?.OwnPermissions.IsDisableSounds() ?? false) || (_pair.UserPair?.OtherPermissions.IsDisableSounds() ?? false);
-            var individualAnimDisabled = (_pair.UserPair?.OwnPermissions.IsDisableAnimations() ?? false) || (_pair.UserPair?.OtherPermissions.IsDisableAnimations() ?? false);
-            var individualVFXDisabled = (_pair.UserPair?.OwnPermissions.IsDisableVFX() ?? false) || (_pair.UserPair?.OtherPermissions.IsDisableVFX() ?? false);
-            var individualIsSticky = _pair.UserPair!.OwnPermissions.IsSticky();
-            var individualIcon = individualIsSticky ? FontAwesomeIcon.ArrowCircleUp : FontAwesomeIcon.InfoCircle;
-            var timepassed = DateTimeOffset.UtcNow - Pair.SoundStateSince.Value;
-
-            FontAwesomeIcon icon = SoundActivity.SpeakerIcon(Pair);
-            float iconspacing = _uiSharedService.GetIconSize(individualIcon).X + spacingX;
-
-            var color = SoundActivity.IconColor(Pair, timepassed);
-            if (individualAnimDisabled || individualSoundsDisabled || individualVFXDisabled || individualIsSticky)
-            {
-                ImGui.SameLine(currentRightSide);
-            }
-            else
-            {
-                currentRightSide -= iconspacing;
-            }
-
-            currentRightSide -= _uiSharedService.GetIconSize(icon).X + spacingX;
-            ImGui.SameLine(currentRightSide);
-            _uiSharedService.IconText(icon, color);
-
-            UiSharedService.AttachToolTip(
-                SoundActivity.Describe(Pair, timepassed) +
-                $"{UiSharedService.TooltipSeparator}CTRL + Click to disable sound sync with {Pair.UserData.AliasOrUID}."
-            );
-
-            if (ImGui.IsItemClicked(ImGuiMouseButton.Left) && UiSharedService.CtrlPressed())
-            {
-                var perm = _pair.UserPair!.OwnPermissions;
-
-                perm.SetSticky(true);
-                perm.SetDisableSounds(true);
-                _ = _apiController.UserSetPairPermissions(new(_pair.UserData, perm));
             }
         }
 

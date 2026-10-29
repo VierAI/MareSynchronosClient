@@ -505,6 +505,94 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
             .ToListAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    // 1225: downloaded files are saved to the DB in small groups (one SQLite commit per group instead of one per file).
+    // Each caller still waits until its own row is saved. The DB is in the default journal mode, so every commit
+    // creates, syncs and deletes a journal file; under Wine that is many host calls per file.
+    private const int DownloadPersistCoalesceMs = 40;
+    private readonly ConcurrentQueue<(FileCacheEntity Entity, TaskCompletionSource<FileCacheEntity?> Done)> _pendingDownloadPersists = new();
+    private int _downloadPersistFlushRunning;
+
+    /// <summary>
+    /// 1225: saves a freshly downloaded and hash-verified cache file. The caller already knows its size and the
+    /// last-write time it stamped, so no extra stat is done. Rows are grouped into one commit for ~40 ms.
+    /// </summary>
+    public Task<FileCacheEntity?> PersistVerifiedDownloadAsync(string fullPath, string verifiedHash, long size, DateTime lastWriteUtc)
+    {
+        // 1.15.5.1403: DownloadPipeline legacy (1224) never uses the grouped commit; one DB save per file. (The legacy download
+        // pipeline does not call this method at all; this is a second guard.)
+
+
+        var filePathWithinFileStore = GetFilePathWithinFileStore(Path.GetFullPath(fullPath), FileCacheStore.Cache);
+        if (filePathWithinFileStore == null)
+        {
+            return Task.FromResult<FileCacheEntity?>(null);
+        }
+
+        var entity = new FileCacheEntity(verifiedHash, filePathWithinFileStore, FileCacheStore.Cache, DateTime.UtcNow.Ticks, lastWriteUtc.Ticks, size);
+        entity.SetResolvedFilePath(Path.GetFullPath(fullPath));
+        var done = new TaskCompletionSource<FileCacheEntity?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingDownloadPersists.Enqueue((entity, done));
+        if (Interlocked.CompareExchange(ref _downloadPersistFlushRunning, 1, 0) == 0)
+        {
+            _ = Task.Run(FlushDownloadPersistsAsync);
+        }
+
+        return done.Task;
+    }
+
+    private async Task FlushDownloadPersistsAsync()
+    {
+        while (true)
+        {
+            try
+            {
+                await Task.Delay(DownloadPersistCoalesceMs).ConfigureAwait(false);
+                var batch = new List<(FileCacheEntity Entity, TaskCompletionSource<FileCacheEntity?> Done)>();
+                while (_pendingDownloadPersists.TryDequeue(out var item)) batch.Add(item);
+                if (batch.Count > 0)
+                {
+                    await SavePersistBatchAsync(batch).ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Grouped download persist loop failed");
+            }
+
+            Volatile.Write(ref _downloadPersistFlushRunning, 0);
+            if (_pendingDownloadPersists.IsEmpty || Interlocked.CompareExchange(ref _downloadPersistFlushRunning, 1, 0) != 0)
+            {
+                return;
+            }
+        }
+    }
+
+    private async Task SavePersistBatchAsync(List<(FileCacheEntity Entity, TaskCompletionSource<FileCacheEntity?> Done)> batch)
+    {
+        // The same path can show up twice (two pairs finishing the same hash): keep the last row per path.
+        var byPath = new Dictionary<string, FileCacheEntity>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in batch) byPath[item.Entity.FilePathWithinFileStore] = item.Entity;
+
+        try
+        {
+            var saved = await UpdateOrCreateFileCacheEntitiesAsync(byPath.Values.ToList(), FileCacheStore.Cache, CancellationToken.None, markAccessed: true).ConfigureAwait(false);
+            var savedByPath = new Dictionary<string, FileCacheEntity>(StringComparer.OrdinalIgnoreCase);
+            foreach (var entity in saved) savedByPath[entity.FilePathWithinFileStore] = entity;
+            foreach (var item in batch)
+            {
+                item.Done.TrySetResult(savedByPath.TryGetValue(item.Entity.FilePathWithinFileStore, out var e) ? e : null);
+            }
+            if (batch.Count > 1)
+            {
+                _logger.LogDebug("Saved {count} downloaded file(s) to the cache DB in one commit", byPath.Count);
+            }
+        }
+        catch (Exception ex)
+        {
+            foreach (var item in batch) item.Done.TrySetException(ex);
+        }
+    }
+
     /// <summary>
     /// This is used for file scans and file downloads, do not use it for player/pair mod lookups!
     /// This method does not use memory caching.
@@ -935,23 +1023,42 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
     /// This is used by the file storage scanner if we are exceeding our storage quota.
     /// This method will delete files from disk, oldest accessed first, up to the bytesToReclaim byte count.
     /// </summary>
-    public async Task<(long ReclaimedBytes, int DeletedFiles)> ReclaimLocalCacheStorageAsync(long bytesToReclaim, CancellationToken cancellationToken = default)
+    // 1.15.5.1227: Wine only. One 903-file / 603 MiB cleanup in 250-file pages caused about 4 s of 100-187 ms frames on the Mac,
+    // so under Wine the cleanup deletes in small chunks (at most WineCleanupChunkFiles files or WineCleanupChunkBytes, whichever
+    // comes first), releases the DB write lock after every chunk and yields WineCleanupYieldMs before the next one.
+    // It runs on the storage scan's own low-priority thread and never touches or waits on the framework thread.
+    // PC keeps 250-file pages with no yield.
+    private const int WineCleanupChunkFiles = 32;
+    private const long WineCleanupChunkBytes = 64L * 1024 * 1024;
+    private const int WineCleanupYieldMs = 200;
+
+    // 1228: chunked = the caller's choice (Wine and perf switch CacheCleanupChunked not legacy); false = the pre-1227 path.
+    public async Task<(long ReclaimedBytes, int DeletedFiles, int Chunks)> ReclaimLocalCacheStorageAsync(long bytesToReclaim, bool chunked, CancellationToken cancellationToken = default)
     {
         if (bytesToReclaim <= 0)
         {
-            return (0, 0);
+            return (0, 0, 0);
         }
 
-        const int batchSize = 250; // how many files we're checking at a time, keep it sane
+        int batchSize = chunked ? WineCleanupChunkFiles : 250; // how many files we're checking at a time, keep it sane
+        long chunkByteLimit = chunked ? WineCleanupChunkBytes : long.MaxValue;
         long reclaimedBytes = 0;
         long lastAccessedDateTicks = -1;
         long lastId = 0;
         int deletedFiles = 0;
+        int chunks = 0;
 
         while (reclaimedBytes < bytesToReclaim)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (chunked && chunks > 0)
+            {
+                // 1227: room for the disk and wineserver between chunks; the DB write lock is not held here
+                await Task.Delay(WineCleanupYieldMs, cancellationToken).ConfigureAwait(false);
+            }
+
             await _databaseWriteSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+            long chunkBytes = 0;
 
             try
             {
@@ -974,6 +1081,7 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
                     break;
                 }
 
+                chunks++;
                 List<FileCacheEntity> fileCachesToRemove = [];
 
                 foreach (var fileCache in fileCaches)
@@ -1041,6 +1149,7 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
 
                         fileCachesToRemove.Add(fileCache);
                         reclaimedBytes += fileSizeOnDisk;
+                        chunkBytes += fileSizeOnDisk;
                         deletedFiles++;
                     }
                     catch (Exception ex)
@@ -1052,6 +1161,12 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
                     // don't keep deleting files just because we batched them, only delete up until what is needed
                     // we should always land within the file size of the most recently deleted file, so 4K-40MB or so, unless it's a massive .scd...
                     if (reclaimedBytes >= bytesToReclaim)
+                    {
+                        break;
+                    }
+
+                    // 1227 (Wine): end this chunk at the byte limit; the next chunk resumes after lastAccessedDateTicks/lastId
+                    if (chunkBytes >= chunkByteLimit)
                     {
                         break;
                     }
@@ -1086,10 +1201,10 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
             }
         }
 
-        _logger.LogInformation("[DATABASE] Storage cleanup deleted {count} files and reclaimed approximately {reclaimedBytes} of the requested {requestedBytes}",
-            deletedFiles, reclaimedBytes.ToByteString(), bytesToReclaim.ToByteString());
+        _logger.LogInformation("[DATABASE] Storage cleanup deleted {count} files in {chunks} chunks and reclaimed approximately {reclaimedBytes} of the requested {requestedBytes}",
+            deletedFiles, chunks, reclaimedBytes.ToByteString(), bytesToReclaim.ToByteString());
 
-        return (reclaimedBytes, deletedFiles);
+        return (reclaimedBytes, deletedFiles, chunks);
     }
 
     /// <summary>

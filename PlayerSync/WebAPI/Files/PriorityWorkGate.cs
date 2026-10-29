@@ -31,6 +31,15 @@ public sealed class PriorityWorkGate
 
     public PriorityWorkGate(int capacity) => _capacity = Math.Max(1, capacity);
 
+    /// <summary>1.15.5.1401: read-only counts for the debug IPC: callers waiting and slots in use.</summary>
+    public (int Waiting, int InUse) Snapshot()
+    {
+        lock (_lock)
+        {
+            return (_waiters.Count, _inUse);
+        }
+    }
+
     public static int SafeTier(Pair? pair)
     {
         try { return TierResolver(pair); }

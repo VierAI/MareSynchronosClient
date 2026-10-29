@@ -5,6 +5,7 @@ using MareSynchronos.Services;
 using MareSynchronos.Services.Events;
 using MareSynchronos.Services.Mediator;
 using MareSynchronos.Services.ServerConfiguration;
+using MareSynchronos.WebAPI;
 using MareSynchronos.WebAPI.Files;
 using MareSynchronos.WebAPI.Files.Models;
 using System.Collections.Concurrent;
@@ -16,7 +17,7 @@ namespace MareSynchronos.Interop.Ipc;
 
 /// <summary>
 /// Fork (1.15.5.1210): read-only debug IPC for local debugging tools. Off unless the user enables 'Allow local debug tools to read pair info' in Settings > Debug; while off, GetPairStates returns an empty array.
-/// - <c>PSync.GetPairStatesVersion</c> () -> int, currently 3.
+/// - <c>PSync.GetPairStatesVersion</c> () -> int, currently 4.
 /// - <c>PSync.GetPairStates</c> () -> string: a JSON array, one object per visible pair:
 ///   {objIndex, name, state (loaded/paused/redrawing/waiting), lastApplyUtc (ISO 8601 or null), dataHash, noise (active/fading[:reason]/failed/none; v3 reason: loopEnded, oneShot, timeEnded, soundRemoved, moved),
 ///   plugins {glamourer, penumbra, customize, heels, honorific, moodles, loci, petNames: bool, what the last apply set},
@@ -27,10 +28,22 @@ namespace MareSynchronos.Interop.Ipc;
 ///   paused (bool) and pauseReason (stored pause reason text, null if not paused).
 ///   The character name is for local debugging; no UIDs are returned. Nothing is written and no action is taken.
 /// JSON text is returned (not a typed object) so callers in another plugin load context need no shared types.
+/// - <c>PSync.GetPairStatesRevision</c> () -> long (1.15.5.1226): changes whenever the pair states change (pair added or
+///   removed from view, online/offline, pause, visibility, apply start/finish, data received or changed, sound state,
+///   latest status, download batches started/finished). Callers can skip GetPairStates while it stays the same.
+///   Download byte progress alone does not change it. Returns 0 while the setting is off.
+///   v4 (1.15.5.1228) added modeHash to every row; v5 (1.15.5.1405) drops it again (the perf A/B switches were removed and
+///   every perf fix now has one fixed code path).
+/// - <c>PSync.GetPerfSwitchState</c> () -> string (1.15.5.1401; read-only since 1.15.5.1405): JSON {available, serverState,
+///   connected, visiblePairs, loadedPairs, waitingPairs, applyingPairs, downloadsQueued, downloadsRunning, downloadBatches,
+///   downloadFilesInFlight, applyGateWaiting, applyGateInUse, pendingApplies, pairsRevision} so a runner can tell when
+///   loading has settled. The name is kept so existing callers keep working; 1.15.5.1405 removed the switch and reconnect
+///   fields (modeHash, pendingModeHash, reconnect*, phase, last*). PSync.GetPerfSwitches, PSync.SetPerfSwitch and
+///   PSync.SetPerfSwitches were removed in 1.15.5.1405.
 /// </summary>
 public sealed class PSyncDebugIpc : IHostedService, IMediatorSubscriber
 {
-    public const int Version = 3;
+    public const int Version = 5;
 
     private readonly ILogger<PSyncDebugIpc> _logger;
     private readonly IDalamudPluginInterface _pi;
@@ -39,14 +52,21 @@ public sealed class PSyncDebugIpc : IHostedService, IMediatorSubscriber
     private readonly EventAggregator _events;
     private ICallGateProvider<string>? _states;
     private ICallGateProvider<int>? _version;
+    private ICallGateProvider<long>? _revision;
+    private ICallGateProvider<string>? _perfSwitchState;
+    private readonly ApiController _api;
+    private readonly object _revisionLock = new();
+    private int _lastFingerprint;
+    private bool _hasFingerprint;
     private readonly ServerConfigurationManager _serverConfig;
     private readonly ConcurrentDictionary<DownloadBatchInfo, ConcurrentDictionary<string, FileDownloadStatus>> _downloads = new();
 
     public MareMediator Mediator { get; }
 
     public PSyncDebugIpc(ILogger<PSyncDebugIpc> logger, IDalamudPluginInterface pi, PairManager pairManager, DalamudUtilService dalamudUtil, EventAggregator events,
-        MareMediator mediator, ServerConfigurationManager serverConfig)
+        MareMediator mediator, ServerConfigurationManager serverConfig, ApiController apiController)
     {
+        _api = apiController;
         Mediator = mediator;
         _serverConfig = serverConfig;
         Mediator.Subscribe<DownloadStartedMessage>(this, m => _downloads[m.BatchInfo] = m.DownloadStatus);
@@ -66,6 +86,10 @@ public sealed class PSyncDebugIpc : IHostedService, IMediatorSubscriber
             _version.RegisterFunc(() => Version);
             _states = _pi.GetIpcProvider<string>("PSync.GetPairStates");
             _states.RegisterFunc(GetPairStates);
+            _revision = _pi.GetIpcProvider<long>("PSync.GetPairStatesRevision");
+            _revision.RegisterFunc(GetPairStatesRevision);
+            _perfSwitchState = _pi.GetIpcProvider<string>("PSync.GetPerfSwitchState");
+            _perfSwitchState.RegisterFunc(GetPerfSwitchState);
         }
         catch (Exception ex)
         {
@@ -78,6 +102,8 @@ public sealed class PSyncDebugIpc : IHostedService, IMediatorSubscriber
     {
         _version?.UnregisterFunc();
         _states?.UnregisterFunc();
+        _revision?.UnregisterFunc();
+        _perfSwitchState?.UnregisterFunc();
         Mediator.UnsubscribeAll(this);
         return Task.CompletedTask;
     }
@@ -99,6 +125,103 @@ public sealed class PSyncDebugIpc : IHostedService, IMediatorSubscriber
         }
     }
 
+    // 1.15.5.1401: loading counters, so a runner knows when it is safe to start a capture (read-only since 1.15.5.1405)
+    private string GetPerfSwitchState()
+    {
+        var d = new Dictionary<string, object?>(StringComparer.Ordinal);
+        try
+        {
+            var available = MareSynchronos.Services.VierAIConfigStore.Current.AllowLocalDebugPairInfo;
+            d["available"] = available;
+            var serverState = _api.ServerState;
+            d["serverState"] = serverState.ToString();
+            d["connected"] = serverState == MareSynchronos.WebAPI.SignalR.Utils.ServerState.Connected;
+            if (!available) return JsonSerializer.Serialize(d); // no pair data while the debug setting is off
+
+            int visible = 0, loaded = 0, waiting = 0, applying = 0;
+            foreach (var pair in _pairManager.GetVisiblePairs())
+            {
+                visible++;
+                if (pair.HasDataApplicationTaskRunning) applying++;
+                else if (!pair.IsPaused && pair.HasCachedData && pair.LastDataApplicationTime > DateTimeOffset.MinValue) loaded++;
+                else if (!pair.IsPaused) waiting++;
+            }
+            d["visiblePairs"] = visible;
+            d["loadedPairs"] = loaded;
+            d["waitingPairs"] = waiting;
+            d["applyingPairs"] = applying;
+            var totals = DownloadPriorityQueue.Instance?.GetTotals() ?? (0, 0);
+            d["downloadsQueued"] = totals.Waiting;
+            d["downloadsRunning"] = totals.Running;
+            int batches = 0, files = 0;
+            foreach (var kv in _downloads)
+            {
+                batches++;
+                files += kv.Value.Count; // every file of a batch that has not finished yet
+            }
+            d["downloadBatches"] = batches;
+            d["downloadFilesInFlight"] = files;
+            var gate = PriorityWorkGate.Apply.Snapshot();
+            d["applyGateWaiting"] = gate.Waiting;
+            d["applyGateInUse"] = gate.InUse;
+            d["pendingApplies"] = applying + gate.Waiting;
+            d["pairsRevision"] = MareSynchronos.Services.PSyncPairRevision.Current;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "PSync.GetPerfSwitchState failed");
+            d["error"] = ex.Message;
+        }
+        return JsonSerializer.Serialize(d);
+    }
+
+    // 1.15.5.1226: cheap check (no JSON, no data copies): a fingerprint of the visible pair states; a change bumps the revision.
+    private long GetPairStatesRevision()
+    {
+        if (!MareSynchronos.Services.VierAIConfigStore.Current.AllowLocalDebugPairInfo) return 0;
+        try
+        {
+            var fp = Fingerprint();
+            lock (_revisionLock)
+            {
+                if (_hasFingerprint && fp != _lastFingerprint) MareSynchronos.Services.PSyncPairRevision.Bump();
+                _lastFingerprint = fp;
+                _hasFingerprint = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "PSync.GetPairStatesRevision fingerprint failed");
+            MareSynchronos.Services.PSyncPairRevision.Bump();
+        }
+        return MareSynchronos.Services.PSyncPairRevision.Current;
+    }
+
+    private int Fingerprint()
+    {
+        var pairs = _pairManager.GetVisiblePairs();
+        pairs.Sort((a, b) => string.CompareOrdinal(a.UserData.UID, b.UserData.UID));
+        var h = new HashCode();
+        h.Add(pairs.Count);
+        foreach (var pair in pairs)
+        {
+            h.Add(pair.UserData.UID, StringComparer.Ordinal);
+            h.Add(pair.IsPaused);
+            h.Add(pair.IsVisible);
+            h.Add(pair.IsOnline);
+            h.Add(pair.HasDataApplicationTaskRunning);
+            h.Add(pair.HasCachedData);
+            h.Add(pair.LastDataApplicationTime.UtcTicks);
+            h.Add((int)pair.SoundState);
+            h.Add(pair.SoundLastFailedAt?.UtcTicks ?? 0);
+            try { h.Add((int?)_events.GetLatestDataEventByUid(pair.UserData.UID)?.ApplicationStatus ?? -1); } catch { /* ignore */ }
+            var batches = 0;
+            foreach (var kv in _downloads) if (kv.Key.Pair == pair) batches++;
+            h.Add(batches);
+        }
+        return h.ToHashCode();
+    }
+
     private List<Dictionary<string, object?>> Collect()
     {
         var now = DateTimeOffset.UtcNow;
@@ -113,7 +236,11 @@ public sealed class PSyncDebugIpc : IHostedService, IMediatorSubscriber
                 : pair.HasCachedData && lastApply > DateTimeOffset.MinValue ? "loaded"
                 : "waiting";
             string? hash = null;
-            try { hash = pair.GetCopyOfPairCharacterData()?.DataHash.Value; } catch { hash = null; }
+            try
+            {
+                hash = pair.GetCopyOfPairCharacterData()?.DataHash.Value;
+            }
+            catch { hash = null; }
             Dictionary<string, bool>? plugins = null;
             try
             {
@@ -182,6 +309,18 @@ public sealed class PSyncDebugIpc : IHostedService, IMediatorSubscriber
             }
         }
         catch { row["tier"] ??= null; }
+        try
+        {
+            // 1.15.5.1217
+            var uid = pair.UserData.UID;
+            row["notDrawn"] = MareSynchronos.Services.PSyncCrowd.IsNotDrawn(uid);
+            row["budgetHeld"] = MareSynchronos.Services.PSyncCrowd.IsBudgetHeld(uid);
+            row["blocked"] = MareSynchronos.Services.PSyncCrowd.IsBlocked(pair);
+            var dist = MareSynchronos.Services.PSyncCrowd.DistanceOf(uid);
+            row["distance"] = dist < float.MaxValue ? Math.Round(dist, 1) : null;
+            row["waitReason"] = MareSynchronos.Services.PSyncCrowd.DescribeWait(pair);
+        }
+        catch { /* ignore */ }
         try
         {
             long total = 0, done = 0;

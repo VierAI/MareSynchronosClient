@@ -265,7 +265,8 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         _creationCts.Cancel();
         _creationCts.Dispose();
         _creationCts = new();
-        _cacheCreateLock.Wait(_creationCts.Token);
+        // 1221: never block the game thread; if a background task holds the lock, retry next frame
+        if (!_cacheCreateLock.Wait(0)) return;
 
         var objectKindsToCreate = _cachesToCreate.ToList();
         foreach (var creationObj in objectKindsToCreate)
@@ -398,7 +399,8 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
         var processingToken = _playerChangesCts.Token;
         var playerChangesToProcess = new List<PlayerChanges>();
 
-        _playerChangesLock.Wait(processingToken);
+        // 1221: never block the game thread; retry next frame
+        if (!_playerChangesLock.Wait(0)) return;
         try
         {
             while (_playerChangesToUpdate.TryDequeue(out var playerChange))
@@ -475,7 +477,8 @@ public sealed class CacheCreationService : DisposableMediatorSubscriberBase
 
     private bool HasPendingPlayerChanges()
     {
-        _playerChangesLock.Wait();
+        // 1221: non-blocking on the game thread; busy lock = check again next frame
+        if (!_playerChangesLock.Wait(0)) return false;
         try
         {
             return _playerChangesToUpdate.Count != 0;

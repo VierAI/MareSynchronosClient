@@ -21,6 +21,12 @@ public sealed partial class PairDataApplicationHandler
     private readonly object _forkDebounceLock = new();
     private string? _forkLastAppliedHash;
     private long _forkLastAppliedTicks;
+    // 1225: the character object and draw object the last finished apply landed on. A forced re-apply of the same hash on
+    // the very same, still-drawn object (no redraw, no recreate, never out of view since) has nothing to redo and is skipped.
+    // Cleared when the pair leaves view, on Penumbra re-init, and at cutscene/GPose end; the user's Reapply always runs.
+    private string? _forkDrawAppliedHash;
+    private nint _forkDrawAppliedAddress;
+    private nint _forkDrawAppliedDrawObject;
 
     // Frame-time audit item 1: split apply. Only one player's Penumbra stage runs per frame (shared by all pairs). The gate is
     // held for one extra framework tick after the stage so the next player's Penumbra change lands on a later frame.
@@ -100,6 +106,10 @@ public sealed partial class PairDataApplicationHandler
         {
             _forkLastAppliedHash = charaData.DataHash.Value;
             _forkLastAppliedTicks = Environment.TickCount64;
+            var handler = _charaHandler;
+            _forkDrawAppliedHash = handler == null ? null : charaData.DataHash.Value;
+            _forkDrawAppliedAddress = handler?.Address ?? nint.Zero;
+            _forkDrawAppliedDrawObject = handler?.DrawObjectAddress ?? nint.Zero;
         }
     }
 
@@ -170,7 +180,17 @@ public sealed partial class PairDataApplicationHandler
 
     private void ForkResetDebounce()
     {
-        lock (_forkDebounceLock) _forkLastAppliedHash = null;
+        lock (_forkDebounceLock)
+        {
+            _forkLastAppliedHash = null;
+            _forkDrawAppliedHash = null;
+        }
+    }
+
+    /// <summary>1225: forget the "already applied to this draw object" state, so the next forced re-apply runs in full.</summary>
+    private void ForkForgetDrawApplied()
+    {
+        lock (_forkDebounceLock) _forkDrawAppliedHash = null;
     }
 
     private bool ForkIsDuplicateApply(string newHash, string? cachedHash, bool force)
@@ -178,10 +198,23 @@ public sealed partial class PairDataApplicationHandler
         if (Interlocked.Exchange(ref _forkBypassDebounceOnce, 0) == 1) return false;
         if (!force || string.IsNullOrEmpty(newHash) || !string.Equals(newHash, cachedHash, StringComparison.Ordinal)) return false;
         if (Volatile.Read(ref _redrawOnNextApplication) != 0) return false;
+        var handler = _charaHandler;
         lock (_forkDebounceLock)
         {
-            return string.Equals(_forkLastAppliedHash, newHash, StringComparison.Ordinal)
-                && Environment.TickCount64 - _forkLastAppliedTicks < ForkDuplicateApplyWindowMs;
+            if (string.Equals(_forkLastAppliedHash, newHash, StringComparison.Ordinal)
+                && Environment.TickCount64 - _forkLastAppliedTicks < ForkDuplicateApplyWindowMs)
+                return true;
+
+            // 1.15.5.1412: ReapplySkip reverted to upstream behavior: only the short duplicate window above, no same-draw-object skip.
+            return false;
+#pragma warning disable CS0162
+            // 1225: same hash on the same character and the same draw object as the last finished apply.
+            return handler != null
+                && string.Equals(_forkDrawAppliedHash, newHash, StringComparison.Ordinal)
+                && _forkDrawAppliedDrawObject != nint.Zero
+                && handler.Address == _forkDrawAppliedAddress
+                && handler.DrawObjectAddress == _forkDrawAppliedDrawObject
+                && handler.CurrentDrawCondition == MareSynchronos.PlayerData.DrawCondition.None;
         }
     }
 

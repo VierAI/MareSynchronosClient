@@ -1,4 +1,4 @@
-﻿using Dalamud.Utility;
+using Dalamud.Utility;
 using MareSynchronos.API.Data;
 using MareSynchronos.API.Data.Enum;
 using MareSynchronos.API.Data.Extensions;
@@ -495,6 +495,12 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
         if (pauseDuration != null && pauseDuration != PauseDuration.Indefinitely)
         {
             _serverManager.SetPauseTimeoutForUid(uid, pauseDuration.Value);
+            // 1.15.5.1411: remember temporary auto-pauses across restarts (vierai-config.json TempPauses), same expiry as the timer.
+            if (reason is PauseReason.ThresholdHeight or PauseReason.ThresholdVram or PauseReason.ThresholdTriangles
+                && _serverManager.GetPendingPausedPairUIDs().TryGetValue(uid, out var expires))
+            {
+                MareSynchronos.Services.VierAITempPauses.Upsert(uid, reason.ToString(), pair.HashedCID, pair.PlayerName ?? string.Empty, expires);
+            }
         }
     }
 
@@ -509,6 +515,7 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
             Logger.LogWarning("Called to unpause pair but UID not found: {uid}", uid);
             _serverManager.RemovePauseReasonForUid(uid);
             _serverManager.RemovePendingPauseForUid(uid);
+            MareSynchronos.Services.VierAITempPauses.Remove(uid); // 1.15.5.1411
 
             return;
         }

@@ -199,6 +199,8 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
     public List<Pair> GetOnlineUserPairs() => _allClientPairs.Where(p => !string.IsNullOrEmpty(p.Value.GetPlayerNameHash())).Select(p => p.Value).ToList();
 
+    public List<Pair> GetAllPairs() => [.. _allClientPairs.Values];
+
     public int GetVisibleUserCount() => _allClientPairs.Count(p => p.Value.IsVisible);
 
     public List<UserData> GetVisibleUsers() => [.. _allClientPairs.Where(p => p.Value.IsVisible).Select(p => p.Key)];
@@ -413,6 +415,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         {
             _serverConfigurationManager.RemovePauseReasonForUid(pair.UserData.UID);
             _serverConfigurationManager.RemovePendingPauseForUid(pair.UserData.UID);
+            pair.ClearLastKnownIdentity(); // 1.15.5.1411: identity follows the (auto-)unpause
             UnmuteSoundRestore.Reapply(pair, unmuted);
         }
 
@@ -673,6 +676,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
                         var onlinePairs = GetOnlineUserPairs();
 
+                        MareSynchronos.Services.VierAITempPauses.PruneExpired(); // 1.15.5.1411
                         var pendingPausedPairs = _serverConfigurationManager.GetPendingPausedPairUIDs();
                         List<string> pairsToUnPause = new List<string>();
 
@@ -685,6 +689,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
                                 Logger.LogDebug("Removing stale paused pair entry for UID: {uid}", uid);
                                 _serverConfigurationManager.RemovePauseReasonForUid(uid);
                                 _serverConfigurationManager.RemovePendingPauseForUid(uid);
+                                if (pair != null && !pair.IsPaused) pair.ClearLastKnownIdentity(); else MareSynchronos.Services.VierAITempPauses.Remove(uid); // 1.15.5.1411
                                 continue;
                             }
 

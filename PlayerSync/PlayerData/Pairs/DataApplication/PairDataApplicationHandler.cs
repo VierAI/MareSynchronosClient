@@ -28,6 +28,9 @@ namespace MareSynchronos.PlayerData.Pairs;
 public sealed partial class PairDataApplicationHandler : DisposableMediatorSubscriberBase
 {
     private int _drawTimeouts;
+    // 1225: every draw timeout in a row, backoff window or not; at DrawParkAfterTimeouts the pair is parked.
+    private int _drawTimeoutStreak;
+    private const int DrawParkAfterTimeouts = 10;
     private DateTime _drawBackoffUntil = DateTime.MinValue;
     private sealed record DataApplication
     {
@@ -45,6 +48,12 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
     private static readonly IImmutableList<string> FileExtensionsToValidate = [".avfx", ".tmb"];
     private static readonly ConcurrentDictionary<string, byte> _filesThatHaveBeenVerifiedGood = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, byte> _filesThatHaveBeenVerifiedBad = new(StringComparer.OrdinalIgnoreCase);
+    // 1225 (audit 8): the verified-file sets are only a shortcut; past this size they start over (files are just checked again).
+    private const int MaxVerifiedEntries = 100000;
+    private static void ForkTrimVerified(ConcurrentDictionary<string, byte> set)
+    {
+        if (set.Count >= MaxVerifiedEntries) set.Clear();
+    }
     private static readonly Dictionary<PlayerChanges, AddonPlugin> _playerChangesToAddonPlugin = new()
             {
                 { PlayerChanges.Honorific, AddonPlugin.Honorific },
@@ -127,12 +136,17 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
 
         Mediator.Subscribe<PenumbraInitializedMessage>(this, (_) =>
         {
+            ForkForgetDrawApplied(); // 1225: new temporary collection, so the next re-apply must run in full
             _penumbraCollection = _ipcManager.Penumbra.CreateTemporaryCollectionAsync(logger, Pair.UserData.UID).ConfigureAwait(false).GetAwaiter().GetResult();
             if (!pair.IsVisible && _charaHandler != null)
             {
                 _charaHandler = null;
             }
         });
+
+        // 1225: after a cutscene or GPose the next forced re-apply always runs in full.
+        Mediator.Subscribe<CutsceneEndMessage>(this, (_) => ForkForgetDrawApplied());
+        Mediator.Subscribe<GposeEndMessage>(this, (_) => ForkForgetDrawApplied());
 
         Mediator.Subscribe<ClassJobChangedMessage>(this, (msg) =>
         {
@@ -288,6 +302,14 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
     // It is very important to keep and honor the CTokens throughout the pipeline
     public void UpdateVisibility(bool visible)
     {
+        // 1225: a visibility change unparks a pair that kept timing out on its draw wait.
+        if (_drawTimeoutStreak != 0 && visible != _isPairValid)
+        {
+            if (_drawTimeoutStreak >= DrawParkAfterTimeouts)
+                Logger.LogDebug("Pair {pair} visibility changed, unparked from draw timeouts", Pair.PairUIDName);
+            _drawTimeoutStreak = 0;
+        }
+
         if (!visible)
         {
             ForkResetDebounce();
@@ -449,6 +471,33 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
         }
     }
 
+    // 1.15.5.1226: data hash of the cached data without a deep copy per read. The hash is worked out once per data change
+    // (same value as GetCopyOfPairCharacterData()?.DataHash.Value) and reused until the cached data is replaced or changed.
+    private CharacterData? _psyncHashSource;
+    private string? _psyncHashValue;
+
+    public string? PSyncGetCachedDataHash()
+    {
+        lock (_cachedDataLock)
+        {
+            var data = _cachedData;
+            if (data == null) return null;
+            if (_psyncHashValue != null && ReferenceEquals(_psyncHashSource, data)) return _psyncHashValue;
+            var hash = data.DeepClone().DataHash.Value;
+            _psyncHashSource = data;
+            _psyncHashValue = hash;
+            return hash;
+        }
+    }
+
+    /// <summary>Call with _cachedDataLock held after changing fields of _cachedData in place.</summary>
+    private void PSyncCachedDataChanged()
+    {
+        _psyncHashSource = null;
+        _psyncHashValue = null;
+        MareSynchronos.Services.PSyncPairRevision.Bump();
+    }
+
     public async Task HandleOptionalPluginDataAsync(AddonPlugin plugin, CharacterData charaData)
     {
         if (_isVanillaEnforced)
@@ -468,6 +517,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
             {
                 Logger.LogDebug("Called to apply addon data but cached data is null.");
                 _cachedData = new();
+                PSyncCachedDataChanged();
             }
         }
 
@@ -597,6 +647,9 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
         var dataApplicationToken = _dataApplicationCancellationTokenSource.Token;
         using CancellationTokenSource linkedCts = CancellationTokenSource.CreateLinkedTokenSource(dataApplicationToken, topLevelToken);
         var linkedToken = linkedCts.Token;
+        Interlocked.Increment(ref _psyncApplyInFlight); // L1d: force re-download waits for this
+        try
+        {
 
         // Fork fix: a Penumbra (re)initialize clears _charaHandler for pairs that are out of view at that moment, and the pair's
         // one-time initialize never runs again (it already has a cached player). Every later apply then failed instantly with
@@ -659,6 +712,11 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
             PriorityWorkGate.Validation.Release();
         }
         await ApplyDataApplicationAsync(dataApplication, moddedPaths, linkedToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _psyncApplyInFlight);
+        }
     }
 
     public async Task ApplyCachedCharacterDataASync(Guid applicationBase, CancellationToken topLevelToken, bool forceApplyCustomization = false)
@@ -681,6 +739,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
             _cachedData = data?.DeepClone();
             _pendingData = null;
             if (data == null) ForkSetApplied(null);
+            PSyncCachedDataChanged();
         }
     }
 
@@ -933,7 +992,8 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
                 (toDownloadReplacements, locallyPresentFiles, moddedPaths) = await TryCalculateModdedDictionary(applicationBase, charaData,
                     compressedAlternateUsage, ActiveCompressionRedirects, cancellationToken).ConfigureAwait(false);
 
-                if (toDownloadReplacements.TrueForAll(c => _downloadManager.ForbiddenTransfers.Exists(f => string.Equals(f.Hash, c.Hash, StringComparison.Ordinal))))
+                if (toDownloadReplacements.TrueForAll(c => _downloadManager.ForbiddenTransfers.Exists(f => string.Equals(f.Hash, c.Hash, StringComparison.OrdinalIgnoreCase))
+                    || PSyncFileSafety.IsRefusedForPair(Pair.UserData.UID, c.Hash)))
                 {
                     break;
                 }
@@ -957,6 +1017,8 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
             {
                 Logger.LogWarning("[BASE-{appBase}] Missing hashes: {hashes}; missing mapped files: {paths}", 
                     applicationBase, string.Join(", ", missingHashes), string.Join(", ", missingMappedPaths.Select(entry => $"{entry.Key.GamePath} [{entry.Key.Hash}] => {entry.Value}")));
+                if (missingMappedPaths.Length > 0)
+                    PSyncHandleMissing(missingMappedPaths.Select(entry => entry.Key.Hash!).Distinct(StringComparer.OrdinalIgnoreCase).ToArray(), "mapped file missing on disk");
             }
 
             if (toDownloadReplacements.Count > 0)
@@ -985,6 +1047,8 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
 
                 Mediator.Publish(new EventMessage(new DataApplicationEvent(applicationBase, DataApplicationStatus.Failed, Pair.PlayerName, Pair.UserData,
                     nameof(DownloadAndVerifyCharacterModFilesAsync), EventSeverity.Error, $"At least one file failed to download for {Pair.PairUIDName}")));
+
+                PSyncHandleMissing(toDownloadReplacements.Select(m => m.Hash).ToArray(), "download did not complete");
 
                 //Logger.LogError("Still missing files for {pair}: {missing}", Pair.PairUIDName, string.Join(", ", toDownloadReplacements.Select(file => file.Hash)));
             }
@@ -1062,6 +1126,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
                     int expansionId = ValidationUtils.ParseExpansionId(file.Value);
                     if (!_dalamudUtil.IsExpansionInstalled(expansionId))
                     {
+                        ForkTrimVerified(_filesThatHaveBeenVerifiedBad);
                         _filesThatHaveBeenVerifiedBad.TryAdd(file.Value, 0);
                         string expansionName = expansionId < ExpansionNames.Length ? ExpansionNames[expansionId] : expansionId.ToString();
                         Logger.LogWarning("{uid} ({name}): File {dest} to be used as {source} is from the {expansionName} expansion which is not installed.",
@@ -1102,6 +1167,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
 
                                 if (validationMessages.Any(message => message.Level == MessageLevel.Crash))
                                 {
+                                    ForkTrimVerified(_filesThatHaveBeenVerifiedBad);
                                     _filesThatHaveBeenVerifiedBad.TryAdd(file.Key.Hash, 0);
                                     Logger.LogWarning("{uid} ({name}): File {hash} to be used as {gamePath} looks like it could crash game and will be ignored. \n  {description}",
                                         Pair.UserData.UID, PlayerName, file.Key.Hash, file.Key.GamePath, messageString);
@@ -1111,11 +1177,14 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
                                 }
                                 else
                                 {
+                                    ForkTrimVerified(_filesThatHaveBeenVerifiedGood);
                                     _filesThatHaveBeenVerifiedGood.TryAdd(file.Key.Hash, 0);
                                     Logger.LogDebug("{uid} ({name}): File {hash} to be used as {gamePath} looks like it might have some mistakes, but will still be used. \n  {description}",
                                         Pair.UserData.UID, PlayerName, file.Key.Hash, file.Key.GamePath, messageString);
                                 }
                             }
+
+                            ForkTrimVerified(_filesThatHaveBeenVerifiedGood);
 
                             _filesThatHaveBeenVerifiedGood.TryAdd(file.Key.Hash, 0);
                         }
@@ -1167,9 +1236,21 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
             Logger.LogDebug("[{applicationId}] Waiting for initial draw for for {handler}", applicationId, _charaHandler);
             // Fork: draw-timeout backoff. A player who keeps timing out (usually culled at the edge of a crowd) gets only a
             // short, silent draw check until the backoff window ends, and only the first timeout of each window is logged.
-            var inDrawBackoff = DateTime.UtcNow < _drawBackoffUntil;
-            var drawResult = await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, _charaHandler!, applicationId, inDrawBackoff ? 500 : 10000, cancellationToken, logTimeout: false).ConfigureAwait(false);
-            if (drawResult == DrawWaitResult.TimedOut)
+            // 1225: after DrawParkAfterTimeouts timeouts in a row the pair is parked: one quick draw probe per try, no
+            // waiting, until it draws or its visibility changes.
+            // 1228 RedrawCap legacy (pre-1225): no parking, timeouts are not counted toward it.
+            const bool legacyNoPark = true; // 1.15.5.1412: RedrawCap reverted to upstream: no draw-timeout parking
+            var parked = !legacyNoPark && _drawTimeoutStreak >= DrawParkAfterTimeouts;
+            var inDrawBackoff = parked || DateTime.UtcNow < _drawBackoffUntil;
+            var drawResult = await _dalamudUtil.WaitWhileCharacterIsDrawing(Logger, _charaHandler!, applicationId, parked ? 100 : inDrawBackoff ? 500 : 10000, cancellationToken, logTimeout: false).ConfigureAwait(false);
+            if (drawResult == DrawWaitResult.TimedOut && !legacyNoPark)
+            {
+                if (++_drawTimeoutStreak == DrawParkAfterTimeouts)
+                {
+                    Logger.LogInformation("[{applicationId}] {handler} timed out drawing {count} times in a row; parked until it draws or leaves view", applicationId, _charaHandler, _drawTimeoutStreak);
+                }
+            }
+            if (drawResult == DrawWaitResult.TimedOut && !parked)
             {
                 if (!inDrawBackoff)
                 {
@@ -1185,7 +1266,12 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
             }
             else if (drawResult == DrawWaitResult.Ready)
             {
+                if (_drawTimeoutStreak >= DrawParkAfterTimeouts)
+                {
+                    Logger.LogInformation("[{applicationId}] {handler} drew again, unparked", applicationId, _charaHandler);
+                }
                 _drawTimeouts = 0;
+                _drawTimeoutStreak = 0;
                 _drawBackoffUntil = DateTime.MinValue;
             }
             if (drawResult != DrawWaitResult.Ready)
@@ -1224,7 +1310,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
             foreach (var kind in updatedData)
             {
                 Mediator.Publish(new EventMessage(new DataApplicationEvent(applicationBase, DataApplicationStatus.Applying, Pair.PlayerName, 
-                    Pair.UserData, nameof(ApplyDataApplicationAsync), EventSeverity.Informational, $"Applying character data of type {kind.ToString()} for {Pair.PairUIDName}")));
+                    Pair.UserData, nameof(ApplyDataApplicationAsync), EventSeverity.Informational, $"Applying character data of type {kind.Key} for {Pair.PairUIDName}")));
 
                 penumbraApplied = await ApplyCustomizationDataAsync(dataApplication, kind.Key, moddedPathsData, penumbraApplied, cancellationToken).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
@@ -2192,6 +2278,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
             {
                 throw new InvalidDataException("Got an unknown AddonPlugin type!");
             }
+            PSyncCachedDataChanged();
         }
     }
 

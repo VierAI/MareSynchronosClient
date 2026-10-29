@@ -95,6 +95,7 @@ public class IdDisplayHandler
     {
         ImGui.SameLine(textPosX);
         (bool textIsUid, string playerText) = GetPlayerText(pair);
+        var nameTruncated = false;
         if (!string.Equals(_editEntry, pair.UserData.UID, StringComparison.Ordinal))
         {
             ImGui.AlignTextToFramePadding();
@@ -105,7 +106,16 @@ public class IdDisplayHandler
             {
                 using (ImRaii.PushColor(ImGuiCol.Text, UiSharedService.Color(highlighter.Item2), highlighter.Item1))
                 {
-                    ImGui.TextUnformatted(playerText);
+                    // PSync: ellipsize to the width the row gives us (measured in the font actually used, mono for UIDs).
+                    var maxWidth = Math.Max(0f, editBoxWidth.Invoke());
+                    var shown = playerText;
+                    if (ImGui.CalcTextSize(playerText).X > maxWidth)
+                    {
+                        shown = maxWidth < ImGui.CalcTextSize("\u2026").X ? string.Empty : MareSynchronos.UI.Components.NoiseNameFit.Fit(playerText, maxWidth).Text;
+                        nameTruncated = true;
+                    }
+                    if (shown.Length > 0) ImGui.TextUnformatted(shown);
+                    else ImGui.Dummy(new System.Numerics.Vector2(0, ImGui.GetTextLineHeight()));
                 }
             }
 
@@ -120,7 +130,7 @@ public class IdDisplayHandler
 
                 if (_popupTime > DateTime.UtcNow || !_mareConfigService.Current.ProfilesShow)
                 {
-                    ImGui.SetTooltip("Left click to switch between UID display and nick" + Environment.NewLine
+                    ImGui.SetTooltip((nameTruncated ? playerText + Environment.NewLine : string.Empty) + "Left click to switch between UID display and nick" + Environment.NewLine
                         + "Right click to change nick for " + pair.UserData.AliasOrUID + Environment.NewLine
                         + "Middle Mouse Button to open their profile in a separate window");
                 }
@@ -192,6 +202,18 @@ public class IdDisplayHandler
             UiSharedService.AttachToolTip("Hit ENTER to save\nRight click to cancel");
         }
     }
+
+    /// <summary>PSync: width the profile icon (drawn after the name) takes, incl. spacing; 0 when it is not shown.</summary>
+    public float ProfileIconReserve(Pair pair)
+    {
+        if (!ShowsProfileIcon(pair)) return 0f;
+        return _uiSharedService.GetIconSize(FontAwesomeIcon.Portrait).X + ImGui.GetStyle().ItemSpacing.X;
+    }
+
+    private bool ShowsProfileIcon(Pair pair)
+        => _mareConfigService.Current.ShowProfileIconByNames && pair.HasProfile
+            && !(pair.IsPaused || pair.UserPair.OtherPermissions.IsPaused())
+            && !(!pair.UserPair.Groups.Any() && pair.IsOneSidedPair);
 
     public void DrawProfileIcon(Pair pair)
     {

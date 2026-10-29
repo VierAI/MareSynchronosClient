@@ -138,10 +138,13 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
     {
         if (!info.Valid)
         {
-            Pair.SoundLastFailedAt = loadedAt;
-            Logger.LogDebug("Sound load for {pair} ignored as failed: {gamePath} -> {filePath}", Pair.UserData.AliasOrUID, gamePath, filePath);
+            // Next build: never replaces ACTIVE/FADING; a path failing repeatedly is ignored for a while (SoundActivity).
+            var recorded = SoundActivity.OnSoundLoadFailed(Pair, gamePath, loadedAt);
+            Logger.LogDebug("Sound load for {pair} ignored as failed{rec}: {gamePath} -> {filePath}", Pair.UserData.AliasOrUID,
+                recorded ? string.Empty : " (not recorded)", gamePath, filePath);
             return;
         }
+        SoundActivity.OnSoundLoadSucceeded(Pair, gamePath);
         Pair.LastLoadedSoundSinceRedrawTime = loadedAt;
         Pair.LastLoadedSoundSinceRedraw = filePath;
         var activeChanged = SoundActivity.OnSoundLoaded(Pair, loadedAt, info);

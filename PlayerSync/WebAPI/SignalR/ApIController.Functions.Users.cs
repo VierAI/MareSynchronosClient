@@ -11,13 +11,14 @@ namespace MareSynchronos.WebAPI;
 #pragma warning disable MA0040
 public partial class ApiController
 {
-    public async Task PushCharacterData(CharacterData data, List<UserData> visibleCharacters)
+    // 1.15.5.1224: returns true only when the hub call succeeded, so callers can tell a failed push from a sent one.
+    public async Task<bool> PushCharacterData(CharacterData data, List<UserData> visibleCharacters)
     {
-        if (!IsConnected) return;
+        if (!IsConnected) return false;
 
         try
         {
-            await PushCharacterDataInternal(data, [.. visibleCharacters]).ConfigureAwait(false);
+            return await PushCharacterDataInternal(data, [.. visibleCharacters]).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -27,6 +28,7 @@ public partial class ApiController
         {
             Logger.LogWarning(ex, "Error during upload of files");
         }
+        return false;
     }
 
     public async Task UserAddPair(UserDto user, bool pairingNotice)
@@ -71,15 +73,20 @@ public partial class ApiController
         return await _mareHub!.InvokeAsync<UserProfileDto>(nameof(UserGetProfile), dto).ConfigureAwait(false);
     }
 
-    public async Task UserPushData(UserCharaDataMessageDto dto)
+    public async Task UserPushData(UserCharaDataMessageDto dto) => await TryUserPushData(dto).ConfigureAwait(false);
+
+    // 1.15.5.1224: same as UserPushData but reports whether the hub call succeeded.
+    private async Task<bool> TryUserPushData(UserCharaDataMessageDto dto)
     {
         try
         {
             await _mareHub!.InvokeAsync(nameof(UserPushData), dto).ConfigureAwait(false);
+            return true;
         }
         catch (Exception ex)
         {
             Logger.LogWarning(ex, "Failed to Push character data");
+            return false;
         }
     }
 
@@ -176,7 +183,7 @@ public partial class ApiController
         await _mareHub!.SendAsync(nameof(GroupUserRejectInvite), dto).ConfigureAwait(false);
     }
 
-    private async Task PushCharacterDataInternal(CharacterData character, List<UserData> visibleCharacters)
+    private async Task<bool> PushCharacterDataInternal(CharacterData character, List<UserData> visibleCharacters)
     {
         Logger.LogInformation("Pushing character data for {hash} to {charas}", character.DataHash.Value, string.Join(", ", visibleCharacters.Select(c => c.AliasOrUID)));
         StringBuilder sb = new();
@@ -190,7 +197,7 @@ public partial class ApiController
         }
         Logger.LogDebug("Chara data contained: {nl} {data}", Environment.NewLine, sb.ToString());
 
-        await UserPushData(new(visibleCharacters, character, null)).ConfigureAwait(false);
+        return await TryUserPushData(new(visibleCharacters, character, null)).ConfigureAwait(false);
     }
 }
 #pragma warning restore MA0040

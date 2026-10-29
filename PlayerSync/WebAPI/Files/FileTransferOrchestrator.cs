@@ -175,6 +175,12 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
     private sealed class DownloadTask()
     {
         public Task Task { get; set; } = null!;
+        // 1225: shared transfer token and waiter count, so a batch that is cancelled and asked again right away
+        // joins the transfer that is still running instead of starting the same file again.
+        public CancellationTokenSource? Cts { get; init; }
+        public int Waiters;
+        public int Generation;
+        public bool Finished;
         public Progress<long> Progress { get; set; } = null!;
         public DownloadStatus CurrentStatus { get; set; } = DownloadStatus.Initializing;
         public event Action<DownloadStatus>? StatusUpdated;
@@ -244,6 +250,133 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
         }
 
         return result.Task;
+    }
+
+    /// <summary>1225: how long a transfer nobody waits for any more keeps running, in case the same file is asked for again.</summary>
+    public const int AbandonedTransferGraceMs = 4000;
+
+    /// <summary>The configured parallel download count (Settings, Transfers).</summary>
+    public int ConfiguredParallelDownloads => Math.Clamp(_mareConfig.Current.ParallelDownloads, 1, MaxTransferSlots);
+
+    /// <summary>
+    /// 1225: like <see cref="GetOrStartDownloadTask"/>, but the transfer runs on its own token. A caller whose token is
+    /// cancelled stops waiting right away; the transfer itself is only cancelled when nobody has joined it again
+    /// within <see cref="AbandonedTransferGraceMs"/>. A batch that is cancelled and re-requested right after (new
+    /// data for the same pair, a visibility flip) therefore joins the running transfer instead of fetching it twice.
+    /// </summary>
+    public Task JoinOrStartDownloadAsync(string hash, EventHandler<long> progressCallback, Action<DownloadStatus> statusCallback,
+        Func<string, IProgress<long>, Action<DownloadStatus>, CancellationToken, Task> downloadFunc, CancellationToken callerToken,
+        int tier = PriorityTiers.Everyone, MareSynchronos.PlayerData.Pairs.Pair? pair = null)
+    {
+        DownloadTask result;
+        bool joined;
+
+        lock (_runningDownloadsLock)
+        {
+            if (_runningDownloads.TryGetValue(hash, out var active) && !(active.Cts?.IsCancellationRequested ?? false))
+            {
+                result = active;
+                if (tier < PriorityTiers.Everyone || pair != null) _priorityQueue.Promote(hash, tier, pair);
+                result.Progress.ProgressChanged += progressCallback;
+                result.StatusUpdated += statusCallback;
+                result.Waiters++;
+                result.Generation++;
+                joined = true;
+            }
+            else
+            {
+                var progress = new Progress<long>(value => progressCallback.Invoke(null, value));
+                var cts = new CancellationTokenSource();
+                result = new DownloadTask { Progress = progress, Cts = cts, Waiters = 1 };
+                result.StatusUpdated += statusCallback;
+                _runningDownloads[hash] = result;
+                var started = result;
+                result.Task = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await downloadFunc.Invoke(hash, progress, status => started.RaiseStatusUpdated(status), cts.Token).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        lock (_runningDownloadsLock)
+                        {
+                            started.Finished = true;
+                            if (_runningDownloads.TryGetValue(hash, out var current) && ReferenceEquals(current, started))
+                            {
+                                _runningDownloads.TryRemove(hash, out _);
+                            }
+                        }
+                        cts.Dispose();
+                    }
+                });
+                joined = false;
+            }
+        }
+
+        if (joined)
+        {
+            Logger.LogDebug("Additional character waiting on {hash}", hash);
+            statusCallback.Invoke(result.CurrentStatus);
+        }
+
+        return WaitForSharedDownloadAsync(result, hash, progressCallback, statusCallback, callerToken);
+    }
+
+    private async Task WaitForSharedDownloadAsync(DownloadTask task, string hash, EventHandler<long> progressCallback, Action<DownloadStatus> statusCallback, CancellationToken callerToken)
+    {
+        try
+        {
+            await task.Task.WaitAsync(callerToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (callerToken.IsCancellationRequested && !task.Task.IsCompleted)
+        {
+            int generation;
+            bool abandoned;
+            lock (_runningDownloadsLock)
+            {
+                task.Progress.ProgressChanged -= progressCallback;
+                task.StatusUpdated -= statusCallback;
+                task.Waiters = Math.Max(0, task.Waiters - 1);
+                generation = task.Generation;
+                abandoned = task.Waiters == 0 && !task.Finished;
+            }
+
+            if (abandoned)
+            {
+                _ = CancelIfStillAbandonedAsync(task, hash, generation);
+            }
+
+            throw;
+        }
+    }
+
+    private async Task CancelIfStillAbandonedAsync(DownloadTask task, string hash, int generation)
+    {
+        try
+        {
+            await Task.Delay(AbandonedTransferGraceMs).ConfigureAwait(false);
+            lock (_runningDownloadsLock)
+            {
+                if (task.Finished || task.Waiters > 0 || task.Generation != generation) return;
+                // Take it out of the map now, so a request after this point starts a fresh transfer.
+                if (_runningDownloads.TryGetValue(hash, out var current) && ReferenceEquals(current, task))
+                {
+                    _runningDownloads.TryRemove(hash, out _);
+                }
+            }
+
+            Logger.LogDebug("{hash}: no batch waits for this transfer any more, cancelling it", hash);
+            task.Cts?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // finished in the meantime
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "{hash}: abandoned transfer cancel failed", hash);
+        }
     }
 
     public async Task<HttpResponseMessage> SendRequestAsync(HttpMethod method, Uri uri,

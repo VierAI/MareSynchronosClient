@@ -44,7 +44,7 @@ public enum SoundState
 /// - ACTIVE -> FADING when the loop ends (or the pair stops being visible), or when the pair's data is re-applied and
 ///   no longer contains any .scd replacement.
 /// - Any .scd load while NOT in a looping state goes straight to FADING (never ACTIVE).
-/// - FADING starts at <see cref="StoppedAlpha"/>; every new sound load restarts the fade.
+/// - FADING starts at <see cref="StoppedAlpha"/>; a one-shot load during a fade extends it, capped at one extra fade length.
 ///
 /// LIMITATIONS (need in-game verification):
 /// - The only sound signal is Penumbra's resource-load event for .scd files, so vanilla (unmodded) sounds are never seen.
@@ -207,6 +207,16 @@ public static class SoundActivity
             // One-shot: never ACTIVE, (re)start the fade.
             var wasActive = pair.SoundState == SoundState.Active;
             if (wasActive && pair.SoundActiveUntil != null && now < pair.SoundActiveUntil.Value) return false; // a song is still playing
+            // Next build: a fade that is already running is not restarted. A repeating effect sound (a VFX that reloads its
+            // .scd every few seconds) restarted it forever, so the state never reached none. It may only be extended, and the
+            // fade start never moves past one fade length after the first start (the fade ends at most two fade lengths in).
+            if (!wasActive && IsListed(pair, now) && pair.SoundStateSince != null)
+            {
+                var first = pair.SoundFadeFirstStart ?? pair.SoundStateSince.Value;
+                var capped = Earlier(now, first.AddSeconds(FadeSeconds));
+                pair.SoundStateSince = Later(pair.SoundStateSince.Value, capped);
+                return false;
+            }
             StartFade(pair, "oneShot");
             pair.SoundStateSince = now;
             pair.SoundActiveUntil = null;
@@ -216,6 +226,48 @@ public static class SoundActivity
 
     private static DateTimeOffset Later(DateTimeOffset a, DateTimeOffset b) => a > b ? a : b;
 
+    private static DateTimeOffset Earlier(DateTimeOffset a, DateTimeOffset b) => a < b ? a : b;
+
+    /// <summary>Next build: a sound path that fails this many times in a row is ignored for the pair for <see cref="FailedPathIgnoreSeconds"/>.</summary>
+    public const int FailedPathIgnoreAfter = 3;
+
+    /// <summary>Next build: how long a repeatedly failing sound path is ignored for the pair.</summary>
+    public const double FailedPathIgnoreSeconds = 600;
+
+    /// <summary>
+    /// Next build: a .scd load for the pair failed (file missing or unreadable). It never counts as noise, never replaces an
+    /// ACTIVE or FADING state (the 'failed' mark is only recorded while the pair has no current sound state), and a path that
+    /// fails <see cref="FailedPathIgnoreAfter"/> times in a row is ignored for a while. Returns true if the failure was recorded.
+    /// </summary>
+    public static bool OnSoundLoadFailed(Pair pair, string gamePath, DateTimeOffset now)
+    {
+        lock (pair)
+        {
+            var key = gamePath ?? string.Empty;
+            pair.SoundFailedPaths.TryGetValue(key, out var entry);
+            if (entry.IgnoredUntil is { } until)
+            {
+                if (now < until) return false;
+                entry = (0, null);
+            }
+            entry.Count++;
+            if (entry.Count >= FailedPathIgnoreAfter) entry.IgnoredUntil = now.AddSeconds(FailedPathIgnoreSeconds);
+            pair.SoundFailedPaths[key] = entry;
+            if (pair.SoundState == SoundState.Active || IsListed(pair, now)) return false;
+            pair.SoundLastFailedAt = now;
+            return true;
+        }
+    }
+
+    /// <summary>Next build: a successful load of this path ends its failure streak.</summary>
+    public static void OnSoundLoadSucceeded(Pair pair, string gamePath)
+    {
+        lock (pair)
+        {
+            pair.SoundFailedPaths.Remove(gamePath ?? string.Empty);
+        }
+    }
+
     /// <summary>A song outside an emote ends when the player moves more than this (meters).</summary>
     public const float SongMoveEndMeters = 0.3f;
 
@@ -224,6 +276,7 @@ public static class SoundActivity
     {
         pair.SoundState = SoundState.Fading;
         pair.SoundEndReason = reason;
+        pair.SoundFadeFirstStart = DateTimeOffset.UtcNow;
         pair.SoundSongPos = null;
     }
 
@@ -345,6 +398,7 @@ public static class SoundActivity
             pair.SoundActiveUntil = null;
             pair.SoundState = SoundState.None;
             pair.SoundStateSince = null;
+            pair.SoundFadeFirstStart = null;
             return wasActive;
         }
     }

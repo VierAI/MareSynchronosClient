@@ -53,6 +53,8 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
     private readonly MareConfigService _configService;
 
     private readonly Dictionary<ulong, (string Ident, string Name)> _frameworkCharacters = new(100);
+    // 1221: ident -> contentId reverse index so ident lookups are hashed instead of a scan over every player seen.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ulong> _frameworkCharacterIdByIdent = new(StringComparer.Ordinal);
     private readonly List<ObjectTablePlayersFrameworkUpdate> _frameworkCharacterChanges = new(100);
     private HashSet<ulong> _playersSeenThisFrame = new(100);
     private HashSet<ulong> _playersSeenPreviousFrame = new(100);
@@ -252,6 +254,8 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
     public bool IsOccupiedInCutSceneEvent => _condition[ConditionFlag.OccupiedInCutSceneEvent];
     public bool IsInGpose { get; private set; } = false;
     public bool IsLoggedIn { get; private set; }
+    /// <summary>1.15.5.1217: players (incl. unpaired) the scan saw this frame.</summary>
+    public int NearbyPlayerCount { get; private set; }
     public bool IsOnFrameworkThread => _framework.IsInFrameworkUpdateThread;
     public bool IsZoning => _condition[ConditionFlag.BetweenAreas] || _condition[ConditionFlag.BetweenAreas51];
     public bool IsBoundByDuty { get; set; } = false;
@@ -347,13 +351,12 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
     public CharacterVisibilityUpdate? GetFrameworkCharacterVisibilityByIdent(string ident)
     {
         EnsureIsOnFramework();
-        var id = _frameworkCharacters.FirstOrDefault(chara => chara.Value.Ident == ident);
-        if (id.Key == 0)
+        if (!_frameworkCharacterIdByIdent.TryGetValue(ident, out var contentId) || contentId == 0)
         {
-            return null; // return null here so we don't do another dictionary lookup
+            return null;
         }
 
-        return GetFrameworkCharacterVisibilityByContentId(id.Key);
+        return GetFrameworkCharacterVisibilityByContentId(contentId);
     }
 
     /// <summary>
@@ -1054,7 +1057,15 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
 
     public string? FindPlayerByNameHash(string ident)
     {
-        return _frameworkCharacters.FirstOrDefault(p => p.Value.Ident == ident).Value.Name;
+        if (!_frameworkCharacterIdByIdent.TryGetValue(ident, out var contentId)) return null;
+        try
+        {
+            return _frameworkCharacters.TryGetValue(contentId, out var c) ? c.Name : null;
+        }
+        catch (InvalidOperationException)
+        {
+            return null; // called off the framework thread while the dictionary is being changed
+        }
     }
 
     internal IEnumerable<string> GetVisiblePlayerIdents()
@@ -1122,6 +1133,39 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
 
     private const int MaxNewFrameworkCharactersPerFrame = 8;
 
+    // 1221: prune _frameworkCharacters entries not seen for 10+ minutes (checked once a minute, game thread only)
+    private readonly Dictionary<ulong, long> _frameworkCharacterLastSeen = new();
+    private long _nextFrameworkPruneMs;
+    private const long FrameworkPruneIntervalMs = 60_000;
+    private const long FrameworkPruneAfterMs = 10 * 60_000;
+
+    private void PruneFrameworkCharacters()
+    {
+        long now = Environment.TickCount64;
+        if (now < _nextFrameworkPruneMs) return;
+        _nextFrameworkPruneMs = now + FrameworkPruneIntervalMs;
+
+        foreach (var id in _playersSeenThisFrame) _frameworkCharacterLastSeen[id] = now;
+        List<ulong>? stale = null;
+        foreach (var kv in _frameworkCharacters)
+        {
+            if (!_frameworkCharacterLastSeen.TryGetValue(kv.Key, out var seen))
+            {
+                _frameworkCharacterLastSeen[kv.Key] = now;
+                continue;
+            }
+            if (now - seen >= FrameworkPruneAfterMs && !_playersSeenPreviousFrame.Contains(kv.Key))
+                (stale ??= []).Add(kv.Key);
+        }
+        if (stale == null) return;
+        foreach (var id in stale)
+        {
+            if (_frameworkCharacters.Remove(id, out var c)) _frameworkCharacterIdByIdent.TryRemove(c.Ident, out _);
+            _frameworkCharacterLastSeen.Remove(id);
+        }
+        _logger.LogDebug("Pruned {count} framework characters not seen for 10+ minutes", stale.Count);
+    }
+
     private unsafe void ScanFrameworkCharacters()
     {
         EnsureIsOnFramework();
@@ -1167,7 +1211,9 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
                         continue;
                     }
                     newCharactersThisFrame++;
-                    _frameworkCharacters.Add(contentId, (contentId.ToString().GetHash256(), chara.Name.ToString()));
+                    var ident = contentId.ToString().GetHash256();
+                    _frameworkCharacters.Add(contentId, (ident, chara.Name.ToString()));
+                    _frameworkCharacterIdByIdent[ident] = contentId;
                 }
 
                 _playersSeenThisFrame.Add(contentId);
@@ -1183,6 +1229,9 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
             }
         }
 
+
+        NearbyPlayerCount = _playersSeenThisFrame.Count; // 1.15.5.1217: crowd size for the memory budget
+        PruneFrameworkCharacters();
 
         // this is for the players we have seen this frame and not the previous (now visibile)
         foreach (var contentId in _playersSeenThisFrame)
@@ -1434,7 +1483,8 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
         if (localPlayer != null)
         {
             _classJobId = localPlayer.ClassJob.RowId;
-            _playerName = localPlayer.Name.TextValue;
+            // 1221: the name can't change while logged in; don't allocate the string every frame
+            _playerName ??= localPlayer.Name.TextValue;
         }
 
         if (!((_configService.Current.AutoPauseDataApplicationWhenPerforming && IsPerforming) || IsInCombat))
@@ -1474,6 +1524,8 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
         {
             _logger.LogDebug("Logged out");
             _frameworkCharacters.Clear();
+            _frameworkCharacterIdByIdent.Clear();
+            _frameworkCharacterLastSeen.Clear();
             IsLoggedIn = false;
             _playerName = null;
             Mediator.Publish(new DalamudLogoutMessage());

@@ -593,7 +593,7 @@ public sealed class FileUploadManager : DisposableMediatorSubscriberBase
                             };
                             if (file.IsForbidden)
                             {
-                                if (_orchestrator.ForbiddenTransfers.TrueForAll(f => !string.Equals(f.Hash, file.Hash, StringComparison.Ordinal)))
+                                if (_orchestrator.ForbiddenTransfers.TrueForAll(f => !string.Equals(f.Hash, file.Hash, StringComparison.OrdinalIgnoreCase)))
                                 {
                                     Logger.LogWarning("Attempted to upload a forbidden file: {hash}", file.Hash);
                                     _orchestrator.ForbiddenTransfers.Add(transfer);

@@ -198,6 +198,15 @@ public sealed class MareMediator : IHostedService
                 _logger.LogError(ex.InnerException ?? ex, "Error executing {type} for subscriber {subscriber}",
                     message.GetType().Name, subscriber.Subscriber.GetType().Name);
                 _lastErrorTime[subscriber] = DateTime.UtcNow;
+                // 1225 (audit 9): this map only throttles repeated error logs; drop old entries so it can't grow forever.
+                if (_lastErrorTime.Count > 256)
+                {
+                    var cutoff = DateTime.UtcNow - TimeSpan.FromMinutes(1);
+                    foreach (var kv in _lastErrorTime)
+                    {
+                        if (kv.Value < cutoff) _lastErrorTime.TryRemove(kv.Key, out _);
+                    }
+                }
             }
         }
     }

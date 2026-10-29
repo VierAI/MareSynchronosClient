@@ -202,9 +202,23 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
     private async Task ReapplyCachedPairData(Pair pair, bool force = true)
     {
         int attempts = 0;
+        bool waitForDrawReady = false;
         while (attempts < 3) // chances are if this fails we're already on to a new dto from the pair
         {
             attempts++;
+
+            if (waitForDrawReady)
+            {
+                // 1225: the last try failed because the character was not in a usable state (still loading, redrawing,
+                // or not drawn). Retrying at once just fails again; wait until it is drawn and ready (up to 3 s), and
+                // stop when it went out of view.
+                waitForDrawReady = false;
+                if (!await WaitForPairDrawReadyAsync(pair, TimeSpan.FromSeconds(3)).ConfigureAwait(false))
+                {
+                    Logger.LogDebug("Cached data application for {pair} stopped: not drawn and ready after an invalid-state retry", pair?.PairUIDName ?? string.Empty);
+                    return;
+                }
+            }
 
             bool hadErrors = false;
             bool started = false;
@@ -219,6 +233,14 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                 {
                     Logger.LogDebug("Cached data application for {pair} stopped! {pair} {cached} {conn} {visible} {data}",
                         pair?.PairUIDName ?? string.Empty, pair == null, pair.CachedPlayer == null, !_isConnected, !pair.IsVisible, !pair.HasCachedData);
+                    return;
+                }
+
+                if (MareSynchronos.Services.PSyncCrowd.HoldsApply(pair))
+                {
+                    // 1.15.5.1217: blocked / budget hold / not drawn (tier 3-4): remember and reapply when the hold lifts.
+                    MareSynchronos.Services.PSyncCrowd.PendingReapply[pair.UserData.UID] = 0;
+                    Logger.LogDebug("Cached data application for {pair} held: {why}", pair.PairUIDName, MareSynchronos.Services.PSyncCrowd.DescribeWait(pair));
                     return;
                 }
 
@@ -254,6 +276,11 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                     Logger.LogWarning("[BASE-{appBase}] An error occured during cached data application for {pair}: {reason} - {msg}",
                         applicationBase, pair.PairUIDName, ex.Reason, ex.Message);
                 }
+                else
+                {
+                    // 1.15.5.1403: DownloadPipeline legacy (1224) retries at once, without the 1225 draw-ready wait
+                    waitForDrawReady = true;
+                }
 
                 continue;
             }
@@ -281,6 +308,37 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                 }
             }
         }
+    }
+
+    /// <summary>1225: true once the pair is visible and its model is drawn and ready; false on timeout, invisibility or shutdown.</summary>
+    private async Task<bool> WaitForPairDrawReadyAsync(Pair? pair, TimeSpan timeout)
+    {
+        if (pair == null) return false;
+        var sw = Stopwatch.StartNew();
+        while (sw.Elapsed < timeout)
+        {
+            var topCts = _dataApplicationPipelineTopLevelCts;
+            if (topCts == null || topCts.IsCancellationRequested || (_dataApplicationManagerCts?.IsCancellationRequested ?? true) || !_isConnected)
+                return false;
+            if (!pair.IsVisible || pair.CachedPlayer == null)
+                return false;
+            if (pair.IsModelReady)
+                return true;
+            try
+            {
+                await Task.Delay(100, topCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+            catch (ObjectDisposedException)
+            {
+                return false;
+            }
+        }
+
+        return pair.IsVisible && pair.IsModelReady;
     }
 
     private void QueueOrRequeueDeferredData(Pair pair, CharacterDataApplication incomingQueuedData)
@@ -477,6 +535,7 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
         bool hadErrors = false;
         bool hasStarted = false;
         bool failureLogged = false;
+        bool thresholdPaused = false;
         Guid applicationBase = Guid.NewGuid();
 
         try
@@ -520,6 +579,7 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
 
             if (ex.Reason == PairDataExceptionReason.ThresholdViolation)
             {
+                thresholdPaused = true; // paused by the height/threshold limit: expected, logged at Information below
                 return;
             }
 
@@ -554,7 +614,10 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                 if (hadErrors)
                 {
                     // Fork: the reason is logged once by RecordFailure; this per-attempt line is debug only (it spammed every 250 ms).
-                    if (failureLogged)
+                    if (thresholdPaused)
+                        Logger.LogInformation("[BASE-{appBase}] Queued data application was cancelled for {pair} after {elapsedMs}ms (paused by the threshold limit)",
+                            applicationBase, pair.PairUIDName, stopwatch!.ElapsedMilliseconds);
+                    else if (failureLogged)
                         Logger.LogDebug("[BASE-{appBase}] Queued data application was cancelled or failed for {pair} after {elapsedMs}ms",
                             applicationBase, pair.PairUIDName, stopwatch!.ElapsedMilliseconds);
                     else

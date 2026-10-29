@@ -104,6 +104,25 @@ public sealed class FileCompactor
         return _disk.RunAsync(() => WriteAllBytes(filePath, decompressedFile), token);
     }
 
+    /// <summary>1225: write plus the file times in one go on the disk thread (see LowPriorityFile.WriteAllBytesWithTimes).</summary>
+    public Task WriteAllBytesWithTimesAsync(string filePath, byte[] decompressedFile, DateTime creationUtc, DateTime lastAccessUtc, DateTime lastWriteUtc, CancellationToken token)
+    {
+        return _disk.RunAsync(() =>
+        {
+            LowPriorityFile.WriteAllBytesWithTimes(filePath, decompressedFile, creationUtc, lastAccessUtc, lastWriteUtc);
+            QueueCompaction(filePath);
+        }, token);
+    }
+
+    private void QueueCompaction(string filePath)
+    {
+        if (_dalamudUtilService.IsWine || !_mareConfigService.Current.UseCompactor)
+            return;
+
+        var path = filePath;
+        _ = _disk.RunIdleAsync(() => CompactFile(path));
+    }
+
     public void WriteAllBytes(string filePath, byte[] decompressedFile)
     {
         LowPriorityFile.WriteAllBytes(filePath, decompressedFile);

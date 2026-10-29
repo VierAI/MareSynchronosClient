@@ -25,6 +25,14 @@ public static class UnmuteSoundRestore
         if (!_last.TryGetValue(uid, out var last) || now - last >= Cooldown)
         {
             _last[uid] = now;
+            // 1225 (audit 8): entries older than the cooldown no longer matter
+            if (_last.Count > 256)
+            {
+                foreach (var kv in _last)
+                {
+                    if (now - kv.Value >= Cooldown && !string.Equals(kv.Key, uid, StringComparison.Ordinal)) _last.TryRemove(kv.Key, out _);
+                }
+            }
             pair.ReapplyCachedDataByUser();
             return;
         }

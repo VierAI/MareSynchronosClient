@@ -12,6 +12,9 @@ public static class LowPriorityFile
     private const int FileIoPriorityHintInfoClass = 12;
     private const int IoPriorityHintVeryLow = 0;
     private const int ChunkSize = 64 * 1024;
+    // 1225: under Wine every write is a separate host call, so cache writes go out in 256 KB pieces there.
+    // Windows keeps 64 KB pieces so the game's own reads still slot in between (unchanged).
+    private const int WineWriteChunkSize = 256 * 1024;
 
     // Under Wine (macOS/Linux) the overlapped file I/O and the I/O-priority hint are not reliable ("General failure",
     // runtime handle errors seen with 1.15.5.909), so Wine always uses plain synchronous I/O. Windows behaviour is unchanged.
@@ -130,11 +133,74 @@ public static class LowPriorityFile
     private static void WriteChunked(string path, ReadOnlySpan<byte> data)
     {
         using var stream = Create(path);
+        WriteChunks(stream, data);
+    }
+
+    private static void WriteChunks(FileStream stream, ReadOnlySpan<byte> data)
+    {
+        var chunk = s_isWine ? WineWriteChunkSize : ChunkSize;
         while (data.Length > 0)
         {
-            var count = Math.Min(ChunkSize, data.Length);
+            var count = Math.Min(chunk, data.Length);
             stream.Write(data[..count]);
             data = data[count..];
+        }
+    }
+
+    /// <summary>
+    /// 1225: writes the file and stamps its creation, last-access and last-write times on the same open handle
+    /// (one SetFileTime call), instead of three FileInfo setters that each open the file again afterwards.
+    /// Falls back to the path-based setters if the handle call fails.
+    /// </summary>
+    public static void WriteAllBytesWithTimes(string path, ReadOnlySpan<byte> data, DateTime creationUtc, DateTime lastAccessUtc, DateTime lastWriteUtc)
+    {
+        bool stamped = false;
+        try
+        {
+            using var stream = Create(path);
+            WriteChunks(stream, data);
+            stream.Flush();
+            stamped = TrySetTimes(stream.SafeFileHandle, creationUtc, lastAccessUtc, lastWriteUtc);
+        }
+        catch (IOException) when (s_isWine)
+        {
+            // Wine "General failure" on the chunked stream: one retry with the plain framework call.
+            File.WriteAllBytes(path, data.ToArray());
+        }
+
+        if (!stamped)
+        {
+            File.SetCreationTimeUtc(path, creationUtc);
+            File.SetLastAccessTimeUtc(path, lastAccessUtc);
+            File.SetLastWriteTimeUtc(path, lastWriteUtc);
+        }
+    }
+
+    private static bool TrySetTimes(SafeFileHandle handle, DateTime creationUtc, DateTime lastAccessUtc, DateTime lastWriteUtc)
+    {
+        if (handle.IsInvalid) return false;
+        try
+        {
+            long c = creationUtc.ToFileTimeUtc();
+            long a = lastAccessUtc.ToFileTimeUtc();
+            long w = lastWriteUtc.ToFileTimeUtc();
+            if (SetFileTime(handle, ref c, ref a, ref w)) return true;
+        }
+        catch (Exception ex) when (ex is EntryPointNotFoundException or DllNotFoundException)
+        {
+            // fall through to the managed handle API
+        }
+
+        try
+        {
+            File.SetCreationTimeUtc(handle, creationUtc);
+            File.SetLastAccessTimeUtc(handle, lastAccessUtc);
+            File.SetLastWriteTimeUtc(handle, lastWriteUtc);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            return false;
         }
     }
 
@@ -165,6 +231,9 @@ public static class LowPriorityFile
     {
         public int PriorityHint;
     }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetFileTime(SafeFileHandle hFile, ref long lpCreationTime, ref long lpLastAccessTime, ref long lpLastWriteTime);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetFileInformationByHandle(SafeFileHandle hFile, int fileInformationClass, ref FileIoPriorityHintInfo lpFileInformation, int dwBufferSize);

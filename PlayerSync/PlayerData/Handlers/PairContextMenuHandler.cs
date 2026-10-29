@@ -103,24 +103,35 @@ namespace MareSynchronos.PlayerData.Handlers
                 AddUserPairChatContextMenu(args);
 
             var target = _dalamudUtilService.SoftTargetAddress != nint.Zero ? _dalamudUtilService.SoftTargetAddress : _dalamudUtilService.TargetAddress;
+            // 1.15.5.1408: the auto-pause override is resolved from the right-clicked object itself (or its content id), not from
+            // the soft/hard target, so it shows even when the clicked player is not the current target or has no cached player.
+            if (args.Target is MenuTargetDefault autoTarget)
+            {
+                var autoPair = PairAutoPauseOverride.ResolveMenuPair(autoTarget, _pairManager, _dalamudUtilService);
+                var hasReason = PairAutoPauseOverride.TryGetAutoPauseReason(autoPair, _serverConfigurationManager, out var autoReason);
+                Logger.LogDebug("Auto-pause override: addon {addon}, menu {type}, pair {uid}, paused {paused}, reason {reason}, shown {shown}",
+                    args.AddonName ?? "world", args.MenuType, autoPair?.UserData.UID ?? "none", autoPair?.IsPaused ?? false, autoReason, hasReason);
+                if (hasReason && autoPair != null) PairAutoPauseOverride.AddMenuItem(args, autoPair, autoReason, _performanceConfigService, Mediator);
+            }
+
             if (target == nint.Zero) return;
             var pairs = _pairManager.GetVisiblePairs();
             var currentTargetPair = pairs.SingleOrDefault(u => u.Address == target);
             if (currentTargetPair != null)
                 AddContextMenu(currentTargetPair, args);
-
-            // Fork: override entry only for players paused by an automatic threshold pause (PairAutoPauseOverride.cs).
-            if (args.Target is MenuTargetDefault autoTarget && autoTarget.TargetObject?.Address == target
-                && PairAutoPauseOverride.TryGetAutoPauseReason(currentTargetPair ?? PairAutoPauseOverride.FindPausedPair(target, _pairManager, _dalamudUtilService), _serverConfigurationManager, out var autoReason))
+            else if (args.Target is MenuTargetDefault pausedTarget && pausedTarget.TargetObject?.Address == target)
             {
-                var autoPair = currentTargetPair ?? PairAutoPauseOverride.FindPausedPair(target, _pairManager, _dalamudUtilService);
-                if (autoPair != null) PairAutoPauseOverride.AddMenuItem(args, autoPair, autoReason, _performanceConfigService, Mediator);
+                // 1.15.5.1220: paused pairs (no cached player) get the regular menu too, found by the target's hashed content id.
+                var pausedPair = PairAutoPauseOverride.FindPausedPair(target, _pairManager, _dalamudUtilService);
+                if (pausedPair != null && pausedPair.IsPaused) AddContextMenu(pausedPair, args, paused: true);
             }
         }
 
-        private void AddContextMenu(Pair pair, IMenuOpenedArgs args)
+        private void AddContextMenu(Pair pair, IMenuOpenedArgs args, bool paused = false)
         {
-            if (!pair.HasCachedPlayer || (args.Target is not MenuTargetDefault target) || target.TargetObjectId != pair.PlayerCharacterId || pair.IsPaused) return;
+            if (args.Target is not MenuTargetDefault target) return;
+            if (!paused && (!pair.HasCachedPlayer || target.TargetObjectId != pair.PlayerCharacterId || pair.IsPaused)) return;
+            AddBudgetExemptItem(pair, args);
             // Fork (PairMenuSwap): same conditions as PairInviteManager's Send Pair Request (world menu, not a two-way direct pair)
             var worldMenu = args.AddonName == null;
 
@@ -149,7 +160,7 @@ namespace MareSynchronos.PlayerData.Handlers
                         args.AddMenuItem(new MenuItem()
                         {
                             Name = new SeStringBuilder().AddText("Pair Data").Build(),
-                            OnClicked = (a) => DrawPairDataContenxtSubmenu(pair, a, worldMenu),
+                            OnClicked = (a) => DrawPairDataContenxtSubmenu(pair, a, worldMenu && !paused),
                             IsSubmenu = true,
                             UseDefaultPrefix = false,
                             PrefixChar = 'P',
@@ -198,6 +209,7 @@ namespace MareSynchronos.PlayerData.Handlers
                         break;
 
                     case ContextMenuItemId.ReapplyLastData:
+                        if (paused) break; // nothing applied while paused
                         args.AddMenuItem(new MenuItem()
                         {
                             Name = new SeStringBuilder().AddText("Reapply Last Data").Build(),
@@ -236,15 +248,31 @@ namespace MareSynchronos.PlayerData.Handlers
             }
         }
 
+        private void AddBudgetExemptItem(Pair pair, IMenuOpenedArgs args)
+        {
+            var uid = pair.UserData.UID;
+            if (!VierAIConfigStore.Current.MemoryBudgetEnabled && !PSyncCrowd.IsBudgetHeld(uid)) return;
+            var exempt = PSyncBudgetExempt.IsExempt(uid);
+            args.AddMenuItem(new MenuItem()
+            {
+                Name = new SeStringBuilder().AddText(exempt ? "Remove memory budget exemption" : "Exempt from memory budget").Build(),
+                OnClicked = _ => PSyncBudgetExempt.Toggle(pair),
+                UseDefaultPrefix = false,
+                PrefixChar = 'P',
+                PrefixColor = 530,
+            });
+        }
+
         private void DrawPairDataContenxtSubmenu(Pair pair, IMenuItemClickedArgs clickedArgs, bool worldMenu = false)
         {
             var menuItems = new List<MenuItem>();
+            var paused = pair.IsPaused;
 
             // Fork (PairMenuSwap): Send Pair Request replaces Reapply Last Data here when Reapply is at the top level instead
             var swapIdent = worldMenu && _apiController.IsConnected && pair.UserPair?.IndividualPairStatus != API.Data.Enum.IndividualPairStatus.Bidirectional
                 ? _dalamudUtilService.GetHashedCIDFromPlayerPointer(pair.Address) : null;
             if (swapIdent != null) menuItems.Add(PairMenuSwap.SendPairRequestItem(() => _inviteManager.SendPairRequest(swapIdent)));
-            else menuItems.Add(new MenuItem()
+            else if (!paused) menuItems.Add(new MenuItem()
             {
                 Name = new SeStringBuilder().AddText("Reapply Last Data").Build(),
                 OnClicked = (a) => pair.ReapplyCachedDataByUser()
@@ -263,6 +291,20 @@ namespace MareSynchronos.PlayerData.Handlers
             });
 
             PairMenuPrioritize.AddItem(menuItems, pair, _performanceConfigService, Mediator);
+
+            // 1.15.5.1217: force re-download and the hard blocklist (inside this submenu, so the top-level layout is unchanged).
+            if (!paused) menuItems.Add(new MenuItem()
+            {
+                Name = new SeStringBuilder().AddText("Force Re-download").Build(),
+                OnClicked = (a) => _ = pair.ForceRedownloadAsync()
+            });
+
+            var isBlocked = MareSynchronos.Services.PSyncCrowd.IsBlocked(pair);
+            menuItems.Add(new MenuItem()
+            {
+                Name = new SeStringBuilder().AddText(isBlocked ? "Unblock (allow downloads)" : "Block (no downloads or applies)").Build(),
+                OnClicked = (a) => MareSynchronos.Services.PSyncBlocklist.Toggle(pair)
+            });
 
             menuItems.Add(new MenuItem()
             {

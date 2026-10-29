@@ -83,7 +83,7 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         CheckAPI();
         CheckModDirectory();
 
-        Mediator.Subscribe<FrameworkUpdateMessage>(this, (_) => { if (!_pendingSoundLoads.IsEmpty) DrainPendingSoundLoads(); ProcessDeferredRedraws(); });
+        Mediator.Subscribe<FrameworkUpdateMessage>(this, (_) => { _redrawsThisFrame = 0; if (!_pendingSoundLoads.IsEmpty) DrainPendingSoundLoads(); ProcessDeferredRedraws(); });
 
         Mediator.Subscribe<PenumbraRedrawCharacterMessage>(this, (msg) =>
         {
@@ -347,15 +347,31 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
             return true;
         }
 
+        if (RedrawCapReached)
+        {
+            // 1225: redraw cap per frame; the rest go out on the next frames (deferred queue, sent first next frame).
+            logger.LogDebug("[{applicationId}] Redraw for object {address:X} moved to the next frame (per-frame redraw cap)", applicationId, address);
+            _deferredRedraws.AddOrUpdate(address, (applicationId, DateTime.UtcNow), (_, old) => (applicationId, old.Since));
+            return true;
+        }
+
         _deferredRedraws.TryRemove(address, out _);
         SendRedraw(address);
         return true;
     }
 
+    // 1225: at most this many Penumbra redraws are sent per framework frame (1 under Wine, 2 elsewhere). A redraw makes the
+    // game rebuild the character and load its files; a mass re-apply used to send them all in the same frame.
+    private static readonly int MaxRedrawsPerFrame = MareSynchronos.FileCache.LowPriorityFile.IsWine ? 1 : 2;
+    private int _redrawsThisFrame;
+    // 1228 RedrawCap legacy (pre-1225): no per-frame cap, every redraw goes out in the frame it is asked for.
+    private bool RedrawCapReached => false; // 1.15.5.1412: per-frame redraw cap reverted to upstream (no cap; Penumbra semaphore of 4 stays)
+
     private unsafe void SendRedraw(nint address)
     {
         var idx = ((Character*)address)->ObjectIndex;
         _pendingRedraws[address] = DateTime.UtcNow;
+        _redrawsThisFrame++;
         _penumbraRedraw!.Invoke(idx, setting: RedrawType.Redraw);
     }
 
@@ -377,6 +393,7 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
             var timedOut = DateTime.UtcNow - entry.Since > DeferredRedrawTimeout;
             if (block == CharacterRedrawBlock.None || (timedOut && block == CharacterRedrawBlock.Loading))
             {
+                if (RedrawCapReached) return; // 1225: per-frame cap, the rest next frame
                 // Drawn now (or stuck loading too long): send it so no stale mods stay on screen.
                 _deferredRedraws.TryRemove(address, out _);
                 Logger.LogDebug("[{applicationId}] Sending deferred redraw for {address:X} ({block})", entry.ApplicationId, address, block);

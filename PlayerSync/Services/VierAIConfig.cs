@@ -73,6 +73,103 @@ public class VierAIConfig
     public int TextureCapEyeFloorPx { get; set; } = 2048;
     public int TextureCapWorkerThreads { get; set; } = 1;
     public List<string> TextureCapExemptUIDs { get; set; } = new();
+
+    // 1.15.5.1217: memory/VRAM budget (off by default = unchanged behaviour), blocklist, missing-file auto retry.
+    public bool MemoryBudgetEnabled { get; set; } = false;
+    /// <summary>0 = Manual MB cap, 1 = Auto (live GPU memory via DXGI; falls back to Manual on iGPU/Wine/failure).</summary>
+    public int MemoryBudgetMode { get; set; } = 0;
+    public int MemoryBudgetManualMiB { get; set; } = 6144;
+    public int MemoryBudgetCrowdedMiB { get; set; } = 3072;
+    public int MemoryBudgetCrowdedPlayers { get; set; } = 40;
+    public int MemoryBudgetHeadroomPercent { get; set; } = 10;
+    public int MemoryBudgetHeadroomMinMiB { get; set; } = 512;
+    public int MemoryBudgetMarginPercent { get; set; } = 10;
+    public int MemoryBudgetMinHoldSeconds { get; set; } = 30;
+    /// <summary>Unused since the perf-warning row layout (kept so older files load cleanly).</summary>
+    public bool ShowPairPerfInline { get; set; } = true;
+    /// <summary>Visible section: show the metric(s) over your performance warning limits next to the pair (e.g. "277M").</summary>
+    public bool PerfWarningInVisiblePane { get; set; } = true;
+    /// <summary>Print a one-time chat line per pair per session when a visible pair is first over a warning limit (rate-limited).</summary>
+    public bool PerfWarningInChat { get; set; } = false;
+    public bool AutoRedownloadMissingFiles { get; set; } = true;
+    public List<string> BlockedUIDs { get; set; } = new();
+    /// <summary>1.15.5.1220: UIDs the memory budget never holds (like tier 0).</summary>
+    public List<string> MemoryBudgetExemptUIDs { get; set; } = new();
+
+    /// <summary>1.15.5.1411: temporary automatic threshold pauses (height/VRAM/triangles with a timeout), so after a game
+    /// restart the right-click override can still find the paused player until the pause expires. Expired entries are
+    /// pruned on load and by the auto-unpause check.</summary>
+    public List<VierAITempPause> TempPauses { get; set; } = new();
+}
+
+/// <summary>1.15.5.1411: one temporary auto-pause: UID, PauseReason name, last known hashed content id and character name,
+/// and the expiry (same time as the PendingPausedPairs entry the auto-unpause timer uses).</summary>
+public sealed class VierAITempPause
+{
+    public string Uid { get; set; } = string.Empty;
+    public string Reason { get; set; } = string.Empty;
+    public string HashedCid { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public DateTimeOffset ExpiresUtc { get; set; }
+}
+
+/// <summary>1.15.5.1411: add/remove/prune/find helpers for <see cref="VierAIConfig.TempPauses"/>; every change saves.</summary>
+public static class VierAITempPauses
+{
+    private static readonly object Lock = new();
+
+    public static void Upsert(string uid, string reason, string hashedCid, string name, DateTimeOffset expiresUtc)
+    {
+        if (string.IsNullOrEmpty(uid)) return;
+        lock (Lock)
+        {
+            var list = VierAIConfigStore.Current.TempPauses;
+            list.RemoveAll(e => string.Equals(e.Uid, uid, StringComparison.Ordinal));
+            list.Add(new VierAITempPause { Uid = uid, Reason = reason, HashedCid = hashedCid ?? string.Empty, Name = name ?? string.Empty, ExpiresUtc = expiresUtc });
+        }
+        Save();
+    }
+
+    public static void Remove(string uid)
+    {
+        if (string.IsNullOrEmpty(uid)) return;
+        int removed;
+        lock (Lock) removed = VierAIConfigStore.Current.TempPauses.RemoveAll(e => string.Equals(e.Uid, uid, StringComparison.Ordinal));
+        if (removed > 0) Save();
+    }
+
+    public static int PruneExpired()
+    {
+        int removed;
+        var now = DateTimeOffset.UtcNow;
+        lock (Lock) removed = VierAIConfigStore.Current.TempPauses.RemoveAll(e => e.ExpiresUtc <= now);
+        if (removed > 0) Save();
+        return removed;
+    }
+
+    /// <summary>UID of an unexpired entry matching one of the hashed content ids, else a unique match on the name.</summary>
+    public static string? FindUid(IEnumerable<string> hashedCids, string? name)
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (Lock)
+        {
+            var live = VierAIConfigStore.Current.TempPauses.Where(e => e.ExpiresUtc > now).ToList();
+            foreach (var h in hashedCids)
+            {
+                var hit = live.FirstOrDefault(e => !string.IsNullOrEmpty(e.HashedCid) && string.Equals(e.HashedCid, h, StringComparison.Ordinal));
+                if (hit != null) return hit.Uid;
+            }
+            if (string.IsNullOrEmpty(name)) return null;
+            var byName = live.Where(e => string.Equals(e.Name, name, StringComparison.Ordinal)).ToList();
+            return byName.Count == 1 ? byName[0].Uid : null;
+        }
+    }
+
+    private static void Save()
+    {
+        VierAIConfigStore.MarkDirty();
+        VierAIConfigStore.TrySave(out _);
+    }
 }
 
 /// <summary>A log line collected before the logger exists (emitted by <see cref="VierAIConfigService"/> on start).</summary>
@@ -112,6 +209,13 @@ public static class VierAIConfigStore
             _lastWrittenJson = string.Empty;
             _dirty = false;
             StartupLog.Clear();
+            try
+            {
+                var notPersisted = RoundTripSelfCheck();
+                if (notPersisted.Count > 0) StartupLog.Add(new(true, $"{FileName} self-check: these settings are not reloaded after save: {string.Join(", ", notPersisted)}"));
+                else StartupLog.Add(new(false, $"{FileName} self-check: all settings survive save/reload"));
+            }
+            catch (Exception ex) { StartupLog.Add(new(true, $"{FileName} self-check failed to run: {ex.Message}")); }
 
             var path = FilePath;
             if (File.Exists(path))
@@ -230,6 +334,42 @@ public static class VierAIConfigStore
         }
     }
 
+    /// <summary>
+    /// 1.15.5.1218 save/reload self-check (no test project in this repo): for every settable property, change only that one
+    /// to a valid non-default value, serialize it like Save does and load it back through ApplyFields. Any property that
+    /// comes back at its default is not being loaded. Returns the names that failed (empty = all persist).
+    /// </summary>
+    public static List<string> RoundTripSelfCheck()
+    {
+        var failed = new List<string>();
+        foreach (var prop in typeof(VierAIConfig).GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+        {
+            if (!prop.CanWrite || !prop.CanRead || prop.Name == nameof(VierAIConfig.SchemaVersion)) continue;
+            var src = new VierAIConfig();
+            object? changed = prop.GetValue(src) switch
+            {
+                bool b => !b,
+                int i => i + 1,
+                float f => f + 0.05f,
+                List<string> => new List<string> { "SELFCHECK1" },
+                _ => null,
+            };
+            if (changed == null) continue;
+            prop.SetValue(src, changed);
+            var dst = new VierAIConfig();
+            try
+            {
+                using var doc = JsonDocument.Parse(JsonSerializer.Serialize(src, WriteOptions));
+                ApplyFields(doc.RootElement, dst, null, null);
+            }
+            catch { failed.Add(prop.Name); continue; }
+            var got = prop.GetValue(dst);
+            var ok = changed is List<string> l1 && got is List<string> l2 ? l1.SequenceEqual(l2) : Equals(changed, got);
+            if (!ok) failed.Add(prop.Name);
+        }
+        return failed;
+    }
+
     private static bool TryLoadFile(string path, VierAIConfig target, out string? error)
     {
         error = null;
@@ -295,6 +435,56 @@ public static class VierAIConfigStore
                 if (!string.IsNullOrEmpty(s)) list.Add(s);
             }
             target.TextureCapExemptUIDs = list;
+        });
+        Try(nameof(VierAIConfig.AllowLocalDebugPairInfo), el => target.AllowLocalDebugPairInfo = el.GetBoolean());
+        // 1.15.5.1218: budget/blocklist fields (1217 wrote them but never read them back). Clamps match the settings UI.
+        Try(nameof(VierAIConfig.MemoryBudgetEnabled), el => target.MemoryBudgetEnabled = el.GetBoolean());
+        Try(nameof(VierAIConfig.MemoryBudgetMode), el => target.MemoryBudgetMode = Math.Clamp(el.GetInt32(), 0, 1));
+        Try(nameof(VierAIConfig.MemoryBudgetManualMiB), el => target.MemoryBudgetManualMiB = Math.Clamp(el.GetInt32(), 256, 262144));
+        Try(nameof(VierAIConfig.MemoryBudgetCrowdedMiB), el => target.MemoryBudgetCrowdedMiB = Math.Clamp(el.GetInt32(), 0, 262144));
+        Try(nameof(VierAIConfig.MemoryBudgetCrowdedPlayers), el => target.MemoryBudgetCrowdedPlayers = Math.Clamp(el.GetInt32(), 0, 1000));
+        Try(nameof(VierAIConfig.MemoryBudgetHeadroomPercent), el => target.MemoryBudgetHeadroomPercent = Math.Clamp(el.GetInt32(), 0, 50));
+        Try(nameof(VierAIConfig.MemoryBudgetHeadroomMinMiB), el => target.MemoryBudgetHeadroomMinMiB = Math.Clamp(el.GetInt32(), 0, 16384));
+        Try(nameof(VierAIConfig.MemoryBudgetMarginPercent), el => target.MemoryBudgetMarginPercent = Math.Clamp(el.GetInt32(), 0, 50));
+        Try(nameof(VierAIConfig.MemoryBudgetMinHoldSeconds), el => target.MemoryBudgetMinHoldSeconds = Math.Clamp(el.GetInt32(), 10, 600));
+        Try(nameof(VierAIConfig.ShowPairPerfInline), el => target.ShowPairPerfInline = el.GetBoolean());
+        Try(nameof(VierAIConfig.PerfWarningInVisiblePane), el => target.PerfWarningInVisiblePane = el.GetBoolean());
+        Try(nameof(VierAIConfig.PerfWarningInChat), el => target.PerfWarningInChat = el.GetBoolean());
+        Try(nameof(VierAIConfig.AutoRedownloadMissingFiles), el => target.AutoRedownloadMissingFiles = el.GetBoolean());
+        Try(nameof(VierAIConfig.MemoryBudgetExemptUIDs), el =>
+        {
+            var list = new List<string>();
+            foreach (var item in el.EnumerateArray())
+            {
+                var s = item.GetString()?.Trim();
+                if (!string.IsNullOrEmpty(s) && s.Length <= 64 && !list.Contains(s, StringComparer.Ordinal) && list.Count < 5000) list.Add(s);
+            }
+            target.MemoryBudgetExemptUIDs = list;
+        });
+        Try(nameof(VierAIConfig.TempPauses), el =>
+        {
+            // 1.15.5.1411: expired entries are pruned on load; one entry per UID.
+            var now = DateTimeOffset.UtcNow;
+            var list = new List<VierAITempPause>();
+            foreach (var item in el.EnumerateArray())
+            {
+                VierAITempPause? e;
+                try { e = item.Deserialize<VierAITempPause>(); } catch { continue; }
+                if (e == null || string.IsNullOrWhiteSpace(e.Uid) || e.Uid.Length > 64 || e.ExpiresUtc <= now) continue;
+                if (list.Any(x => string.Equals(x.Uid, e.Uid, StringComparison.Ordinal)) || list.Count >= 5000) continue;
+                list.Add(e);
+            }
+            target.TempPauses = list;
+        });
+        Try(nameof(VierAIConfig.BlockedUIDs), el =>
+        {
+            var list = new List<string>();
+            foreach (var item in el.EnumerateArray())
+            {
+                var s = item.GetString()?.Trim();
+                if (!string.IsNullOrEmpty(s) && !list.Contains(s, StringComparer.Ordinal)) list.Add(s);
+            }
+            target.BlockedUIDs = list;
         });
         Try(nameof(VierAIConfig.UIDsToPrioritize), el =>
         {

@@ -1,4 +1,4 @@
-using Dalamud.Plugin.Services;
+﻿using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 using Lumina.Excel.Sheets;

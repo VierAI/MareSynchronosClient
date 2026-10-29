@@ -1,4 +1,4 @@
-﻿using MareSynchronos.API.Data;
+using MareSynchronos.API.Data;
 using MareSynchronos.API.Data.Enum;
 using MareSynchronos.FileCache;
 using MareSynchronos.MareConfiguration;
@@ -35,6 +35,10 @@ public class VisibleUserDataDistributorService : DisposableMediatorSubscriberBas
     private CharacterData? _uploadingCharacterData = null;
     private int _cacheCreationRequestCount = 0;
     private DateTimeOffset _lastCacheCreationRequest = DateTimeOffset.MinValue;
+    // 1.15.5.1224: UID -> (hash, time) of the last push, so a visibility flap doesn't re-push identical data.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (string Hash, DateTimeOffset At)> _lastPushed = new(StringComparer.Ordinal);
+    private static readonly TimeSpan RepushWindow = TimeSpan.FromMinutes(5);
+    private DateTimeOffset _nextLastPushedPrune = DateTimeOffset.MinValue;
 
 
     public VisibleUserDataDistributorService(ILogger<VisibleUserDataDistributorService> logger, ApiController apiController, DalamudUtilService dalamudUtil,
@@ -53,6 +57,7 @@ public class VisibleUserDataDistributorService : DisposableMediatorSubscriberBas
             if (_lastCreatedData == null || (!string.Equals(newData.DataHash.Value, _lastCreatedData.DataHash.Value, StringComparison.Ordinal)))
             {
                 _lastCreatedData = newData;
+                _lastPushed.Clear(); // 1.15.5.1224: new hash, everyone needs it again
                 Logger.LogTrace("Storing new data hash {hash}", newData.DataHash.Value);
                 PushToAllVisibleUsers(forced: true);
             }
@@ -106,10 +111,15 @@ public class VisibleUserDataDistributorService : DisposableMediatorSubscriberBas
         base.Dispose(disposing);
     }
 
+    // 1.15.5.1217: mutual hold. Users we hold for the memory budget or have blocked do not get our data either.
+    // They are left out of "previously visible", so when the hold lifts they count as newly visible and get our data again.
+    private List<UserData> PSyncPushTargets() => _pairManager.GetVisibleUsers().Where(u => !MareSynchronos.Services.PSyncCrowd.HoldsPush(u.UID)).ToList();
+
     private void PushToAllVisibleUsers(bool forced = false)
     {
-        foreach (var user in _pairManager.GetVisibleUsers())
+        foreach (var user in PSyncPushTargets())
         {
+            if (!forced && SkipRecentlyPushed(user)) continue;
             _usersToPushDataTo.Add(user);
         }
 
@@ -127,7 +137,7 @@ public class VisibleUserDataDistributorService : DisposableMediatorSubscriberBas
             return;
         }
 
-        var allVisibleUsers = _pairManager.GetVisibleUsers();
+        var allVisibleUsers = PSyncPushTargets();
         List<UserData> newVisibleUsers;
 
         lock (_pushDataLock)
@@ -146,10 +156,40 @@ public class VisibleUserDataDistributorService : DisposableMediatorSubscriberBas
         Logger.LogDebug("Scheduling character data push of {data} to {users}", _lastCreatedData?.DataHash.Value ?? string.Empty, string.Join(", ", newVisibleUsers.Select(k => k.AliasOrUID)));
         foreach (var user in newVisibleUsers)
         {
+            if (SkipRecentlyPushed(user)) continue;
             _usersToPushDataTo.Add(user);
         }
 
         PushCharacterData();
+    }
+
+    // 1.15.5.1224: true when this UID already got the current hash within RepushWindow. Read-only: a push is only recorded after it succeeds (RecordPushed).
+    private bool SkipRecentlyPushed(UserData user)
+    {
+        // 1.15.5.1412: ReloadDedupe reverted to upstream: never skip a re-push
+        return false;
+#pragma warning disable CS0162
+        var hash = _lastCreatedData?.DataHash.Value;
+        if (string.IsNullOrEmpty(hash)) return false;
+        var now = DateTimeOffset.UtcNow;
+        if (now >= _nextLastPushedPrune)
+        {
+            _nextLastPushedPrune = now + TimeSpan.FromMinutes(1);
+            foreach (var kv in _lastPushed)
+                if (now - kv.Value.At >= RepushWindow) _lastPushed.TryRemove(kv.Key, out _);
+        }
+        if (_lastPushed.TryGetValue(user.UID, out var last) && string.Equals(last.Hash, hash, StringComparison.Ordinal) && now - last.At < RepushWindow)
+        {
+            Logger.LogDebug("Skipping re-push of {hash} to {user}: already sent {secs:0}s ago", hash, user.AliasOrUID, (now - last.At).TotalSeconds);
+            return true;
+        }
+        return false;
+    }
+
+    private void RecordPushed(string hash, IEnumerable<UserData> users)
+    {
+        var now = DateTimeOffset.UtcNow;
+        foreach (var u in users) _lastPushed[u.UID] = (hash, now);
     }
 
     private bool HasCacheOrCreateIfEmpty()
@@ -241,7 +281,11 @@ public class VisibleUserDataDistributorService : DisposableMediatorSubscriberBas
                     dataToSend.PetNamesData = latestData.PetNamesData;
                     Logger.LogDebug("Pushing {data} to {users}", dataToSend.DataHash, string.Join(", ", _usersToPushDataTo.Select(k => k.AliasOrUID)));
 
-                    await _apiController.PushCharacterData(dataToSend, [.. _usersToPushDataTo]).ConfigureAwait(false);
+                    _usersToPushDataTo.RemoveWhere(u => MareSynchronos.Services.PSyncCrowd.HoldsPush(u.UID));
+                    if (_usersToPushDataTo.Count == 0) return;
+                    var sentTo = _usersToPushDataTo.ToList();
+                    var pushed = await _apiController.PushCharacterData(dataToSend, sentTo).ConfigureAwait(false);
+                    if (pushed) RecordPushed(dataToSend.DataHash.Value, sentTo); // 1.15.5.1224: failed pushes record nothing, so they're retried
 
                     _usersToPushDataTo.Clear();
                 }
@@ -375,7 +419,7 @@ public class VisibleUserDataDistributorService : DisposableMediatorSubscriberBas
         await _pushDataSemaphore.WaitAsync(_runtimeCts.Token).ConfigureAwait(false);
         try
         {
-            foreach (var user in _pairManager.GetVisibleUsers())
+            foreach (var user in PSyncPushTargets())
             {
                 _usersToPushPartialDataTo.Add(user);
             }

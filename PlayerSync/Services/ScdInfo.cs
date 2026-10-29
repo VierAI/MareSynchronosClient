@@ -26,6 +26,7 @@ public static class ScdInfo
 {
     public const double SustainedSeconds = 20;
     private const int HeaderBytes = 16384;
+    private const int MaxCacheEntries = 20000;
     private static readonly ConcurrentDictionary<string, ScdClass> s_cache = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Cached answer, or null if the file was not read yet.</summary>
@@ -47,7 +48,12 @@ public static class ScdInfo
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Thread.Sleep(150 * (attempt + 1)); }
             catch { info = ScdClass.Failed; break; }
         }
-        if (info.Valid) s_cache[filePath] = info;
+        if (info.Valid)
+        {
+            // 1225 (audit 8): bounded; a cleared entry is just read again (16 KB header) the next time it is needed.
+            if (s_cache.Count >= MaxCacheEntries) s_cache.Clear();
+            s_cache[filePath] = info;
+        }
         return info;
     });
 

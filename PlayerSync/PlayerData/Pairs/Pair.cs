@@ -52,7 +52,7 @@ public class Pair
     public bool IsPaused => UserPair.OwnPermissions.IsPaused();
     public bool IsVisible => CachedPlayer?.IsVisible ?? false;
     public bool CanApplyModdedData => HasCachedPlayer && HasDataHandler && IsVisible && IsModelReady && !HasDataApplicationTaskRunning &&
-        DateTimeOffset.UtcNow - LastDataApplicationTime > TimeSpan.FromMilliseconds(250);
+        DateTimeOffset.UtcNow - LastDataApplicationTime > TimeSpan.FromMilliseconds(250) && !MareSynchronos.Services.PSyncCrowd.HoldsApply(this);
     public string? PlayerName => CachedPlayer?.PlayerName ?? string.Empty;
     public string PairUIDName => $"{UserData.UID}:{(string.IsNullOrWhiteSpace(PlayerName) ? "NULLPLAYER" : PlayerName)}";
     public ConcurrentDictionary<string, string> ActiveCompressionRedirects => DataHandler?.ActiveCompressionRedirects ?? [];
@@ -68,6 +68,19 @@ public class Pair
     public DateTimeOffset? LastLoadedSoundSinceRedrawTime { get; set; } = null;
     public string LastLoadedSoundSinceRedraw { get; set; } = string.Empty;
     public string HashedCID => _onlineUserIdentDto?.Ident ?? string.Empty;
+    // 1.15.5.1410: kept after MarkOffline (a paused pair goes offline and loses its ident and cached player), so the
+    // right-click auto-pause override can still find a paused pair by the clicked character's hashed content id or name.
+    public string LastKnownHashedCID { get; private set; } = string.Empty;
+    public string LastKnownPlayerName { get; private set; } = string.Empty;
+
+    /// <summary>1.15.5.1411: forget the remembered identity once the pause is lifted (auto-unpause on expiry or any unpause
+    /// confirmed by the server), at the same moment the pause reason and expiry are removed.</summary>
+    public void ClearLastKnownIdentity()
+    {
+        LastKnownHashedCID = string.Empty;
+        LastKnownPlayerName = string.Empty;
+        MareSynchronos.Services.VierAITempPauses.Remove(UserData.UID);
+    }
     public ulong ContendId => CachedPlayer?.ContentId ?? 0;
 
     // Fork: sound activity state machine, see Services/SoundActivity.cs.
@@ -113,6 +126,10 @@ public class Pair
     public int SoundLoopKey { get; set; }
     /// <summary>Fork 1210: last time one of the pair's sound files failed to load (ignored for ACTIVE; tooltip only).</summary>
     public DateTimeOffset? SoundLastFailedAt { get; set; }
+    /// <summary>Next build: when the current fade first started (a repeating one-shot may extend the fade only up to one extra fade length past this).</summary>
+    public DateTimeOffset? SoundFadeFirstStart { get; set; }
+    /// <summary>Next build: consecutive failed loads per sound game path, and until when a repeatedly failing path is ignored.</summary>
+    public Dictionary<string, (int Count, DateTimeOffset? IgnoredUntil)> SoundFailedPaths { get; } = new(StringComparer.OrdinalIgnoreCase);
     public nint Address => CachedPlayer?.PlayerCharacter ?? nint.Zero;
     public UserData UserData => UserPair.User;
     public ulong PlayerCharacterId => CachedPlayer?.PlayerCharacterId ?? ulong.MaxValue;
@@ -207,6 +224,12 @@ public class Pair
         return DataHandler?.GetCopyOfPairCharacterData();
     }
 
+    /// <summary>1.15.5.1226: hash of the cached data, without copying it (worked out once per data change).</summary>
+    public string? PSyncGetCachedDataHash()
+    {
+        return DataHandler?.PSyncGetCachedDataHash();
+    }
+
     public Task<Dictionary<ObjectKind, List<FileReplacementData>>?> TryGetMissingFileReplacementData()
     {
         return DataHandler!.TryGetMissingFileReplacementData();
@@ -254,6 +277,56 @@ public class Pair
         ReapplyCachedData(forced: true);
     }
 
+    /// <summary>1.15.5.1217: revert this pair's applied mods (budget hold / block) but keep their data for a later reapply.</summary>
+    public async Task ReleaseAppliedDataAsync(string why)
+    {
+        await _creationSemaphore.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var old = DataHandler;
+            if (old == null) return;
+            var data = old.PSyncGetAnyData();
+            _logger.LogInformation("PSync: reverting {pair} ({why})", PairUIDName, why);
+            if (_onlineUserIdentDto == null) return;
+            // Audit L3: build the replacement first and swap it in, so DataHandler is never null for other callers.
+            var dataHandler = _pairDataApplicationHandlerFactory.Create(this);
+            DataHandler = dataHandler;
+            old.Dispose();
+            var charaHandler = CachedPlayer?.CharacterHandler;
+            if (dataHandler != null && charaHandler != null)
+            {
+                await dataHandler.Initialize(charaHandler).ConfigureAwait(false);
+            }
+            if (data != null) dataHandler?.PSyncSeedPendingData(data);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "PSync: failed to revert {pair}", PairUIDName);
+        }
+        finally
+        {
+            _creationSemaphore.Release();
+        }
+    }
+
+    /// <summary>1.15.5.1217: drop this pair's files from the PSync cache and download + apply them again.</summary>
+    public async Task<int> ForceRedownloadAsync()
+    {
+        var handler = DataHandler;
+        if (handler == null) return 0;
+        var removed = await handler.PSyncForceRedownloadAsync().ConfigureAwait(false);
+        ReapplyCachedDataByUser();
+        return removed;
+    }
+
+    /// <summary>1.15.5.1218: hashes this pair currently uses (cached or pending data), for shared-file checks.</summary>
+    public IEnumerable<string> PSyncGetFileHashes()
+    {
+        var data = DataHandler?.PSyncGetAnyData();
+        if (data == null) return Array.Empty<string>();
+        return data.FileReplacements.SelectMany(k => k.Value).Select(r => r.Hash).Where(h => !string.IsNullOrWhiteSpace(h));
+    }
+
     public void ReapplyCachedData(bool forced = false)
     {
         if (HasCachedData)
@@ -297,6 +370,7 @@ public class Pair
             if (dto != null)
             {
                 _onlineUserIdentDto = dto;
+                if (!string.IsNullOrEmpty(dto.Ident)) LastKnownHashedCID = dto.Ident;
             }
         }
         finally
@@ -339,6 +413,8 @@ public class Pair
             dataHandler?.Dispose();
 
             var player = CachedPlayer;
+            if (!string.IsNullOrEmpty(_onlineUserIdentDto?.Ident)) LastKnownHashedCID = _onlineUserIdentDto!.Ident;
+            if (!string.IsNullOrEmpty(player?.PlayerName)) LastKnownPlayerName = player!.PlayerName!;
             CachedPlayer = null;
             player?.Dispose();
 

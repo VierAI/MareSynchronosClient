@@ -22,6 +22,7 @@ public partial class SettingsUi
             new(PerformanceTabs.TextureCap, "Texture Size Cap", DrawPerformanceTextureCap),
             new(PerformanceTabs.Threshold, "Auto Threshold Pausing", DrawPerformanceThresholdPausing),
             new(PerformanceTabs.Height, "Auto Height Pausing", DrawPerformanceHeightPausing),
+            new(PerformanceTabs.Budget, "Memory Budget & Blocklist", DrawPerformanceMemoryBudget),
         ];
 
     private enum PerformanceTabs
@@ -30,6 +31,7 @@ public partial class SettingsUi
         Threshold,
         Height,
         TextureCap,
+        Budget,
     }
 
     private void DrawPerformanceSettings()

@@ -970,6 +970,9 @@ public sealed class CacheMonitor : DisposableMediatorSubscriberBase
         }, ct, TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 
+    // 1.15.5.1227: under Wine a cleanup goes down to this share of the cap (hysteresis), see RecalculateFileCacheSize.
+    private const double WineCleanupTargetFraction = 0.90;
+
     public void RecalculateFileCacheSize(CancellationToken token)
     {
         if (string.IsNullOrEmpty(_configService.Current.CacheFolder) || !Directory.Exists(_configService.Current.CacheFolder))
@@ -1056,8 +1059,19 @@ public sealed class CacheMonitor : DisposableMediatorSubscriberBase
 
         token.ThrowIfCancellationRequested();
 
-        var bytesToDelete = FileCacheSize - space;
-        Logger.LogInformation("File directory is almost full! Requesting {bytesToDelete} bytes be deleted to reach {bytes} bytes", bytesToDelete.ToByteString(), space.ToByteString());
+        // 1.15.5.1227: Wine only, hysteresis. The trigger is unchanged (cap minus headroom), but the cleanup now goes down to
+        // WineCleanupTargetFraction of the cap instead of just under the trigger, so at the cap it runs far less often than
+        // once a minute. PC unchanged.
+        var cleanTarget = space;
+        // Read once per cleanup so the target and the chunking always match.
+        var chunkedCleanup = LowPriorityFile.IsWine;
+        if (chunkedCleanup)
+        {
+            cleanTarget = Math.Min(space, (long)(maxCacheInBytes * WineCleanupTargetFraction));
+        }
+
+        var bytesToDelete = FileCacheSize - cleanTarget;
+        Logger.LogInformation("File directory is almost full! Requesting {bytesToDelete} bytes be deleted to reach {bytes} bytes", bytesToDelete.ToByteString(), cleanTarget.ToByteString());
 
         var isAbleToRun = false;
         try
@@ -1079,8 +1093,15 @@ public sealed class CacheMonitor : DisposableMediatorSubscriberBase
                 Thread.Sleep(250);
             }
 
-            var fileCleanupResults = _fileDbManager.ReclaimLocalCacheStorageAsync(bytesToDelete, token).GetAwaiter().GetResult();
+            var cleanupWatch = Stopwatch.StartNew();
+            var fileCleanupResults = _fileDbManager.ReclaimLocalCacheStorageAsync(bytesToDelete, chunkedCleanup, token).GetAwaiter().GetResult();
+            cleanupWatch.Stop();
             FileCacheSize = Math.Max(0, FileCacheSize - fileCleanupResults.ReclaimedBytes);
+
+            // 1227: one summary line per cleanup
+            Logger.LogInformation("Cache cleanup: {files} files, {mib:0.0} MiB, {chunks} chunks, {ms} ms (requested {requestedMib:0.0} MiB, target {target}, wine {wine})",
+                fileCleanupResults.DeletedFiles, fileCleanupResults.ReclaimedBytes / 1048576d, fileCleanupResults.Chunks, cleanupWatch.ElapsedMilliseconds,
+                bytesToDelete / 1048576d, cleanTarget.ToByteString(), LowPriorityFile.IsWine);
 
             if (fileCleanupResults.ReclaimedBytes < bytesToDelete)
             {

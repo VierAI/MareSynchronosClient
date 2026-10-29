@@ -125,6 +125,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddSingleton<DownloadPriorityQueue>();
             collection.AddSingleton<SoundActivityTracker>();
             collection.AddSingleton<AutoAnimationSync>(); // fork 1210
+            collection.AddSingleton<MareSynchronos.Services.PSyncCrowdService>(); // 1.15.5.1217
             collection.AddSingleton<FileTransferOrchestrator>();
             collection.AddSingleton((s) => new PreloaderService(
                 s.GetRequiredService<FileCacheManager>(), s.GetRequiredService<FileUploadManager>(),
@@ -328,8 +329,9 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddHostedService<StageSavedNotificationService>();
             collection.AddHostedService<CacheFolderHealthCheck>();
             collection.AddHostedService(p => p.GetRequiredService<AutoAnimationSync>()); // fork 1210
+            collection.AddHostedService(p => p.GetRequiredService<MareSynchronos.Services.PSyncCrowdService>()); // 1.15.5.1217
             collection.AddHostedService(p => new MareSynchronos.Interop.Ipc.PSyncDebugIpc(p.GetRequiredService<ILogger<MareSynchronos.Interop.Ipc.PSyncDebugIpc>>(), pluginInterface,
-                p.GetRequiredService<PairManager>(), p.GetRequiredService<DalamudUtilService>(), p.GetRequiredService<MareSynchronos.Services.Events.EventAggregator>(), p.GetRequiredService<MareMediator>(), p.GetRequiredService<ServerConfigurationManager>())); // fork 1210
+                p.GetRequiredService<PairManager>(), p.GetRequiredService<DalamudUtilService>(), p.GetRequiredService<MareSynchronos.Services.Events.EventAggregator>(), p.GetRequiredService<MareMediator>(), p.GetRequiredService<ServerConfigurationManager>(), p.GetRequiredService<ApiController>())); // fork 1210, 1401 adds ApiController (1405: server state only)
             //collection.AddHostedService(p => p.GetRequiredService<PlayerIdleStatusService>());
             collection.AddHostedService<SkeletonMappingFix>();
         })

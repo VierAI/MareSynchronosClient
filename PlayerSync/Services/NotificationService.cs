@@ -42,6 +42,7 @@ public class NotificationService : DisposableMediatorSubscriberBase, IHostedServ
     public Task StartAsync(CancellationToken cancellationToken)
     {
         Mediator.Subscribe<NotificationMessage>(this, ShowNotification);
+        Mediator.Subscribe<PSyncChatNoticeMessage>(this, m => PrintWarnChat(m.Message));
 
         _inviteTogglePayload = _chatGui.AddChatLinkHandler(0, (_, _) => Mediator.Publish(new UiToggleMessage(typeof(PairingRequestsUi))));
         // LifeStreamHandler uses ID 1
