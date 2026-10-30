@@ -161,6 +161,7 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
         });
 
         mediator.Subscribe<TargetPairMessage>(this, (msg) => TargetPairByTargetType(msg.Pair, msg.TargetType));
+        mediator.Subscribe<HoverTargetPairMessage>(this, (msg) => HoverTargetPair(msg.Pair, msg.TargetType));
 
         IsWine = Util.IsWine();
         _cid = RebuildCID();
@@ -1131,6 +1132,85 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
         });
     }
 
+    // ---- 1.15.5.1414: temporary hover targeting (framework thread only) ----
+    private bool _hoverActive;
+    private TargetType _hoverType;
+    private bool _hoverHadPrevious;
+    private ulong _hoverPreviousId;
+    private nint _hoverSetAddress;
+
+    private IGameObject? GetTargetOfType(TargetType type) => type switch
+    {
+        TargetType.Target => _targetManager.Target,
+        TargetType.SoftTarget => _targetManager.SoftTarget,
+        TargetType.FocusTarget => _targetManager.FocusTarget,
+        TargetType.MouseOverTarget => _targetManager.MouseOverTarget,
+        _ => null,
+    };
+
+    private void SetTargetOfType(TargetType type, IGameObject? obj)
+    {
+        switch (type)
+        {
+            case TargetType.Target: _targetManager.Target = obj; break;
+            case TargetType.SoftTarget: _targetManager.SoftTarget = obj; break;
+            case TargetType.FocusTarget: _targetManager.FocusTarget = obj; break;
+            case TargetType.MouseOverTarget: _targetManager.MouseOverTarget = obj; break;
+        }
+    }
+
+    private void HoverTargetPair(Pair? pair, TargetType targetType)
+    {
+        if (_clientState.IsPvP) return;
+        _ = RunOnFrameworkThread(() =>
+        {
+            if (pair == null)
+            {
+                RestoreHoverTarget();
+                return;
+            }
+            if (!TryGetPlayerAddressAndIndexOnFrameworkByContentId(pair.ContendId, out _, out var index)) return;
+            var obj = _objectTable[index];
+            if (obj == null) return;
+            if (_hoverActive && _hoverType != targetType) RestoreHoverTarget();
+            if (!_hoverActive)
+            {
+                var current = GetTargetOfType(targetType);
+                _hoverHadPrevious = current != null;
+                _hoverPreviousId = current?.GameObjectId ?? 0;
+                _hoverType = targetType;
+                _hoverActive = true;
+            }
+            SetTargetOfType(targetType, obj);
+            _hoverSetAddress = obj.Address;
+            PSyncHoverTarget.Touch();
+        });
+    }
+
+    private void RestoreHoverTarget()
+    {
+        if (!_hoverActive) return;
+        _hoverActive = false;
+        var current = GetTargetOfType(_hoverType);
+        // The player picked a different target while hovering: keep theirs.
+        if (current != null && current.Address != _hoverSetAddress) return;
+        IGameObject? previous = _hoverHadPrevious ? _objectTable.SearchById(_hoverPreviousId) : null;
+        SetTargetOfType(_hoverType, previous);
+    }
+
+    private void CheckHoverTargetStale()
+    {
+        if (!_hoverActive) return;
+        if (Environment.TickCount64 - PSyncHoverTarget.LastTouchTick > PSyncHoverTarget.StaleAfterMs) RestoreHoverTarget();
+    }
+
+    /// <summary>1.15.5.1414: home world of the player at this address (0 if unknown). Framework thread only.</summary>
+    public uint GetHomeWorldIdForAddressOnFramework(nint address)
+    {
+        if (address == nint.Zero) return 0;
+        return (GetCharacterFromObjectTableByAddressWhenAlreadyOnFrameworkThread(address) as IPlayerCharacter)?.HomeWorld.RowId ?? 0;
+    }
+
     private const int MaxNewFrameworkCharactersPerFrame = 8;
 
     // 1221: prune _frameworkCharacters entries not seen for 10+ minutes (checked once a minute, game thread only)
@@ -1337,6 +1417,7 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
     private unsafe void FrameworkOnUpdate(IFramework framework)
     {
         FrameworkUpdateCount++;
+        CheckHoverTargetStale(); // 1.15.5.1414: restore the pre-hover target when no UI row reports a hover any more
         bool isNormalFrameworkUpdate = DateTime.UtcNow < _delayedFrameworkUpdateCheck.AddSeconds(1);
 
         ScanFrameworkCharacters(); // check if we see/don't see players around us and let PairManager know

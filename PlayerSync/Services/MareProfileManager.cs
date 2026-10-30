@@ -70,6 +70,11 @@ public class MareProfileManager : MediatorSubscriberBase
         return (profile);
     }
 
+    // Fork (VierAI 1413): lets the pair request window tell a real picture from the logo placeholders.
+    public bool HasOwnPicture(MareProfileData profile) => !ReferenceEquals(profile, _defaultProfileData) && !ReferenceEquals(profile, _loadingProfileData) && !ReferenceEquals(profile, _nsfwProfileData);
+
+    public bool IsLoading(MareProfileData profile) => ReferenceEquals(profile, _loadingProfileData);
+
     public void RemoveMareProfile(UserData data)
     {
         _mareProfiles.Remove(data, out _);

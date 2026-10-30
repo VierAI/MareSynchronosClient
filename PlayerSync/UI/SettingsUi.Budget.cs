@@ -95,13 +95,7 @@ public partial class SettingsUi
             VierAIConfigStore.MarkDirty();
         }
         _uiShared.DrawHelpText("Print one chat line the first time a visible pair is over a warning limit (once per player per session, at most one line every 10 seconds).");
-        var autoRedl = cfg.AutoRedownloadMissingFiles;
-        if (ImGui.Checkbox("Re-download automatically when files are missing", ref autoRedl))
-        {
-            cfg.AutoRedownloadMissingFiles = autoRedl;
-            VierAIConfigStore.MarkDirty();
-        }
-        _uiShared.DrawHelpText("When an apply finds missing files, PlayerSync re-downloads them and re-applies (at most 3 times per 10 minutes per player).");
+        // 1.15.5.1414: the missing-file auto re-download was removed, so its checkbox is gone (the config key stays, unused).
         ImGui.TextUnformatted($"Downloads blocked by file safety checks this session: {PSyncFileSafety.BlockedCount}");
 
         ImGui.Separator();

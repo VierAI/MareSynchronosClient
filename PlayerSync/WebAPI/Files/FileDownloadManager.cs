@@ -227,9 +227,13 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     private readonly record struct WineCapSummary(int Starts, int Waited, double MaxWaitMs, double WindowMs);
 
+    // 1.15.5.1414: WineStartCap is off by default (legacy = no pacing of file starts). On Mac it made players wait up to
+    // ~16 s before their files started loading. Kept as a switch for A/B tests only.
+    private static readonly bool WineStartCapEnabled = false;
+
     private static async Task WineFileStartPaceAsync(ILogger logger, CancellationToken token)
     {
-        if (!LowPriorityFile.IsWine) return;
+        if (!WineStartCapEnabled || !LowPriorityFile.IsWine) return;
 
         var firstTry = DateTime.UtcNow;
         var hadToWait = false;
@@ -1046,7 +1050,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         var tempFilename = _fileDbManager.GetCacheTempFilePath(directDownload.Hash);
         try
         {
-            // 1226 WineStartCap (own switch; returns at once while WineStartCap is legacy, the default)
+            // 1226 WineStartCap: off since 1.15.5.1414 (WineStartCapEnabled = false), so this returns at once on every platform.
             await WineFileStartPaceAsync(Logger, token).ConfigureAwait(false);
 
             // Download the compressed file directly

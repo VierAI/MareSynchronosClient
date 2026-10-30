@@ -215,7 +215,9 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                 waitForDrawReady = false;
                 if (!await WaitForPairDrawReadyAsync(pair, TimeSpan.FromSeconds(3)).ConfigureAwait(false))
                 {
-                    Logger.LogDebug("Cached data application for {pair} stopped: not drawn and ready after an invalid-state retry", pair?.PairUIDName ?? string.Empty);
+                    // 1.15.5.1414: do not drop the apply (that could leave an old look on screen). Mark it pending;
+                    // PSyncCrowdService.LiftHolds reapplies it once nothing holds the pair, and drops it if they left view.
+                    QueuePendingReapplyAfterDrawWait(pair);
                     return;
                 }
             }
@@ -256,6 +258,7 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                 Logger.LogTrace("[BASE-{appBase}] Starting cached data application for {pair}", applicationBase, pair.PairUIDName);
                 await pair.ApplyCachedDataAync(applicationBase, _dataApplicationPipelineTopLevelCts.Token, force).ConfigureAwait(false);
                 completed = true;
+                waitForDrawReady = false;
 
                 break;
             }
@@ -308,6 +311,20 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                 }
             }
         }
+
+        if (waitForDrawReady)
+        {
+            // 1.15.5.1414: all attempts hit an invalid character state; retry later instead of dropping it.
+            QueuePendingReapplyAfterDrawWait(pair);
+        }
+    }
+
+    /// <summary>1.15.5.1414: an apply that gave up because the character never became drawn and ready is retried later.</summary>
+    private void QueuePendingReapplyAfterDrawWait(Pair? pair)
+    {
+        if (pair == null || !pair.IsVisible || !pair.HasCachedData) return;
+        MareSynchronos.Services.PSyncCrowd.PendingReapply[pair.UserData.UID] = 0;
+        Logger.LogDebug("Cached data application for {pair} not drawn and ready after an invalid-state retry; queued a pending reapply", pair.PairUIDName);
     }
 
     /// <summary>1225: true once the pair is visible and its model is drawn and ready; false on timeout, invisibility or shutdown.</summary>

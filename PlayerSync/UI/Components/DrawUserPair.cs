@@ -92,27 +92,22 @@ public class DrawUserPair
 
         if (_configService.Current.TargetPairsOnHover)
         {
-            bool thisPairIsSelected = _lastHoverTarget?.UserData.UID == _pair.UserData.UID;
+            // 1.15.5.1414: hover targeting is temporary. The previous target is restored on unhover (and by
+            // DalamudUtilService if this row stops being drawn), so hovering never leaves a permanent focus target.
             var onHoverTargetType = _configService.Current.OnHoverTargetType;
-            Pair? hoverTarget = null;
-
-            if (_wasHovered && !thisPairIsSelected)
+            if (_wasHovered)
             {
-                hoverTarget = _pair;
+                var stale = PSyncHoverTarget.Touch();
+                if (stale || _lastHoverTarget?.UserData.UID != _pair.UserData.UID)
+                {
+                    _lastHoverTarget = _pair;
+                    _mediator.Publish(new HoverTargetPairMessage(_pair, onHoverTargetType));
+                }
             }
-
-            if ((_lastHoverTarget == null && hoverTarget != null) || (hoverTarget != null && (_lastHoverTarget?.PlayerName != hoverTarget.PlayerName)))
-            {
-                _lastHoverTarget = hoverTarget;
-                _mediator.Publish(new TargetPairMessage(hoverTarget, onHoverTargetType));
-            }
-
-            var pairName = onHoverTargetType == TargetType.Target ? _uiSharedService.PlayerTargetName : onHoverTargetType == TargetType.SoftTarget ? _uiSharedService.PlayerSoftTargetname :
-                onHoverTargetType == TargetType.FocusTarget ? _uiSharedService.PlayerFocusTargetname : string.Empty;
-            if (!TableHelper.IsMouseWithinWindow() && _lastHoverTarget != null && _lastHoverTarget == _pair && !string.IsNullOrEmpty(pairName))
+            else if (_lastHoverTarget != null && string.Equals(_lastHoverTarget.UserData.UID, _pair.UserData.UID, StringComparison.Ordinal))
             {
                 _lastHoverTarget = null;
-                _mediator.Publish(new TargetPairMessage(null, onHoverTargetType));
+                _mediator.Publish(new HoverTargetPairMessage(null, onHoverTargetType));
             }
         }
     }

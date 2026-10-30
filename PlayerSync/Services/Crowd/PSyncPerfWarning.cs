@@ -87,12 +87,13 @@ public static class PSyncPerfWarning
             if (!w.Any) continue;
             s_notified.Add(uid);
             s_lastChat = now;
+            var who = string.IsNullOrEmpty(pair.PlayerName) ? pair.UserData.AliasOrUID : $"{pair.PlayerName} ({pair.UserData.AliasOrUID})";
             mediator.Publish(new PSyncChatNoticeMessage(
-                $"{pair.UserData.AliasOrUID} is over your performance warning limit: {Label(pair, w)}" + (w.VramPause || w.TrisPause ? " (over auto-pause)" : string.Empty)));
+                $"{who} is over your performance warning limit: {Label(pair, w)}" + (w.VramPause || w.TrisPause ? " (over auto-pause)" : string.Empty), pair));
             return;
         }
     }
 }
 
 /// <summary>PSync: print one line to the game chat (warning style), regardless of the notification location setting.</summary>
-public record PSyncChatNoticeMessage(string Message) : MessageBase;
+public record PSyncChatNoticeMessage(string Message, Pair? Pair = null) : MessageBase; // 1414: Pair = player link in chat

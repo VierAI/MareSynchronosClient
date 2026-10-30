@@ -310,6 +310,10 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
     private readonly System.Collections.Concurrent.ConcurrentDictionary<nint, (Guid ApplicationId, DateTime Since)> _deferredRedraws = new();
     private static readonly TimeSpan PendingRedrawTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan DeferredRedrawTimeout = TimeSpan.FromSeconds(10);
+    // 1.15.5.1414: at most one follow-up (deferred) redraw per character per window. Later requests in the window are
+    // merged into one that goes out when the window ends, so the newest state still gets drawn but redraws cannot storm.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<nint, DateTime> _lastFollowUpRedraw = new();
+    private static readonly TimeSpan FollowUpRedrawWindow = TimeSpan.FromSeconds(3);
 
     private static unsafe CharacterRedrawBlock GetRedrawBlock(nint address)
     {
@@ -384,10 +388,12 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
             if (_dalamudUtil.GetCharacterFromObjectTableByAddressWhenAlreadyOnFrameworkThread(address) == null)
             {
                 _deferredRedraws.TryRemove(address, out _);
+                _lastFollowUpRedraw.TryRemove(address, out _);
                 Logger.LogDebug("[{applicationId}] Deferred redraw for {address:X} dropped, object gone", entry.ApplicationId, address);
                 continue;
             }
             if (_pendingRedraws.TryGetValue(address, out var sentAt) && DateTime.UtcNow - sentAt < PendingRedrawTimeout) continue;
+            if (_lastFollowUpRedraw.TryGetValue(address, out var lastFollowUp) && DateTime.UtcNow - lastFollowUp < FollowUpRedrawWindow) continue;
 
             var block = GetRedrawBlock(address);
             var timedOut = DateTime.UtcNow - entry.Since > DeferredRedrawTimeout;
@@ -397,6 +403,8 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
                 // Drawn now (or stuck loading too long): send it so no stale mods stay on screen.
                 _deferredRedraws.TryRemove(address, out _);
                 Logger.LogDebug("[{applicationId}] Sending deferred redraw for {address:X} ({block})", entry.ApplicationId, address, block);
+                if (_lastFollowUpRedraw.Count > 512) _lastFollowUpRedraw.Clear();
+                _lastFollowUpRedraw[address] = DateTime.UtcNow;
                 SendRedraw(address);
             }
             else if (timedOut)

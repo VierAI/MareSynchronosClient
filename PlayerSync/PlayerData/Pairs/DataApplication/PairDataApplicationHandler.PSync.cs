@@ -7,13 +7,9 @@ using System.Collections.Concurrent;
 
 namespace MareSynchronos.PlayerData.Pairs;
 
-// 1.15.5.1217: force re-download, missing-file auto retry, budget hold seeding.
+// 1.15.5.1217: force re-download, budget hold seeding. (1.15.5.1414: the missing-file auto retry is removed.)
 public sealed partial class PairDataApplicationHandler
 {
-    private const int PSyncMaxAutoRetries = 3;
-    private static readonly TimeSpan PSyncRetryWindow = TimeSpan.FromMinutes(10);
-    private static readonly ConcurrentDictionary<string, List<DateTimeOffset>> s_psyncRetries = new(StringComparer.Ordinal);
-    private int _psyncRetryScheduled;
     private int _psyncApplyInFlight;
 
     /// <summary>After a budget/block release: keep the last data as pending so a later reapply can use it.</summary>
@@ -122,56 +118,14 @@ public sealed partial class PairDataApplicationHandler
         return removed;
     }
 
-    /// <summary>"Missing files for" path: drop stale cache entries and schedule one capped forced reapply.</summary>
+    /// <summary>
+    /// "Missing files for" path. 1.15.5.1414: no automatic re-download or re-apply any more (it could reload a player
+    /// over and over). Missing files are only logged; the normal download/apply path and the manual "Force Re-download"
+    /// menu entry handle them.
+    /// </summary>
     private void PSyncHandleMissing(string[] hashes, string why)
     {
-        try
-        {
-            if (!VierAIConfigStore.Current.AutoRedownloadMissingFiles || hashes.Length == 0) return;
-            if (PSyncCrowd.IsBlocked(Pair)) return;
-            lock (_downloadManager.ForbiddenTransfers)
-            {
-                hashes = hashes.Where(h => !_downloadManager.ForbiddenTransfers.Exists(f => string.Equals(f.Hash, h, StringComparison.OrdinalIgnoreCase))
-                    && !PSyncFileSafety.IsRefusedForPair(Pair.UserData.UID, h)).ToArray();
-            }
-            if (hashes.Length == 0) return;
-            var uid = Pair.UserData.UID;
-            var now = DateTimeOffset.UtcNow;
-            var list = s_psyncRetries.GetOrAdd(uid, _ => new());
-            lock (list)
-            {
-                list.RemoveAll(t => now - t > PSyncRetryWindow);
-                if (list.Count >= PSyncMaxAutoRetries)
-                {
-                    Logger.LogWarning("PSync: missing files for {pair} ({why}); auto re-download cap reached ({cap} per {min} min)", Pair.PairUIDName, why, PSyncMaxAutoRetries, (int)PSyncRetryWindow.TotalMinutes);
-                    return;
-                }
-                if (Interlocked.Exchange(ref _psyncRetryScheduled, 1) == 1) return;
-                list.Add(now);
-            }
-            Logger.LogInformation("PSync: missing files for {pair} ({why}); re-downloading {n} file(s) and re-applying", Pair.PairUIDName, why, hashes.Length);
-            var pair = Pair;
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await PSyncForceRedownloadAsync(hashes, deleteFiles: false).ConfigureAwait(false);
-                    await Task.Delay(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
-                    pair.ReapplyCachedDataByUser();
-                }
-                catch (Exception ex)
-                {
-                    Logger.LogDebug(ex, "PSync: missing-file retry failed");
-                }
-                finally
-                {
-                    Interlocked.Exchange(ref _psyncRetryScheduled, 0);
-                }
-            });
-        }
-        catch (Exception ex)
-        {
-            Logger.LogDebug(ex, "PSync: missing-file handling failed");
-        }
+        if (hashes.Length == 0) return;
+        Logger.LogDebug("PSync: missing files for {pair} ({why}): {n} file(s), no automatic re-download", Pair.PairUIDName, why, hashes.Length);
     }
 }

@@ -6,6 +6,7 @@ using Dalamud.Interface.Utility.Raii;
 using Dalamud.Plugin.Services;
 using MareSynchronos.MareConfiguration;
 using MareSynchronos.MareConfiguration.Models;
+using MareSynchronos.PlayerData.Pairs;
 using MareSynchronos.Services.Mediator;
 using MareSynchronos.UI;
 using Microsoft.Extensions.Hosting;
@@ -42,7 +43,7 @@ public class NotificationService : DisposableMediatorSubscriberBase, IHostedServ
     public Task StartAsync(CancellationToken cancellationToken)
     {
         Mediator.Subscribe<NotificationMessage>(this, ShowNotification);
-        Mediator.Subscribe<PSyncChatNoticeMessage>(this, m => PrintWarnChat(m.Message));
+        Mediator.Subscribe<PSyncChatNoticeMessage>(this, m => PrintWarnChat(m.Message, m.Pair));
 
         _inviteTogglePayload = _chatGui.AddChatLinkHandler(0, (_, _) => Mediator.Publish(new UiToggleMessage(typeof(PairingRequestsUi))));
         // LifeStreamHandler uses ID 1
@@ -71,10 +72,36 @@ public class NotificationService : DisposableMediatorSubscriberBase, IHostedServ
         _chatGui.Print(se.BuiltString);
     }
 
-    private void PrintWarnChat(string? message)
+    private void PrintWarnChat(string? message, Pair? pair = null)
     {
-        SeStringBuilder se = new SeStringBuilder().AddText("[PlayerSync] ").AddUiForeground("Warning: " + (message ?? string.Empty), 31).AddUiForegroundOff();
-        _chatGui.Print(se.BuiltString);
+        message ??= string.Empty;
+        // 1.15.5.1414: the player's name becomes a normal player link (PlayerPayload with name + home world), so
+        // clicking or right-clicking it works like on a chat sender (target, examine, etc.).
+        var name = pair?.PlayerName;
+        var address = pair?.Address ?? nint.Zero;
+        var idx = string.IsNullOrEmpty(name) ? -1 : message.IndexOf(name, StringComparison.Ordinal);
+        if (idx < 0 || address == nint.Zero)
+        {
+            SeStringBuilder plain = new SeStringBuilder().AddText("[PlayerSync] ").AddUiForeground("Warning: " + message, 31).AddUiForegroundOff();
+            _chatGui.Print(plain.BuiltString);
+            return;
+        }
+
+        _ = _dalamudUtilService.RunOnFrameworkThread(() =>
+        {
+            var world = _dalamudUtilService.GetHomeWorldIdForAddressOnFramework(address);
+            var se = new SeStringBuilder().AddText("[PlayerSync] ").AddUiForeground("Warning: " + message[..idx], 31).AddUiForegroundOff();
+            if (world != 0)
+            {
+                se.Add(new PlayerPayload(name!, world)).AddText(name!).Add(RawPayload.LinkTerminator);
+            }
+            else
+            {
+                se.AddUiForeground(name!, 31).AddUiForegroundOff();
+            }
+            se.AddUiForeground(message[(idx + name!.Length)..], 31).AddUiForegroundOff();
+            _chatGui.Print(se.BuiltString);
+        });
     }
 
     private void PrintPairRequestChat(string? message)
@@ -131,7 +158,7 @@ public class NotificationService : DisposableMediatorSubscriberBase, IHostedServ
                 break;
 
             case NotificationType.Warning:
-                PrintWarnChat(msg.Message);
+                PrintWarnChat(msg.Message, msg.Pair);
                 break;
 
             case NotificationType.Error:

@@ -1716,7 +1716,36 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
         }
     }
 
+    // 1.15.5.1414: at most one post-redraw Customize+/Heels reapply per character per window, and never two at once.
+    private int _scaleReapplyInFlight;
+    private long _lastScaleReapplyTick = long.MinValue / 2;
+    private const long ScaleReapplyWindowMs = 3000;
+
     private async Task ReapplyScaleAndHeelsAfterRedrawAsync(Guid applicationId, CharacterData charaData, CancellationToken cancellationToken)
+    {
+        if (Interlocked.CompareExchange(ref _scaleReapplyInFlight, 1, 0) != 0)
+        {
+            Logger.LogDebug("[{applicationId}] Post-redraw C+/Heels reapply for {pair} skipped, one is already running", applicationId, Pair.PairUIDName);
+            return;
+        }
+        try
+        {
+            var now = Environment.TickCount64;
+            if (now - Interlocked.Read(ref _lastScaleReapplyTick) < ScaleReapplyWindowMs)
+            {
+                Logger.LogDebug("[{applicationId}] Post-redraw C+/Heels reapply for {pair} skipped, one ran in the last {ms} ms", applicationId, Pair.PairUIDName, ScaleReapplyWindowMs);
+                return;
+            }
+            Interlocked.Exchange(ref _lastScaleReapplyTick, now);
+            await ReapplyScaleAndHeelsAfterRedrawCoreAsync(applicationId, charaData, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _scaleReapplyInFlight, 0);
+        }
+    }
+
+    private async Task ReapplyScaleAndHeelsAfterRedrawCoreAsync(Guid applicationId, CharacterData charaData, CancellationToken cancellationToken)
     {
         string? scale = null;
         if (charaData.CustomizePlusData.TryGetValue(ObjectKind.Player, out var encoded) && !string.IsNullOrEmpty(encoded))

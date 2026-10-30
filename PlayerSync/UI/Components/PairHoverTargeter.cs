@@ -1,6 +1,7 @@
 using Dalamud.Bindings.ImGui;
 using MareSynchronos.MareConfiguration;
 using MareSynchronos.PlayerData.Pairs;
+using MareSynchronos.Services;
 using MareSynchronos.Services.Mediator;
 using MareSynchronos.Services.Models;
 
@@ -35,10 +36,15 @@ internal sealed class PairHoverTargeter
         _hoveredThisFrame = true;
 
         var cfg = _configService.Current;
-        if (cfg.TargetPairsOnHover && !string.Equals(_hoveredUid, pair.UserData.UID, StringComparison.Ordinal))
+        if (cfg.TargetPairsOnHover)
         {
-            _hoveredUid = pair.UserData.UID;
-            _mediator.Publish(new TargetPairMessage(pair, cfg.OnHoverTargetType));
+            // 1.15.5.1414: temporary hover target (restored on unhover), not a permanent TargetPairMessage.
+            var stale = PSyncHoverTarget.Touch();
+            if (stale || !string.Equals(_hoveredUid, pair.UserData.UID, StringComparison.Ordinal))
+            {
+                _hoveredUid = pair.UserData.UID;
+                _mediator.Publish(new HoverTargetPairMessage(pair, cfg.OnHoverTargetType));
+            }
         }
 
         if (!overButton && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
@@ -51,6 +57,6 @@ internal sealed class PairHoverTargeter
     {
         if (_hoveredThisFrame || _hoveredUid == null) return;
         _hoveredUid = null;
-        _mediator.Publish(new TargetPairMessage(null, _configService.Current.OnHoverTargetType));
+        _mediator.Publish(new HoverTargetPairMessage(null, _configService.Current.OnHoverTargetType));
     }
 }
