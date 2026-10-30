@@ -22,43 +22,28 @@ Per-build notes are on the [releases page](https://github.com/VierAI/MareSynchro
 
 ### PSync (VierAI) changes
 
-Everything below in this section is VierAI's fork work, not part of the official PlayerSync. This list covers 1.15.5.1416. Items under In testing arrived in builds after the first public release and are all included in 1.15.5.1416.
+Everything in this section is VierAI's fork work, not part of the official PlayerSync. This list covers 1.15.5.1416. Items marked *(in testing)* were added after the first public release (1.15.5.1209); the version in brackets is the build that added them, and all of them are included in 1.15.5.1416.
 
-#### Features added
+#### Features
 
 - Noises window and Noises folder in the main window: see who is playing modded sounds, hover a row to target them, mute or pause from the list; detection counts only a player's own sounds; unmuting or Reapply Last Data restores their music, looping emote sounds and speaker icon
 - Sound icon next to pairs (active or fading) with a speaker wave; optional speaker on name tags
-- Download priority: five tiers (listed players, in-game friends, party and alliance members, direct pairs, everyone else), Priority settings tab, Prioritize in the Pair Data menu
+- Download priority: five tiers (listed players, in-game friends, party and alliance members, direct pairs, everyone else), Priority settings tab, Prioritize in the Pair Data menu; nearer players first within a tier (whole alliance in the party tier *(in testing, 1216)*)
 - Downloads window shows only active transfers with names; bars show Waiting when idle and keep a transfer's progress between file groups
 - Texture size cap (off by default): shrinks oversized textures on tiny models, judged by the model's real size; eyes keep at least 2K
 - Syncshells show how many members you can only reach through that shell, as a green (N)
 - Noises: configurable fade time (10-300 s) and muted row hide delay (5-60 s); stable row order; buttons on hover; red icon for muted rows
-- Right-click menu: Reapply Last Data at the top level, Send Pair Request in the Pair Data submenu
-
-#### In testing
-
-Features:
-
-- Right-click menu: Override auto pause for players paused by the VRAM, triangle or height threshold
-- Settings > Debug: 'Allow local debug tools to read pair info' (off by default)
-- Players the game is not drawing show a "Not drawn" icon; their downloads wait unless they are listed, in-game friends or party/alliance members
-- Pair tooltip shows why a player is waiting (tier, queue position, downloading, not drawn, budget, waiting for data) and where their files came from
-- Visible pairs show their approximate VRAM and triangles inline (e.g. "312 MB, 450k tris"), yellow or red over your thresholds
-- Force re-download for one player (main window menu and right-click Pair Data menu)
-- Optional memory budget (off by default): manual MB cap, stricter cap in crowded areas, or Auto from live GPU memory (manual on Wine/Mac and integrated GPUs); holds the lowest-priority, farthest players first, both ways, and resumes them automatically
-- Blocklist: block a player (by UID) so nothing of theirs downloads or applies (separate from pause, kept across restarts)
-- Pair request window in the Noises style: transparent until hovered, shows avatar and name; hovering shows the ID and icon buttons
-- Hovering a pair in the list temporarily targets them
-
-Fixes:
-
-- Crash guard: mods and redraws for a player wait until the game has finished drawing them
-- Outfit changes that arrive while a redraw is still pending get their own redraw (fixes stale outfits and missing legs)
-- Data for players not on your list is ignored quietly; a mass reapply is spread over about 3 seconds
-- Busy areas: finished downloads are kept when their batch is cancelled, players stuck not drawing back off, busy sound files are re-read, the compactor retries files in use
-- Noises: a song tied to an emote fades when the emote ends; a song started outside an emote ends when the player walks away
-- A player whose draw timed out is retried once the game has finished drawing them
-- Follow-up redraws and Customize+/Heels reapplies are capped
+- Right-click menu: Reapply Last Data moved to the top level and Send Pair Request moved into the Pair Data submenu (the Reapply and Send Pair Request actions themselves are upstream PlayerSync; VierAI only moved them)
+- *(in testing, 1216)* Right-click menu: Override auto pause for players paused by the VRAM, triangle or height threshold
+- *(in testing, 1216)* Settings > Debug: 'Allow local debug tools to read pair info' (off by default)
+- *(in testing, 1217)* Players the game is not drawing show a "Not drawn" icon; their downloads wait unless they are listed, in-game friends or party/alliance members
+- *(in testing, 1217)* Pair tooltip shows why a player is waiting (tier, queue position, downloading, not drawn, budget, waiting for data) and where their files came from
+- *(in testing, 1217)* Visible pairs show their approximate VRAM and triangles inline (e.g. "312 MB, 450k tris"), yellow or red over your thresholds
+- *(in testing, 1217)* Force re-download for one player (main window menu and right-click Pair Data menu)
+- *(in testing, 1217)* Optional memory budget (off by default): manual MB cap, stricter cap in crowded areas, or Auto from live GPU memory (manual on Wine/Mac and integrated GPUs); holds the lowest-priority, farthest players first, both ways, and resumes them automatically
+- *(in testing, 1217; UID-only 1218)* Blocklist: block a player (by UID) so nothing of theirs downloads or applies (separate from pause, kept across restarts)
+- *(in testing, 1413)* Pair request window in the Noises style: transparent until hovered, shows avatar and name; hovering shows the ID and icon buttons
+- *(in testing, 1414)* Hovering a pair targets them only while hovered (builds on upstream PlayerSync's "target pairs on hover" option, which is the official team's work)
 
 #### Fixes
 
@@ -69,6 +54,13 @@ Fixes:
 - Customize+ and Heels reapply after a redraw once the skeleton is loaded (fixes half-loaded players)
 - No more endless retry loop after Penumbra restarts; retries back off up to 60 s
 - Duplicate applies are debounced
+- *(in testing, 1210-1216)* Busy areas: finished downloads are kept when their batch is cancelled, players stuck not drawing back off, busy sound files are re-read, the compactor retries files in use
+- *(in testing, 1210-1216)* Noises: a song tied to an emote fades when the emote ends; a song started outside an emote ends when the player walks away
+- *(in testing, 1216)* Outfit changes that arrive while a redraw is still pending get their own redraw (fixes stale outfits and missing legs)
+- *(in testing, 1216)* Data for players not on your list is ignored quietly; a mass reapply is spread over about 3 seconds
+- *(in testing, 1225)* Crash guard: mods and redraws for a player wait until the game has finished drawing them
+- *(in testing, 1414)* A player whose draw timed out is retried once the game has finished drawing them
+- *(in testing, 1414)* Follow-up redraws and Customize+/Heels reapplies are capped
 
 #### Performance
 
@@ -80,14 +72,13 @@ Fixes:
 #### Security
 
 - Server file hashes and file paths are validated so files stay inside the cache folder
-- Downloads are limited to game mod file types, and files that look like programs or archives are refused and logged
+- *(in testing, 1217/1218)* Downloads are limited to game mod file types, and files that look like programs or archives are refused and logged
 
 #### Other
 
 - Fork-only settings live in their own vierai-config.json (migrated automatically once)
 - New plugin icon and AI-generated code disclosure
-- Missing files are no longer re-downloaded automatically (use Force re-download for one player instead)
-
+- *(in testing, 1414)* Missing files are no longer re-downloaded automatically (use Force re-download for one player instead)
 ### Upstream PlayerSync changes
 
 Changes made by the official PlayerSync developers, included in this fork through merges from upstream. They are not VierAI's work; credit goes to the PlayerSync team. Summarized from the upstream history.
@@ -103,6 +94,7 @@ Changes made by the official PlayerSync developers, included in this fork throug
 
 #### 1.15.5 (August to October 2026)
 
+- Option to target pairs on hover in the main window (upstream PlayerSync; the VierAI hover-only targeting builds on it)
 - Service gateways to work around Cloudflare connectivity issues, with connection checks and a token refresh notification
 - Phase two UI: hub window, location chooser, subscription and find tabs, change notifications
 - Client-side pause list; option to turn off name plate colors in dungeons and PvP
