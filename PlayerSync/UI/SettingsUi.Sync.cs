@@ -457,6 +457,25 @@ public partial class SettingsUi
         }
         _uiShared.DrawHelpText("Checks incoming files for issues that are known to cause crashes." + UiSharedService.TooltipSeparator +
             "Files filtered to prevent crashing will be noted as Warnings in the Dalamud log.");
+        // 1.15.5.1415: files blocked by validation or by the crash quarantine are remembered across restarts.
+        var fileSafety = PlayerSync.FileCache.PSyncFileSafetyStore.Instance;
+        if (fileSafety != null)
+        {
+            using (ImRaii.PushIndent())
+            {
+                ImGui.TextUnformatted($"Blocked files: {fileSafety.BadCount}");
+                ImGui.SameLine();
+                using (ImRaii.Disabled(fileSafety.BadCount == 0))
+                {
+                    if (ImGui.Button("Clear blocked files"))
+                    {
+                        _ = fileSafety.ClearBadAsync();
+                    }
+                }
+                _uiShared.DrawHelpText("Files that failed the crash checks, or that were being applied when the game closed unexpectedly, are blocked and remembered across restarts." + UiSharedService.TooltipSeparator +
+                    "Clear the list if a file was blocked by mistake. Cleared files are checked again the next time they are applied.");
+            }
+        }
         if (ImGui.Checkbox("Filter out all sync data (make others appear vanilla)", ref filterMods))
         {
             _configService.Current.FilterMods = filterMods;

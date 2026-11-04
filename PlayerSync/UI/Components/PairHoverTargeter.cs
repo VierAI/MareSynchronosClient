@@ -53,6 +53,31 @@ internal sealed class PairHoverTargeter
         }
     }
 
+    /// <summary>1.15.5.1417: same as <see cref="Row(Pair, bool, bool)"/> for rows whose player may not be a pair
+    /// (pair request rows): the player is found by content id or ident. <paramref name="key"/> identifies the row.</summary>
+    public void Row(string key, ulong contentId, string? ident, bool rowHovered, bool overButton)
+    {
+        if (!rowHovered) return;
+        _hoveredThisFrame = true;
+        if (contentId == 0 && string.IsNullOrEmpty(ident)) return;
+
+        var cfg = _configService.Current;
+        if (cfg.TargetPairsOnHover)
+        {
+            var stale = PSyncHoverTarget.Touch();
+            if (stale || !string.Equals(_hoveredUid, key, StringComparison.Ordinal))
+            {
+                _hoveredUid = key;
+                _mediator.Publish(new HoverTargetPlayerMessage(contentId, ident, cfg.OnHoverTargetType));
+            }
+        }
+
+        if (!overButton && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
+        {
+            _mediator.Publish(new TargetPlayerMessage(contentId, ident, cfg.UseFocusTarget ? TargetType.FocusTarget : TargetType.Target));
+        }
+    }
+
     public void EndFrame()
     {
         if (_hoveredThisFrame || _hoveredUid == null) return;

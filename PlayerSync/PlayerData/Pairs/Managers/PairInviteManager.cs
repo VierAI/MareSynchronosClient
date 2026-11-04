@@ -145,7 +145,8 @@ namespace MareSynchronos.PlayerData.Pairs
 
                 var msg = name != "Unknown" ? $"Player {name} ({req.Requestor.AliasOrUID}) " : $"UID/Alias {req.Requestor.AliasOrUID} ";
                 Mediator.Publish(new NotificationMessage("New Pair Request", msg + "has sent you a request to pair directly.",
-                    MareConfiguration.Models.NotificationType.Invite));
+                    MareConfiguration.Models.NotificationType.Invite, Pair: _pairManager.GetPairByUID(req.Requestor.UID),
+                    PlayerLinkName: name != "Unknown" ? name : null, PlayerIdent: req.RequestorIdent)); // 1.15.5.1417: player link
             }
 
             // clean up the local ident cache
@@ -332,7 +333,7 @@ namespace MareSynchronos.PlayerData.Pairs
                 var msg = name != "Unknown" ? $"Player {name} ({inv.InvitingUser.AliasOrUID}) " : $"UID/Alias {inv.InvitingUser.AliasOrUID} ";
                 var alias = string.IsNullOrWhiteSpace(inv.GroupAlias) ? "." : $" ({inv.GroupAlias}).";
                 Mediator.Publish(new NotificationMessage("Syncshell Invite", msg + "has sent you an invite to join Syncshell " +
-                    $"{inv.GID}" + alias, MareConfiguration.Models.NotificationType.Invite));
+                    $"{inv.GID}" + alias, MareConfiguration.Models.NotificationType.Invite, Pair: thisPair)); // 1.15.5.1417: player link
             }
 
             _pendingGroupInvites = incomingGroupInvites.ToList();

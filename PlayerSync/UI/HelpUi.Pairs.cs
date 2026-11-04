@@ -1,4 +1,4 @@
-﻿using Dalamud.Bindings.ImGui;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Colors;
 using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
@@ -41,6 +41,7 @@ public partial class HelpUi : WindowMediatorSubscriberBase
         new(DiagnosticPairsTabs.PairLogs, "Pair Logs", DrawPairApplicationLogs),
         new(DiagnosticPairsTabs.PairTiming, "Framework Timing", DrawPairTiming),
         new(DiagnosticPairsTabs.PairDetail, "Pair Detail", DrawPairDataDetail),
+        new(DiagnosticPairsTabs.Workload, "Workload", DrawPairWorkload),
     ];
 
     private enum DiagnosticPairsTabs
@@ -49,7 +50,8 @@ public partial class HelpUi : WindowMediatorSubscriberBase
         PairStatus,
         PairLogs,
         PairTiming,
-        PairDetail
+        PairDetail,
+        Workload
     }
 
     private void OnOpenPairDataWindow()

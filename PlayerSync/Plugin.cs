@@ -116,6 +116,7 @@ public sealed class Plugin : IDalamudPlugin
             // add mare related singletons
             collection.AddSingleton<MareMediator>();
             collection.AddSingleton<FileCacheManager>();
+        collection.AddSingleton<PSyncFileSafetyStore>(); // 1.15.5.1415
             collection.AddSingleton<ServerConfigurationManager>();
             collection.AddSingleton<ApiController>();
             collection.AddSingleton<PerformanceCollectorService>();
@@ -281,7 +282,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddScoped<WindowMediatorSubscriberBase, NoiseMakersUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, UsageUi>();
             collection.AddScoped<WindowMediatorSubscriberBase, PairingRequestsUi>();
-            collection.AddScoped<WindowMediatorSubscriberBase, PairingRequestsNoticeUi>();
+            // 1.15.5.1417: PairingRequestsNoticeUi (pair request pill) removed; PairingRequestsUi opens by itself.
             collection.AddScoped<WindowMediatorSubscriberBase, EditProfileUi>((s) => new EditProfileUi(s.GetRequiredService<ILogger<EditProfileUi>>(),
                 s.GetRequiredService<MareMediator>(), s.GetRequiredService<ApiController>(), s.GetRequiredService<UiSharedService>(), s.GetRequiredService<FileDialogManager>(),
                 s.GetRequiredService<MareProfileManager>(), s.GetRequiredService<PerformanceCollectorService>(), s.GetRequiredService<UiTheme>(), 
@@ -313,6 +314,7 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddHostedService(p => p.GetRequiredService<SoundActivityTracker>());
             collection.AddHostedService(p => p.GetRequiredService<InGameFriendService>());
             collection.AddHostedService(p => p.GetRequiredService<FileCacheManager>());
+        collection.AddHostedService(p => p.GetRequiredService<PSyncFileSafetyStore>()); // 1.15.5.1415: after FileCacheManager (migrations)
             collection.AddHostedService(p => p.GetRequiredService<ConfigurationMigrator>());
             collection.AddHostedService(p => p.GetRequiredService<DalamudUtilService>());
             collection.AddHostedService(p => p.GetRequiredService<PerformanceCollectorService>());

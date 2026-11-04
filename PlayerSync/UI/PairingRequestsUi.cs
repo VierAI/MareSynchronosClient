@@ -9,6 +9,7 @@ using MareSynchronos.MareConfiguration;
 using MareSynchronos.Services;
 using MareSynchronos.Services.Mediator;
 using MareSynchronos.UI.ModernUi;
+using MareSynchronos.UI.Components;
 using MareSynchronos.PlayerData.Pairs;
 using MareSynchronos.Services.ServerConfiguration;
 using MareSynchronos.API.Data;
@@ -16,9 +17,11 @@ using System.Numerics;
 
 namespace MareSynchronos.UI;
 
-// Fork (VierAI 1413): Noises-style pair request window. Transparent (no background, title bar or border) until hovered;
-// each request shows the requester's avatar and name, and hovering reveals the pair/group ID and icon buttons
-// (check = accept, X = dismiss, ban = ignore player). The buttons call the same handlers as before.
+// Fork (VierAI 1413/1417): Noises-style pair request list. Transparent (no background, title bar or border) until hovered.
+// 1417: one line per request: small avatar, name (syncshell for invites), then check = accept, X = dismiss, ban = ignore
+// player on the same line. The old "PlayerSync Pair Requests" pill (PairingRequestsNoticeUi) is gone: this window opens
+// by itself when a new request arrives. Hovering a row does the temporary hover focus (restored when the hover ends),
+// right-clicking a row (not a button) targets the player, left-clicking the name copies the ID.
 public class PairingRequestsUi : WindowMediatorSubscriberBase
 {
     private const float FadeSeconds = 0.2f;
@@ -36,10 +39,15 @@ public class PairingRequestsUi : WindowMediatorSubscriberBase
     private float _hoverFade;
     private int _pushedColors;
     private Vector4 _baseText = new(1, 1, 1, 1);
+    private readonly PairHoverTargeter _hover;
+    private int _lastPendingCount;
+    private bool _autoOpened;
+    private bool _inGpose;
+    private const float AvatarSize = 36f; // 1417: was 48
 
     public PairingRequestsUi(ILogger<PairingRequestsUi> logger, MareMediator mediator,
         PerformanceCollectorService performanceCollectorService, PlayerPerformanceConfigService playerPerformanceConfig,
-        UiTheme theme, PairInviteManager pairRequestManager, ServerConfigurationManager serverConfigurationManager, PairManager pairManager,
+        MareConfigService configService, UiTheme theme, PairInviteManager pairRequestManager, ServerConfigurationManager serverConfigurationManager, PairManager pairManager,
         UiSharedService uiSharedService, MareProfileManager profileManager)
         : base(logger, mediator, "PlayerSync Pair Requests", performanceCollectorService)
     {
@@ -54,13 +62,35 @@ public class PairingRequestsUi : WindowMediatorSubscriberBase
         Flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoCollapse
             | ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoFocusOnAppearing;
 
-        Mediator.Subscribe<GposeStartMessage>(this, (_) => IsOpen = false);
+        _hover = new PairHoverTargeter(mediator, configService);
+
+        Mediator.Subscribe<GposeStartMessage>(this, (_) => { _inGpose = true; IsOpen = false; });
+        Mediator.Subscribe<GposeEndMessage>(this, (_) =>
+        {
+            _inGpose = false;
+            if (PendingCount > 0) { IsOpen = true; _autoOpened = true; }
+        });
 
         SizeConstraints = new()
         {
             MinimumSize = new(260, 0),
             MaximumSize = new(600, 600)
         };
+    }
+
+    private int PendingCount => _pairRequestManager.ReceivedPendingCount + _pairRequestManager.ReceivedGroupInviteCount;
+
+    // 1417: replaces the pill step. Runs every frame, open or not: a new request opens the list by itself.
+    public override void PreOpenCheck()
+    {
+        var count = PendingCount;
+        if (count > _lastPendingCount && !_inGpose && !IsOpen)
+        {
+            IsOpen = true;
+            _autoOpened = true;
+        }
+        _lastPendingCount = count;
+        base.PreOpenCheck();
     }
 
     public override void Update()
@@ -98,9 +128,7 @@ public class PairingRequestsUi : WindowMediatorSubscriberBase
     {
         // basically close the window if the user accepted/rejected the final requets
         // but don't close if they just toggle open the empty window manually
-        if (_pairRequestManager.ReceivedPendingCount == 0
-            && _pairRequestManager.ReceivedGroupInviteCount == 0
-            && _userClickedSomething)
+        if (PendingCount == 0 && (_userClickedSomething || _autoOpened))
             IsOpen = false;
 
         _windowHovered = ImGui.IsWindowHovered(ImGuiHoveredFlags.AllowWhenBlockedByActiveItem | ImGuiHoveredFlags.ChildWindows);
@@ -110,117 +138,160 @@ public class PairingRequestsUi : WindowMediatorSubscriberBase
         DrawPendingRequests();
     }
 
+    private readonly record struct Row(string Key, UserData? Requestor, ulong ContentId, string? Ident, string Name, string? Group,
+        string ShownId, string CopyId, Action Accept, Action Dismiss, Action Ignore, string DismissTooltip);
+
+    private readonly List<Row> _rows = [];
+
     private void DrawPendingRequests()
     {
-        var pendingIncomingRequests = _pairRequestManager.GetPendingRequests();
-        var pendingIncomingInvites = _pairRequestManager.GetPendingGroupInvites();
+        _rows.Clear();
+        foreach (var request in _pairRequestManager.GetPendingRequests())
+        {
+            var requestorUid = request.Requestor.UID;
+            var requestorName = _serverConfigurationManager.GetPendingRequestNameForIdent(request.RequestorIdent) ?? request.Requestor.AliasOrUID;
+            var pair = _pairManager.GetPairByUID(requestorUid);
+            _rows.Add(new Row(requestorUid, request.Requestor, pair?.ContendId ?? 0, request.RequestorIdent, requestorName, null,
+                requestorUid, requestorUid,
+                Accept: () => _pairRequestManager.SendPairRequest(new UserData(requestorUid)),
+                Dismiss: () => _pairRequestManager.SendPairRejection(new UserData(requestorUid)),
+                Ignore: () =>
+                {
+                    _pairRequestManager.SendPairRejection(new UserData(requestorUid));
+                    _serverConfigurationManager.AddPairingRequestBlacklistUid(requestorUid);
+                },
+                DismissTooltip: "Silently drop this request without notifying the player who requested to pair."));
+        }
 
-        if (!pendingIncomingRequests.Any() && !pendingIncomingInvites.Any())
+        foreach (var invite in _pairRequestManager.GetPendingGroupInvites())
+        {
+            var requestorUid = invite.InvitingUser?.UID ?? String.Empty;
+            var pair = _pairManager.GetPairByUID(requestorUid);
+            var requestorName = !string.IsNullOrEmpty(pair?.PlayerName) ? pair!.PlayerName! : invite.InvitingUser?.AliasOrUID ?? "Unknown";
+            var inviteId = invite.RequestId;
+            _rows.Add(new Row($"{inviteId}-{requestorUid}", invite.InvitingUser, pair?.ContendId ?? 0,
+                string.IsNullOrEmpty(pair?.HashedCID) ? null : pair!.HashedCID, requestorName, invite.GroupAliasOrGID,
+                invite.GroupAliasOrGID, invite.Group.AliasOrGID,
+                Accept: () => _pairRequestManager.SendGroupInviteJoin(inviteId),
+                Dismiss: () => _pairRequestManager.SendRejectGroupInvite(inviteId),
+                Ignore: () =>
+                {
+                    _pairRequestManager.SendRejectGroupInvite(inviteId);
+                    _serverConfigurationManager.AddPairingRequestBlacklistUid(requestorUid);
+                },
+                DismissTooltip: "Silently drop this request without notifying the player who sent the invite."));
+        }
+
+        if (_rows.Count == 0)
         {
             ImGui.TextUnformatted("No pending pair requests.");
             return;
         }
 
-        foreach (var request in pendingIncomingRequests)
+        // Every row is as wide as the widest one; the buttons are right-aligned inside that width (Noises window style).
+        var scale = ImGuiHelpers.GlobalScale;
+        var spacingX = ImGui.GetStyle().ItemSpacing.X;
+        var buttonsWidth = ButtonsWidth();
+        var widest = 0f;
+        foreach (var r in _rows)
         {
-            var requestorUid = request.Requestor.UID;
-            var requestorName = _serverConfigurationManager.GetPendingRequestNameForIdent(request.RequestorIdent) ?? request.Requestor.AliasOrUID;
-
-            DrawEntry(requestorUid, request.Requestor, requestorName, requestorUid, requestorUid,
-                accept: () => _pairRequestManager.SendPairRequest(new UserData(requestorUid)),
-                dismiss: () => _pairRequestManager.SendPairRejection(new UserData(requestorUid)),
-                ignore: () =>
-                {
-                    _pairRequestManager.SendPairRejection(new UserData(requestorUid));
-                    _serverConfigurationManager.AddPairingRequestBlacklistUid(requestorUid);
-                },
-                dismissTooltip: "Silently drop this request without notifying the player who requested to pair.");
+            var w = ImGui.CalcTextSize(r.Name).X;
+            if (r.Group != null) w += spacingX + ImGui.CalcTextSize(GroupLabel(r.Group)).X;
+            widest = Math.Max(widest, w);
         }
+        var minWidth = 260f * scale - ImGui.GetStyle().WindowPadding.X * 2f;
+        var rowWidth = Math.Max(minWidth, AvatarSize * scale + spacingX + widest + spacingX * 2f + buttonsWidth);
 
-        foreach (var invite in pendingIncomingInvites)
-        {
-            var groupName = invite.GroupAliasOrGID;
-            var requestorUid = invite.InvitingUser?.UID ?? String.Empty;
-            var requestorName = _pairManager.GetPairByUID(requestorUid)?.PlayerName ?? invite.InvitingUser?.AliasOrUID ?? "Unknown";
-            var inviteId = invite.RequestId;
-
-            DrawEntry($"{inviteId}-{requestorUid}", invite.InvitingUser, requestorName, groupName, invite.Group.AliasOrGID,
-                accept: () => _pairRequestManager.SendGroupInviteJoin(inviteId),
-                dismiss: () => _pairRequestManager.SendRejectGroupInvite(inviteId),
-                ignore: () =>
-                {
-                    _pairRequestManager.SendRejectGroupInvite(inviteId);
-                    _serverConfigurationManager.AddPairingRequestBlacklistUid(requestorUid);
-                },
-                dismissTooltip: "Silently drop this request without notifying the player who sent the invite.");
-        }
+        _hover.BeginFrame();
+        foreach (var r in _rows) DrawRow(r, rowWidth, buttonsWidth);
+        _hover.EndFrame();
     }
 
-    private void DrawEntry(string id, UserData? requestor, string name, string shownId, string copyId,
-        Action accept, Action dismiss, Action ignore, string dismissTooltip)
+    private static string GroupLabel(string group) => "(Syncshell " + group + ")";
+
+    private float ButtonsWidth()
     {
-        using var pushId = ImRaii.PushId(id);
-        var scale = ImGuiHelpers.GlobalScale;
-        var avatarSize = new Vector2(48f * scale, 48f * scale);
         var spacingX = ImGui.GetStyle().ItemSpacing.X;
+        return _uiSharedService.GetIconButtonSize(FontAwesomeIcon.Check).X + spacingX
+            + _uiSharedService.GetIconButtonSize(FontAwesomeIcon.Times).X + spacingX
+            + _uiSharedService.GetIconButtonSize(FontAwesomeIcon.Ban).X;
+    }
 
-        ImGui.BeginGroup();
-        DrawAvatar(requestor, avatarSize);
+    private void DrawRow(Row r, float rowWidth, float buttonsWidth)
+    {
+        using var pushId = ImRaii.PushId(r.Key);
+        var scale = ImGuiHelpers.GlobalScale;
+        var avatar = new Vector2(AvatarSize * scale, AvatarSize * scale);
+        var spacingX = ImGui.GetStyle().ItemSpacing.X;
+        var frameH = ImGui.GetFrameHeight();
+        var rowHeight = Math.Max(avatar.Y, frameH);
+        var start = ImGui.GetCursorPos();
+        var rowMin = ImGui.GetCursorScreenPos();
+        var rowMax = new Vector2(rowMin.X + rowWidth, rowMin.Y + rowHeight);
+        var midY = start.Y + (rowHeight - frameH) * 0.5f;
+        var overButton = false;
+
+        ImGui.SetCursorPosY(start.Y + (rowHeight - avatar.Y) * 0.5f);
+        DrawAvatar(r.Requestor, avatar);
+
         ImGui.SameLine();
+        ImGui.SetCursorPosY(midY);
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextUnformatted(r.Name);
+        if (ImGui.IsItemHovered()) ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+        if (ImGui.IsItemClicked(ImGuiMouseButton.Left)) ImGui.SetClipboardText(r.CopyId);
+        UiSharedService.AttachToolTip(r.ShownId + UiSharedService.TooltipSeparator + "Left-click: copy ID" + Environment.NewLine + "Right-click: target");
 
-        var textX = ImGui.GetCursorPosX();
-        var startY = ImGui.GetCursorPosY();
-        ImGui.SetCursorPosY(startY + (_windowHovered ? 0f : (avatarSize.Y - ImGui.GetTextLineHeight()) * 0.5f));
-        ImGui.TextUnformatted(name);
-
-        if (_windowHovered)
+        if (r.Group != null)
         {
-            ImGui.SetCursorPosX(textX);
+            ImGui.SameLine();
+            ImGui.SetCursorPosY(midY);
+            ImGui.AlignTextToFramePadding();
             using (ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.DalamudGrey))
-                ImGui.TextUnformatted(shownId);
-            if (ImGui.IsItemHovered()) ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
-            if (ImGui.IsItemClicked()) ImGui.SetClipboardText(copyId);
-            UiSharedService.AttachToolTip("Click to copy");
+                ImGui.TextUnformatted(GroupLabel(r.Group));
+        }
 
-            ImGui.SetCursorPosX(textX);
-            using (ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.HealerGreen))
+        ImGui.SameLine(start.X + rowWidth - buttonsWidth);
+        ImGui.SetCursorPosY(midY);
+        using (ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.HealerGreen))
+        {
+            if (_uiSharedService.IconButton(FontAwesomeIcon.Check))
             {
-                if (_uiSharedService.IconButton(FontAwesomeIcon.Check))
-                {
-                    accept();
-                    _userClickedSomething = true;
-                }
-            }
-            UiSharedService.AttachToolTip("Accept");
-
-            ImGui.SameLine(0, spacingX);
-            if (_uiSharedService.IconButton(FontAwesomeIcon.Times))
-            {
-                dismiss();
+                r.Accept();
                 _userClickedSomething = true;
             }
-            UiSharedService.AttachToolTip("Dismiss" + UiSharedService.TooltipSeparator + dismissTooltip);
+        }
+        overButton |= ImGui.IsItemHovered();
+        UiSharedService.AttachToolTip("Accept");
 
-            ImGui.SameLine(0, spacingX);
-            using (ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.DalamudRed))
-            {
-                if (_uiSharedService.IconButton(FontAwesomeIcon.Ban))
-                {
-                    ignore();
-                    _userClickedSomething = true;
-                }
-            }
-            UiSharedService.AttachToolTip("Ignore Player" + UiSharedService.TooltipSeparator + "Ignoring a player will block their requests to you." + UiSharedService.TooltipSeparator +
-                "Unblock requests in Settings -> Sync Settings -> Pair Requests.");
-        }
-        else
+        ImGui.SameLine(0, spacingX);
+        if (_uiSharedService.IconButton(FontAwesomeIcon.Times))
         {
-            // Same-height placeholder so the window doesn't jump when hovered.
-            ImGui.SetCursorPosY(startY);
-            ImGui.Dummy(new Vector2(1f, avatarSize.Y));
+            r.Dismiss();
+            _userClickedSomething = true;
         }
-        ImGui.EndGroup();
-        ImGui.Spacing();
+        overButton |= ImGui.IsItemHovered();
+        UiSharedService.AttachToolTip("Dismiss" + UiSharedService.TooltipSeparator + r.DismissTooltip);
+
+        ImGui.SameLine(0, spacingX);
+        using (ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.DalamudRed))
+        {
+            if (_uiSharedService.IconButton(FontAwesomeIcon.Ban))
+            {
+                r.Ignore();
+                _userClickedSomething = true;
+            }
+        }
+        overButton |= ImGui.IsItemHovered();
+        UiSharedService.AttachToolTip("Ignore Player" + UiSharedService.TooltipSeparator + "Ignoring a player will block their requests to you." + UiSharedService.TooltipSeparator +
+            "Unblock requests in Settings -> Sync Settings -> Pair Requests.");
+
+        // Keep the full row height (avatar may be taller than the buttons).
+        ImGui.SetCursorPos(new Vector2(start.X, start.Y + rowHeight + ImGui.GetStyle().ItemSpacing.Y));
+        ImGui.Dummy(Vector2.Zero);
+
+        var rowHovered = ImGui.IsMouseHoveringRect(rowMin, rowMax) && ImGui.IsWindowHovered(ImGuiHoveredFlags.AllowWhenBlockedByActiveItem);
+        _hover.Row(r.Key, r.ContentId, r.Ident, rowHovered, overButton);
     }
 
     private void DrawAvatar(UserData? user, Vector2 size)
@@ -261,6 +332,7 @@ public class PairingRequestsUi : WindowMediatorSubscriberBase
     public override void OnClose()
     {
         _userClickedSomething = false;
+        _autoOpened = false;
         foreach (var t in _avatars.Values) t?.Dispose();
         _avatars.Clear();
 

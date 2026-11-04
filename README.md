@@ -18,11 +18,11 @@ This fork is not compatible with the final version of the classic Mare API, we h
 
 ## Changes from official PlayerSync
 
-Per-build notes are on the [releases page](https://github.com/VierAI/MareSynchronosClient/releases). To install this fork, add the custom repo URL `https://raw.githubusercontent.com/VierAI/DalamudPlugins/main/vierai.json` in Dalamud (listing source: [VierAI/DalamudPlugins](https://github.com/VierAI/DalamudPlugins)). Fork maintained by VierAI. Also kept in [CHANGELOG.md](CHANGELOG.md). This list covers 1.15.5.1416. The fork's own changes come first; the official PlayerSync team's changes are listed separately below them.
+Per-build notes are on the [releases page](https://github.com/VierAI/MareSynchronosClient/releases). To install this fork, add the custom repo URL `https://raw.githubusercontent.com/VierAI/DalamudPlugins/main/vierai.json` in Dalamud (listing source: [VierAI/DalamudPlugins](https://github.com/VierAI/DalamudPlugins)). Fork maintained by VierAI. Also kept in [CHANGELOG.md](CHANGELOG.md). The fork's own changes come first; the official PlayerSync team's changes are listed separately below them.
 
 ### PSync (VierAI) changes
 
-Everything in this section is VierAI's fork work, not part of the official PlayerSync. This list covers 1.15.5.1416. Items marked *(in testing)* were added after the first public release (1.15.5.1209); the version in brackets is the build that added them, and all of them are included in 1.15.5.1416.
+Everything in this section is VierAI's fork work, not part of the official PlayerSync. Items marked *(in testing)* were added after the first public release (1.15.5.1209); the version in brackets is the build that added them, and all of them are included in 1.15.5.1500.
 
 #### Features
 
@@ -42,8 +42,13 @@ Everything in this section is VierAI's fork work, not part of the official Playe
 - *(in testing, 1217)* Force re-download for one player (main window menu and right-click Pair Data menu)
 - *(in testing, 1217)* Optional memory budget (off by default): manual MB cap, stricter cap in crowded areas, or Auto from live GPU memory (manual on Wine/Mac and integrated GPUs); holds the lowest-priority, farthest players first, both ways, and resumes them automatically
 - *(in testing, 1217; UID-only 1218)* Blocklist: block a player (by UID) so nothing of theirs downloads or applies (separate from pause, kept across restarts)
-- *(in testing, 1413)* Pair request window in the Noises style: transparent until hovered, shows avatar and name; hovering shows the ID and icon buttons
+- *(in testing, 1413; list layout 1417)* Pair request window: one line per request with avatar and name, accept, decline and block buttons inline, opens automatically when a request arrives
+- *(in testing, 1417)* Pair request window: hover a request to focus that player, right-click to target them
 - *(in testing, 1414)* Hovering a pair targets them only while hovered (builds on upstream PlayerSync's "target pairs on hover" option, which is the official team's work)
+- *(in testing, 1417)* Player names in PSync chat warnings are clickable
+- *(in testing, 1417)* Settings > Sync: count of blocked files, with a button to clear them
+- *(in testing, 1424)* Help > Their Pair Data > Workload tab: how many pairs are online, visible, loaded, waiting, applying or paused, with total file size, estimated VRAM and triangles, and a sortable top list
+- *(in testing, 1423)* Local debug tools (only with 'Allow local debug tools to read pair info' on) can read per-pair file size, VRAM and triangle estimates
 
 #### Fixes
 
@@ -61,6 +66,10 @@ Everything in this section is VierAI's fork work, not part of the official Playe
 - *(in testing, 1225)* Crash guard: mods and redraws for a player wait until the game has finished drawing them
 - *(in testing, 1414)* A player whose draw timed out is retried once the game has finished drawing them
 - *(in testing, 1414)* Follow-up redraws and Customize+/Heels reapplies are capped
+- *(in testing, 1417)* Model (.mdl) files are checked for a valid structure before use; bad files are remembered in the file cache database and not applied again
+- *(in testing, 1417)* Crash-loop quarantine: files tied to repeated game crashes are held back, with a chat warning
+- *(in testing, 1421; 25 files 1425)* Mac/Wine: download batches are split into groups of at most 25 files, with a short pause between groups
+- *(in testing, 1426)* Mac/Wine: downloaded files are saved to the cache one at a time, with a short pause after each, to limit disk load
 
 #### Performance
 
@@ -68,6 +77,7 @@ Everything in this section is VierAI's fork work, not part of the official Playe
 - Lighter per-frame work for name plates, sound polling, the Noises list and the Penumbra callback
 - Logins and plugin start hash at most 8 new players per frame
 - Downloads use free slots in strict priority order
+- *(in testing, 1419)* Pair data applies and redraws run two at a time instead of four
 
 #### Security
 
@@ -82,6 +92,12 @@ Everything in this section is VierAI's fork work, not part of the official Playe
 ### Upstream PlayerSync changes
 
 Changes made by the official PlayerSync developers, included in this fork through merges from upstream. They are not VierAI's work; credit goes to the PlayerSync team. Summarized from the upstream history.
+
+#### 1.15.5.15 (November 2026)
+
+Fixes:
+
+- A new upload no longer starts while an earlier one is still running; the earlier upload is cancelled first (merged into PSync 1.15.5.1500)
 
 #### 1.15.6 (experimental, October 2026)
 

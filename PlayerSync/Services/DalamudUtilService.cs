@@ -162,6 +162,8 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
 
         mediator.Subscribe<TargetPairMessage>(this, (msg) => TargetPairByTargetType(msg.Pair, msg.TargetType));
         mediator.Subscribe<HoverTargetPairMessage>(this, (msg) => HoverTargetPair(msg.Pair, msg.TargetType));
+        mediator.Subscribe<HoverTargetPlayerMessage>(this, (msg) => HoverTargetPlayer(msg.ContentId, msg.Ident, msg.TargetType)); // 1.15.5.1417
+        mediator.Subscribe<TargetPlayerMessage>(this, (msg) => TargetPlayer(msg.ContentId, msg.Ident, msg.TargetType)); // 1.15.5.1417
 
         IsWine = Util.IsWine();
         _cid = RebuildCID();
@@ -1129,6 +1131,7 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
                     _targetManager.MouseOverTarget = objectToTarget;
                     break;
             }
+            if (_hoverActive && _hoverType == targetType) _hoverActive = false; // 1.15.5.1417: an explicit target is kept, not undone by the hover restore
         });
     }
 
@@ -1169,22 +1172,83 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
                 RestoreHoverTarget();
                 return;
             }
-            if (!TryGetPlayerAddressAndIndexOnFrameworkByContentId(pair.ContendId, out _, out var index)) return;
+            HoverTargetContentIdOnFramework(pair.ContendId, targetType);
+        });
+    }
+
+    // ---- 1.15.5.1417: hover / target by content id or ident (pair request rows: the requester may not be a pair) ----
+    private ulong ResolveContentId(ulong contentId, string? ident)
+    {
+        if (contentId != 0) return contentId;
+        if (!string.IsNullOrEmpty(ident) && _frameworkCharacterIdByIdent.TryGetValue(ident, out var cid)) return cid;
+        return 0;
+    }
+
+    private void HoverTargetContentIdOnFramework(ulong contentId, TargetType targetType)
+    {
+        if (contentId == 0 || !TryGetPlayerAddressAndIndexOnFrameworkByContentId(contentId, out _, out var index)) return;
+        var obj = _objectTable[index];
+        if (obj == null) return;
+        if (_hoverActive && _hoverType != targetType) RestoreHoverTarget();
+        if (!_hoverActive)
+        {
+            var current = GetTargetOfType(targetType);
+            _hoverHadPrevious = current != null;
+            _hoverPreviousId = current?.GameObjectId ?? 0;
+            _hoverType = targetType;
+            _hoverActive = true;
+        }
+        SetTargetOfType(targetType, obj);
+        _hoverSetAddress = obj.Address;
+        PSyncHoverTarget.Touch();
+    }
+
+    private void HoverTargetPlayer(ulong contentId, string? ident, TargetType targetType)
+    {
+        if (_clientState.IsPvP) return;
+        _ = RunOnFrameworkThread(() =>
+        {
+            if (contentId == 0 && string.IsNullOrEmpty(ident))
+            {
+                RestoreHoverTarget();
+                return;
+            }
+            HoverTargetContentIdOnFramework(ResolveContentId(contentId, ident), targetType);
+        });
+    }
+
+    private void TargetPlayer(ulong contentId, string? ident, TargetType targetType)
+    {
+        if (_clientState.IsPvP) return;
+        _ = RunOnFrameworkThread(() =>
+        {
+            var cid = ResolveContentId(contentId, ident);
+            if (cid == 0 || !TryGetPlayerAddressAndIndexOnFrameworkByContentId(cid, out _, out var index)) return;
             var obj = _objectTable[index];
             if (obj == null) return;
-            if (_hoverActive && _hoverType != targetType) RestoreHoverTarget();
-            if (!_hoverActive)
-            {
-                var current = GetTargetOfType(targetType);
-                _hoverHadPrevious = current != null;
-                _hoverPreviousId = current?.GameObjectId ?? 0;
-                _hoverType = targetType;
-                _hoverActive = true;
-            }
             SetTargetOfType(targetType, obj);
-            _hoverSetAddress = obj.Address;
-            PSyncHoverTarget.Touch();
+            if (_hoverActive && _hoverType == targetType) _hoverActive = false; // keep the explicit target
         });
+    }
+
+    /// <summary>1.15.5.1417: home world of a player in the object table, found by content id, then ident, then exact
+    /// name (0 if not found). Framework thread only.</summary>
+    public uint GetHomeWorldIdOnFramework(ulong contentId, string? ident, string? name)
+    {
+        EnsureIsOnFramework();
+        var cid = ResolveContentId(contentId, ident);
+        if (cid != 0 && TryGetPlayerAddressAndIndexOnFrameworkByContentId(cid, out _, out var index)
+            && _objectTable[index] is IPlayerCharacter byId)
+        {
+            return byId.HomeWorld.RowId;
+        }
+        if (string.IsNullOrEmpty(name)) return 0;
+        for (int i = 0; i < 200; i++)
+        {
+            if (_objectTable[i] is IPlayerCharacter pc && string.Equals(pc.Name.TextValue, name, StringComparison.Ordinal))
+                return pc.HomeWorld.RowId;
+        }
+        return 0;
     }
 
     private void RestoreHoverTarget()

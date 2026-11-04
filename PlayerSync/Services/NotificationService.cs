@@ -66,66 +66,87 @@ public class NotificationService : DisposableMediatorSubscriberBase, IHostedServ
         _chatGui.PrintError(se.BuiltString);
     }
 
-    private void PrintInfoChat(string? message)
+    private void PrintInfoChat(string? message, Pair? pair = null, string? linkName = null, string? ident = null)
+        => PrintLinkedChat(ChatStyle.Info, message, pair, linkName, ident);
+
+    private void PrintWarnChat(string? message, Pair? pair = null, string? linkName = null, string? ident = null)
+        => PrintLinkedChat(ChatStyle.Warning, message, pair, linkName, ident);
+
+    private void PrintPairRequestChat(string? message, Pair? pair = null, string? linkName = null, string? ident = null)
+        => PrintLinkedChat(ChatStyle.Invite, message, pair, linkName, ident);
+
+    private enum ChatStyle { Info, Warning, Invite }
+
+    private static string? FirstNonEmpty(params string?[] values)
     {
-        SeStringBuilder se = new SeStringBuilder().AddText("[PlayerSync] Info: ").AddItalics(message ?? string.Empty);
-        _chatGui.Print(se.BuiltString);
+        foreach (var v in values) if (!string.IsNullOrEmpty(v)) return v;
+        return null;
     }
 
-    private void PrintWarnChat(string? message, Pair? pair = null)
+    // 1.15.5.1417: the player's name in a PSync chat line is a normal player link (PlayerPayload with name + home world),
+    // so clicking or right-clicking it works like on a chat sender. The 1414 version read pair.Address on the mediator
+    // thread; PairHandler.PlayerCharacter is nint.Zero unless it is read on the framework thread, so every line fell back
+    // to plain text. The world lookup now runs on the framework thread (by content id, then ident, then exact name).
+    // PlayerPayload.Encode() already writes the name text and the link terminator itself, so nothing is added after it.
+    private void PrintLinkedChat(ChatStyle style, string? message, Pair? pair, string? linkName, string? ident)
     {
         message ??= string.Empty;
-        // 1.15.5.1414: the player's name becomes a normal player link (PlayerPayload with name + home world), so
-        // clicking or right-clicking it works like on a chat sender (target, examine, etc.).
-        var name = pair?.PlayerName;
-        var address = pair?.Address ?? nint.Zero;
+        var name = FirstNonEmpty(linkName, pair?.PlayerName, pair?.LastKnownPlayerName);
         var idx = string.IsNullOrEmpty(name) ? -1 : message.IndexOf(name, StringComparison.Ordinal);
-        if (idx < 0 || address == nint.Zero)
+        if (idx < 0)
         {
-            SeStringBuilder plain = new SeStringBuilder().AddText("[PlayerSync] ").AddUiForeground("Warning: " + message, 31).AddUiForegroundOff();
-            _chatGui.Print(plain.BuiltString);
+            _chatGui.Print(BuildChat(style, message, -1, null, 0));
             return;
         }
 
+        var lookupIdent = FirstNonEmpty(ident, pair?.HashedCID, pair?.LastKnownHashedCID);
         _ = _dalamudUtilService.RunOnFrameworkThread(() =>
         {
-            var world = _dalamudUtilService.GetHomeWorldIdForAddressOnFramework(address);
-            var se = new SeStringBuilder().AddText("[PlayerSync] ").AddUiForeground("Warning: " + message[..idx], 31).AddUiForegroundOff();
-            if (world != 0)
+            uint world = 0;
+            try
             {
-                se.Add(new PlayerPayload(name!, world)).AddText(name!).Add(RawPayload.LinkTerminator);
+                world = _dalamudUtilService.GetHomeWorldIdOnFramework(pair?.ContendId ?? 0, lookupIdent, name);
             }
-            else
+            catch (Exception ex)
             {
-                se.AddUiForeground(name!, 31).AddUiForegroundOff();
+                Logger.LogDebug(ex, "Chat player link: home world lookup failed");
             }
-            se.AddUiForeground(message[(idx + name!.Length)..], 31).AddUiForegroundOff();
-            _chatGui.Print(se.BuiltString);
+            _chatGui.Print(BuildChat(style, message, idx, name, world));
         });
     }
 
-    private void PrintPairRequestChat(string? message)
+    private SeString BuildChat(ChatStyle style, string message, int idx, string? name, uint world)
     {
-        SeStringBuilder se = new SeStringBuilder();
+        var linked = idx >= 0 && !string.IsNullOrEmpty(name) && world != 0;
+        var before = linked ? message[..idx] : message;
+        var after = linked ? message[(idx + name!.Length)..] : string.Empty;
+        var se = new SeStringBuilder();
+        if (style == ChatStyle.Warning)
+        {
+            se.AddText("[PlayerSync] ").AddUiForeground("Warning: " + before, 31).AddUiForegroundOff();
+            if (linked)
+            {
+                se.Add(new PlayerPayload(name!, world));
+                if (after.Length > 0) se.AddUiForeground(after, 31).AddUiForegroundOff();
+            }
+            return se.Build();
+        }
 
-        if (_inviteTogglePayload != null)
+        se.AddText("[PlayerSync] Info: ").AddItalics(before);
+        if (linked)
         {
-            se
-            .AddText("[PlayerSync] Info: ")
-            .AddItalics(message ?? string.Empty)
-            .AddText(" ")
-            .Add(_inviteTogglePayload)
-            .AddUiForeground("Click here to view invites.", 37)
-            .AddUiForegroundOff()
-            .Add(RawPayload.LinkTerminator)
-            .Build();
+            se.Add(new PlayerPayload(name!, world));
+            if (after.Length > 0) se.AddItalics(after);
         }
-        else
+        if (style == ChatStyle.Invite && _inviteTogglePayload != null)
         {
-            se.AddText("[PlayerSync] Info: ").AddItalics(message ?? string.Empty);
+            se.AddText(" ")
+                .Add(_inviteTogglePayload)
+                .AddUiForeground("Click here to view invites.", 37)
+                .AddUiForegroundOff()
+                .Add(RawPayload.LinkTerminator);
         }
-        
-        _chatGui.Print(se.BuiltString);
+        return se.Build();
     }
 
     private void PrintStageSaveChat(string message, string filename, string stageId)
@@ -154,11 +175,11 @@ public class NotificationService : DisposableMediatorSubscriberBase, IHostedServ
         switch (msg.Type)
         {
             case NotificationType.Info:
-                PrintInfoChat(msg.Message);
+                PrintInfoChat(msg.Message, msg.Pair, msg.PlayerLinkName, msg.PlayerIdent);
                 break;
 
             case NotificationType.Warning:
-                PrintWarnChat(msg.Message, msg.Pair);
+                PrintWarnChat(msg.Message, msg.Pair, msg.PlayerLinkName, msg.PlayerIdent);
                 break;
 
             case NotificationType.Error:
@@ -166,7 +187,7 @@ public class NotificationService : DisposableMediatorSubscriberBase, IHostedServ
                 break;
 
             case NotificationType.Invite:
-                PrintPairRequestChat(msg.Message);
+                PrintPairRequestChat(msg.Message, msg.Pair, msg.PlayerLinkName, msg.PlayerIdent);
                 break;
 
             case NotificationType.Token:

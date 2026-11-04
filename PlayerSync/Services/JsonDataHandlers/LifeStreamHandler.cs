@@ -85,17 +85,36 @@ namespace PlayerSync.Services
 
             Logger.LogTrace("Address parse: {1}", destination);
 
-            SeStringBuilder se = new SeStringBuilder();
+            // 1.15.5.1417: the inviter's name is a player link (PlayerPayload with home world) when they are in the object table.
+            var linkName = pair.PlayerName;
+            var linkIdent = pair.HashedCID;
+            _ = _dalamudUtilService.RunOnFrameworkThread(() =>
+            {
+                uint world = 0;
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(linkName)) world = _dalamudUtilService.GetHomeWorldIdOnFramework(pair.ContendId, linkIdent, linkName);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogDebug(ex, "Lifestream invite: home world lookup failed");
+                }
 
-            se
-            .AddText(psync + invite + " has sent you a Lifestream invite. Click to travel to: ")
-            .Add(_lifestreamInvite!)
-            .AddUiForeground(destination, 37)
-            .AddUiForegroundOff()
-            .Add(RawPayload.LinkTerminator)
-            .Build();
+                SeStringBuilder se = new SeStringBuilder();
+                if (world != 0)
+                    se.AddText(psync + "Player ").Add(new PlayerPayload(linkName!, world));
+                else
+                    se.AddText(psync + invite);
 
-            _chatGui.Print(se.BuiltString);
+                se
+                .AddText(" has sent you a Lifestream invite. Click to travel to: ")
+                .Add(_lifestreamInvite!)
+                .AddUiForeground(destination, 37)
+                .AddUiForegroundOff()
+                .Add(RawPayload.LinkTerminator);
+
+                _chatGui.Print(se.Build());
+            });
         }
 
         private void LifestreamInviteIpcHandler(SeString address)

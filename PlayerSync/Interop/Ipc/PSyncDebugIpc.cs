@@ -33,7 +33,11 @@ namespace MareSynchronos.Interop.Ipc;
 ///   latest status, download batches started/finished). Callers can skip GetPairStates while it stays the same.
 ///   Download byte progress alone does not change it. Returns 0 while the setting is off.
 ///   v4 (1.15.5.1228) added modeHash to every row; v5 (1.15.5.1405) drops it again (the perf A/B switches were removed and
-///   every perf fix now has one fixed code path).
+///   every perf fix now has one fixed code path). v6 adds bytes, vram and tris to every row (cached per-apply values,
+///   -1 = not computed yet) and syncedBytes, syncedVramBytes, syncedTris, maxPairVramBytes, maxPairTris (summed over
+///   loaded pairs, skipping -1) to GetPerfSwitchState. No triangle or file analysis is run for these reads.
+///   1424: the sums come from PSyncWorkload (shared with Help > Their Pair Data > Workload) and add maxPairBytes,
+///   bytesNotComputed, vramNotComputed and trisNotComputed (loaded pairs whose value is still -1).
 /// - <c>PSync.GetPerfSwitchState</c> () -> string (1.15.5.1401; read-only since 1.15.5.1405): JSON {available, serverState,
 ///   connected, visiblePairs, loadedPairs, waitingPairs, applyingPairs, downloadsQueued, downloadsRunning, downloadBatches,
 ///   downloadFilesInFlight, applyGateWaiting, applyGateInUse, pendingApplies, pairsRevision} so a runner can tell when
@@ -43,7 +47,7 @@ namespace MareSynchronos.Interop.Ipc;
 /// </summary>
 public sealed class PSyncDebugIpc : IHostedService, IMediatorSubscriber
 {
-    public const int Version = 5;
+    public const int Version = 6;
 
     private readonly ILogger<PSyncDebugIpc> _logger;
     private readonly IDalamudPluginInterface _pi;
@@ -138,18 +142,21 @@ public sealed class PSyncDebugIpc : IHostedService, IMediatorSubscriber
             d["connected"] = serverState == MareSynchronos.WebAPI.SignalR.Utils.ServerState.Connected;
             if (!available) return JsonSerializer.Serialize(d); // no pair data while the debug setting is off
 
-            int visible = 0, loaded = 0, waiting = 0, applying = 0;
-            foreach (var pair in _pairManager.GetVisiblePairs())
-            {
-                visible++;
-                if (pair.HasDataApplicationTaskRunning) applying++;
-                else if (!pair.IsPaused && pair.HasCachedData && pair.LastDataApplicationTime > DateTimeOffset.MinValue) loaded++;
-                else if (!pair.IsPaused) waiting++;
-            }
-            d["visiblePairs"] = visible;
-            d["loadedPairs"] = loaded;
-            d["waitingPairs"] = waiting;
-            d["applyingPairs"] = applying;
+            var w = PSyncWorkload.Compute(_pairManager.GetVisiblePairs()); // 1424: shared with the Help > Workload tab
+            int applying = w.Applying;
+            d["visiblePairs"] = w.Visible;
+            d["loadedPairs"] = w.Loaded;
+            d["waitingPairs"] = w.Waiting;
+            d["applyingPairs"] = w.Applying;
+            d["syncedBytes"] = w.Bytes;
+            d["syncedVramBytes"] = w.VramBytes;
+            d["syncedTris"] = w.Tris;
+            d["maxPairVramBytes"] = w.MaxPairVramBytes;
+            d["maxPairTris"] = w.MaxPairTris;
+            d["maxPairBytes"] = w.MaxPairBytes;
+            d["bytesNotComputed"] = w.BytesNotComputed;
+            d["vramNotComputed"] = w.VramNotComputed;
+            d["trisNotComputed"] = w.TrisNotComputed;
             var totals = DownloadPriorityQueue.Instance?.GetTotals() ?? (0, 0);
             d["downloadsQueued"] = totals.Waiting;
             d["downloadsRunning"] = totals.Running;
@@ -278,6 +285,9 @@ public sealed class PSyncDebugIpc : IHostedService, IMediatorSubscriber
                 ["plugins"] = plugins,
                 ["status"] = status,
                 ["statusMessage"] = statusMessage,
+                ["bytes"] = pair.LastAppliedDataBytes, // v6: -1 = not computed yet
+                ["vram"] = pair.LastAppliedApproximateVRAMBytes,
+                ["tris"] = pair.LastAppliedDataTris,
             });
             AddV3(list[^1], pair);
         }

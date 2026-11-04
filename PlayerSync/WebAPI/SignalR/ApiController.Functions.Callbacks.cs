@@ -116,7 +116,7 @@ public partial class ApiController
         Logger.LogDebug("Got a request to pair from {uid} mapping to {player}.", dto.User.UID, player);
 
         Mediator.Publish(new NotificationMessage("Incoming direct pair request.",
-                $"Player {player} would like to pair. To accept, right click their character, or use the triple-dot menu next to their name, and select \"Pair individually\".", NotificationType.Info, TimeSpan.FromSeconds(15)));
+                $"Player {player} would like to pair. To accept, right click their character, or use the triple-dot menu next to their name, and select \"Pair individually\".", NotificationType.Info, TimeSpan.FromSeconds(15), Pair: pair));
 
         return Task.CompletedTask;
     }

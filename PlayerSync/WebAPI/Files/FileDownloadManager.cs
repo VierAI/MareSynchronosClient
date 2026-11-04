@@ -129,6 +129,14 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     public async Task DownloadFiles(DownloadBatchInfo batchInfo, List<FileReplacementData> fileReplacementDto, Dictionary<string, string> compressionSubstitutions, CancellationToken ct)
     {
+        // 1.15.5.1415: hash + game path of every file in the batch (no player names), to trace a bad file after a crash.
+        if (Logger.IsEnabled(LogLevel.Debug))
+        {
+            foreach (var replacement in fileReplacementDto)
+            {
+                Logger.LogDebug("Download batch ({kind}): {hash} -> {gamePaths}", batchInfo.DisplayType, replacement.Hash, string.Join(", ", replacement.GamePaths ?? []));
+            }
+        }
         var shouldPublishHalt = Interlocked.Increment(ref _downloadHaltRefCount) == 1;
         if (shouldPublishHalt)
             SafePublish(() => Mediator.Publish(new HaltScanMessage(nameof(DownloadFiles))),
@@ -204,7 +212,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     private const long InMemoryBudget = 192L * 1024 * 1024;
     private const int MaxHttpRetries = 2;
     private static long s_inMemoryBytes;
-    private static readonly SemaphoreSlim s_finalizeGate = new(LowPriorityFile.IsWine ? 1 : 3);
+    private static readonly SemaphoreSlim s_finalizeGate = new(LowPriorityFile.IsWine ? WineWriteConcurrency : 3);
 
     // 1.15.5.1226: Wine only. Big bursts (60-108 files from several players at once) still bunched up their file starts across
     // batches, so new transfers are capped for the whole plugin: at most WineMaxFileStartsPerSecond in any rolling second and
@@ -229,7 +237,35 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
     // 1.15.5.1414: WineStartCap is off by default (legacy = no pacing of file starts). On Mac it made players wait up to
     // ~16 s before their files started loading. Kept as a switch for A/B tests only.
+    // 1.15.5.1420 had it on under Wine (Mac test); it stalled downloads ~3,000 times, so 1.15.5.1421 turns it off again everywhere.
     private static readonly bool WineStartCapEnabled = false;
+
+    // 1.15.5.1420-1422 (Mac test): most files one Wine direct batch holds (1418 froze on a 933-file batch). Applied in DownloadFilesInternal.
+    // 1.15.5.1422 keeps this split with the new download pipeline under Wine.
+    // 1.15.5.1425 (Mac test): cap lowered 50 -> 25 (1424 froze on chunk 2/9 of a 450-file pair) and a pause of
+    // WineBatchPauseMs between chunks so each chunk's writes and applies can drain first. Wine only; PC never splits.
+    private const int WineBatchCap = 25;
+    private const int WineBatchPauseMs = 750;
+    // 1.15.5.1426 (Mac test): cache-write throttle, Wine only. Decompress + hash + write of downloaded files runs at most
+    // WineWriteConcurrency at a time (the finalize gate), and after each write the gate is held for at least WineWriteGapMs
+    // and long enough to keep writes under WineWriteBytesPerSecond, so saving never runs as a tight burst beside the game.
+    private const int WineWriteConcurrency = 1;
+    private const int WineWriteGapMs = 8;
+    private const long WineWriteBytesPerSecond = 32L * 1024 * 1024;
+    private int _wineWriteFiles;
+    private long _wineWriteBytes;
+    private long _wineWritePacedMs;
+    private long _wineWriteMaxGateWaitMs;
+
+    private void LogWineWriteStats(string what)
+    {
+        var files = Interlocked.Exchange(ref _wineWriteFiles, 0);
+        var bytes = Interlocked.Exchange(ref _wineWriteBytes, 0);
+        var paced = Interlocked.Exchange(ref _wineWritePacedMs, 0);
+        var maxWait = Interlocked.Exchange(ref _wineWriteMaxGateWaitMs, 0);
+        Logger.LogInformation("Wine write throttle: {what}: {files} files, {mib:0.0} MiB written, paced {paced} ms, longest gate wait {wait} ms",
+            what, files, bytes / 1048576.0, paced, maxWait);
+    }
 
     private static async Task WineFileStartPaceAsync(ILogger logger, CancellationToken token)
     {
@@ -805,7 +841,44 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     private async Task DownloadFilesInternal(DownloadBatchInfo batchInfo, List<FileReplacementData> fileReplacement, Dictionary<string, string> compressionSubstitutions, CancellationToken ct)
     {
         // Separate out the files with direct download URLs
-        var directDownloads = CurrentDownloads.Where(download => !string.IsNullOrEmpty(download.DirectDownloadUrl)).ToList();
+        var allDirectDownloads = CurrentDownloads.Where(download => !string.IsNullOrEmpty(download.DirectDownloadUrl)).ToList();
+        if (allDirectDownloads.Count < CurrentDownloads.Count)
+        {
+            Logger.LogWarning("NOTE: {legacy} files did not have direct download URLs and cannot be downloaded.", CurrentDownloads.Count - allDirectDownloads.Count);
+        }
+
+        // 1.15.5.1421/1422 (Mac test): under Wine only, the direct batch is split here, where it is built, so no single direct
+        // batch (status trackers, start message, parallel run) holds more than WineBatchCap files. Chunks run one after another.
+        // 1420 split only inside the parallel run, after the whole batch was registered. PC is unchanged (one batch).
+        if (LowPriorityFile.IsWine && allDirectDownloads.Count > WineBatchCap)
+        {
+            var chunks = allDirectDownloads.Chunk(WineBatchCap).ToList();
+            for (var c = 0; c < chunks.Count; c++)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (c > 0 && WineBatchPauseMs > 0)
+                {
+                    Logger.LogInformation("Wine batch pause: {ms} ms before chunk {i}/{n}", WineBatchPauseMs, c + 1, chunks.Count);
+                    await Task.Delay(WineBatchPauseMs, ct).ConfigureAwait(false);
+                }
+                Logger.LogInformation("Wine batch cap: chunk {i}/{n} ({k} files)", c + 1, chunks.Count, chunks[c].Length);
+                // 1.15.5.1426: the start message carries only this chunk (finished chunks are dropped from the status list).
+                if (c > 0) _downloadStatus.Clear();
+                await DownloadDirectBatchAsync(chunks[c].ToList(), batchInfo, fileReplacement, compressionSubstitutions, ct).ConfigureAwait(false);
+                LogWineWriteStats($"chunk {c + 1}/{chunks.Count}");
+            }
+        }
+        else
+        {
+            await DownloadDirectBatchAsync(allDirectDownloads, batchInfo, fileReplacement, compressionSubstitutions, ct).ConfigureAwait(false);
+            if (LowPriorityFile.IsWine && allDirectDownloads.Count > 0) LogWineWriteStats("batch");
+        }
+
+        ClearDownload();
+    }
+
+    private async Task DownloadDirectBatchAsync(List<DownloadFileTransfer> directDownloads, DownloadBatchInfo batchInfo, List<FileReplacementData> fileReplacement, Dictionary<string, string> compressionSubstitutions, CancellationToken ct)
+    {
 
         // Create download status trackers for the direct downloads
         foreach (var directDownload in directDownloads)
@@ -821,10 +894,6 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         }
 
         Logger.LogInformation("Downloading {direct} files directly.", directDownloads.Count);
-        if (directDownloads.Count < CurrentDownloads.Count)
-        {
-            Logger.LogWarning("NOTE: {legacy} files did not have direct download URLs and cannot be downloaded.", CurrentDownloads.Count - directDownloads.Count);
-        }
 
         Mediator.Publish(new DownloadStartedMessage(batchInfo, _downloadStatus));
 
@@ -890,6 +959,8 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
                 (status) => downloadTracker.DownloadStatus = status,
                 async (hash, progress, statusCallback, transferToken) =>
                 {
+                    // 1.15.5.1422 (Mac test): Wine is back on the new (1225+) pipeline like PC. 1420/1421 used the legacy (1224) path
+                    // under Wine; it stopped the freezes but cost ~104 s of stalls per 1,000 files (new pipeline ~6 s).
                     if (!FileCacheManager.IsValidFileHash(directDownload.Hash))
                     {
                         Logger.LogWarning("Skipping direct download with an invalid file hash");
@@ -1017,13 +1088,13 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
         Logger.LogDebug("Download end: {id}", batchInfo.DisplayName);
 
-        ClearDownload();
     }
 
     /// <summary>
     /// 1.15.5.1403 DownloadPipeline legacy: one direct download exactly as in 1.15.5.1224 (55051917). The download slot is held
     /// through the transfer, read-back, decompress, hash and write; the bytes go to the temp file only (no in-memory buffer);
     /// decompress runs inline (no shared finalize gate); the DB row is saved per file; the batch token cancels at once.
+    /// 1.15.5.1420/1421: used under Wine for the Mac test. 1.15.5.1422: no longer called (Wine is back on the new pipeline); kept for A/B tests.
     /// </summary>
     private async Task DownloadDirectFileLegacyAsync(DownloadFileTransfer directDownload, IProgress<long> progress, Action<DownloadStatus> statusCallback,
         int batchTier, DownloadBatchInfo batchInfo, List<FileReplacementData> fileReplacement, Dictionary<string, string> compressionSubstitutions, CancellationToken token)
@@ -1050,7 +1121,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         var tempFilename = _fileDbManager.GetCacheTempFilePath(directDownload.Hash);
         try
         {
-            // 1226 WineStartCap: off since 1.15.5.1414 (WineStartCapEnabled = false), so this returns at once on every platform.
+            // 1226 WineStartCap: off again since 1.15.5.1421 (WineStartCapEnabled = false; 1420 had it on under Wine and it stalled the Mac), so this returns at once on every platform.
             await WineFileStartPaceAsync(Logger, token).ConfigureAwait(false);
 
             // Download the compressed file directly
@@ -1160,7 +1231,14 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
     /// </summary>
     private async Task<(long Size, DateTime LastWriteUtc)?> DecompressVerifyAndWriteAsync(DownloadFileTransfer directDownload, DownloadedPayload payload, string finalFilename, string origin, string fileExtension, DownloadBatchInfo batchInfo)
     {
+        var gateWait = System.Diagnostics.Stopwatch.StartNew();
         await s_finalizeGate.WaitAsync().ConfigureAwait(false);
+        if (LowPriorityFile.IsWine)
+        {
+            var waited = gateWait.ElapsedMilliseconds;
+            long prev;
+            while (waited > (prev = Interlocked.Read(ref _wineWriteMaxGateWaitMs)) && Interlocked.CompareExchange(ref _wineWriteMaxGateWaitMs, waited, prev) != prev) { }
+        }
         try
         {
             byte[] compressedBytes = payload.Memory ?? await LowPriorityFile.ReadAllBytesAsync(payload.TempFile!, CancellationToken.None).ConfigureAwait(false);
@@ -1182,8 +1260,22 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
 
             var creationUtc = RandomDayInThePast();
             var lastWriteUtc = RandomDayInThePast();
+            var writeTimer = System.Diagnostics.Stopwatch.StartNew();
             await _fileCompactor.WriteAllBytesWithTimesAsync(finalFilename, decompressedBytes, creationUtc, DateTime.UtcNow, lastWriteUtc, CancellationToken.None).ConfigureAwait(false);
-            return (decompressedBytes.LongLength, lastWriteUtc);
+            var size = decompressedBytes.LongLength;
+            decompressedBytes = null!;
+            if (LowPriorityFile.IsWine)
+            {
+                // 1.15.5.1426: pace while still holding the gate, so the next file waits: at least WineWriteGapMs, and the
+                // write plus the pause together take no less than size / WineWriteBytesPerSecond.
+                var budgetMs = (long)Math.Ceiling(size * 1000.0 / WineWriteBytesPerSecond);
+                var pauseMs = Math.Max(WineWriteGapMs, budgetMs - writeTimer.ElapsedMilliseconds);
+                await Task.Delay(TimeSpan.FromMilliseconds(pauseMs)).ConfigureAwait(false);
+                Interlocked.Increment(ref _wineWriteFiles);
+                Interlocked.Add(ref _wineWriteBytes, size);
+                Interlocked.Add(ref _wineWritePacedMs, pauseMs);
+            }
+            return (size, lastWriteUtc);
         }
         finally
         {

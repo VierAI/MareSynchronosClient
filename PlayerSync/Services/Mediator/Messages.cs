@@ -66,7 +66,7 @@ public record TransientResourceChangedMessage(ObjectKind? ObjectKind) : MessageB
 public record HaltScanMessage(string Source) : MessageBase;
 public record ResumeScanMessage(string Source) : MessageBase;
 public record NotificationMessage
-    (string Title, string Message, NotificationType Type, TimeSpan? TimeShownOnScreen = null, string? UpdatedStageFilename = null, string? UpdatedStageId = null, Pair? Pair = null) : MessageBase; // 1414: Pair = player link in chat
+    (string Title, string Message, NotificationType Type, TimeSpan? TimeShownOnScreen = null, string? UpdatedStageFilename = null, string? UpdatedStageId = null, Pair? Pair = null, string? PlayerLinkName = null, string? PlayerIdent = null) : MessageBase; // 1414: Pair = player link in chat; 1417: name/ident for players who are not pairs
 public record ReapplyCachedPairDataMessage(Pair Pair, bool Force = true) : MessageBase;
 public record CreateCacheForObjectMessage(GameObjectHandler ObjectToCreateFor) : SameThreadMessage;
 public record CreateCacheForEverythingMessage() : MessageBase;

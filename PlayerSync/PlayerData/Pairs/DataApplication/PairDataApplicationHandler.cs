@@ -45,11 +45,21 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
     }
 
     private static readonly PriorityWorkGate _dataApplicationGate = PriorityWorkGate.Apply; // fork: tier-ordered when full
-    private static readonly IImmutableList<string> FileExtensionsToValidate = [".avfx", ".tmb"];
+    private static readonly IImmutableList<string> FileExtensionsToValidate = [".avfx", ".tmb", ".mdl"]; // 1415: + .mdl
     private static readonly ConcurrentDictionary<string, byte> _filesThatHaveBeenVerifiedGood = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, byte> _filesThatHaveBeenVerifiedBad = new(StringComparer.OrdinalIgnoreCase);
     // 1225 (audit 8): the verified-file sets are only a shortcut; past this size they start over (files are just checked again).
     private const int MaxVerifiedEntries = 100000;
+    // 1.15.5.1415: persisted bad hashes (PSyncFileSafetyStore) are seeded here at startup; the settings button clears them.
+    public static void ForkSeedVerifiedBad(IEnumerable<string> hashes)
+    {
+        foreach (var hash in hashes) _filesThatHaveBeenVerifiedBad.TryAdd(hash, 0);
+    }
+    public static void ForkClearVerifiedBad()
+    {
+        _filesThatHaveBeenVerifiedBad.Clear();
+        _filesThatHaveBeenVerifiedGood.Clear();
+    }
     private static void ForkTrimVerified(ConcurrentDictionary<string, byte> set)
     {
         if (set.Count >= MaxVerifiedEntries) set.Clear();
@@ -889,7 +899,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
         // Check for any pair data for optional plugins that we don't have installed/enabled
         if (charaDataToUpdate.TryGetValue(ObjectKind.Player, out var playerChanges))
         {
-            _pluginWarningNotificationManager.NotifyForMissingPlugins(Pair.UserData, PlayerName!, playerChanges);
+            _pluginWarningNotificationManager.NotifyForMissingPlugins(Pair.UserData, PlayerName!, playerChanges, Pair);
         }
 
         return Task.CompletedTask;
@@ -1138,7 +1148,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
                 {
                     // Validate modded file
                     var extension = Path.GetExtension(file.Key.GamePath);
-                    if (_filesThatHaveBeenVerifiedBad.ContainsKey(file.Key.Hash))
+                    if (_filesThatHaveBeenVerifiedBad.ContainsKey(file.Key.Hash) || PSyncFileSafetyStore.IsKnownBad(file.Key.Hash))
                     {
                         Logger.LogWarning("{uid} ({name}): File {hash} to be used as {gamePath} looks like it could crash game and will be ignored.",
                             Pair.UserData.UID, PlayerName, file.Key.Hash, file.Key.GamePath);
@@ -1169,6 +1179,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
                                 {
                                     ForkTrimVerified(_filesThatHaveBeenVerifiedBad);
                                     _filesThatHaveBeenVerifiedBad.TryAdd(file.Key.Hash, 0);
+                                    PSyncFileSafetyStore.Instance?.RecordBad(file.Key.Hash, messageString, Pair.UserData.UID); // 1415: persist
                                     Logger.LogWarning("{uid} ({name}): File {hash} to be used as {gamePath} looks like it could crash game and will be ignored. \n  {description}",
                                         Pair.UserData.UID, PlayerName, file.Key.Hash, file.Key.GamePath, messageString);
                                     moddedPaths.Remove(file.Key);
@@ -1307,13 +1318,36 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
 
             // This runs against each object kind, player, pet, etc. and applies the changes
             bool penumbraApplied = false;
-            foreach (var kind in updatedData)
+            // 1.15.5.1415 crash-loop quarantine: mark this pair's model files as "being applied" (on disk) until the redraw
+            // settled. If the game dies in between, the next start blocks those hashes and names the pair in chat.
+            string? applyMarker = null;
+            var safetyStore = PSyncFileSafetyStore.Instance;
+            if (safetyStore != null && dataApplication.UpdateModdedPaths)
             {
-                Mediator.Publish(new EventMessage(new DataApplicationEvent(applicationBase, DataApplicationStatus.Applying, Pair.PlayerName, 
-                    Pair.UserData, nameof(ApplyDataApplicationAsync), EventSeverity.Informational, $"Applying character data of type {kind.Key} for {Pair.PairUIDName}")));
+                var mdlHashes = moddedPaths.Keys
+                    .Where(k => k.Hash != null && k.GamePath.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase))
+                    .Select(k => k.Hash!).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                applyMarker = await safetyStore.BeginApplyAsync(Pair.UserData.UID, mdlHashes, cancellationToken).ConfigureAwait(false);
+            }
+            try
+            {
+                foreach (var kind in updatedData)
+                {
+                    Mediator.Publish(new EventMessage(new DataApplicationEvent(applicationBase, DataApplicationStatus.Applying, Pair.PlayerName, 
+                        Pair.UserData, nameof(ApplyDataApplicationAsync), EventSeverity.Informational, $"Applying character data of type {kind.Key} for {Pair.PairUIDName}")));
 
-                penumbraApplied = await ApplyCustomizationDataAsync(dataApplication, kind.Key, moddedPathsData, penumbraApplied, cancellationToken).ConfigureAwait(false);
-                cancellationToken.ThrowIfCancellationRequested();
+                    penumbraApplied = await ApplyCustomizationDataAsync(dataApplication, kind.Key, moddedPathsData, penumbraApplied, cancellationToken).ConfigureAwait(false);
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+            }
+            finally
+            {
+                safetyStore?.EndApply(applyMarker);
+            }
+
+            if (safetyStore != null && penumbraApplied && dataApplication.UpdateModdedPaths)
+            {
+                safetyStore.RecordApplied(moddedPaths.Keys.Where(k => k.Hash != null).Select(k => (k.Hash!, k.GamePath)).Distinct().ToArray());
             }
 
             if (dataApplication.UpdateModdedPaths)

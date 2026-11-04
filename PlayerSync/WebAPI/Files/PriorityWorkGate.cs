@@ -13,7 +13,7 @@ public sealed class PriorityWorkGate
     /// <summary>Tier lookup, set by <see cref="DownloadPriorityQueue"/> so apply/validation use the same tiers as downloads.</summary>
     public static Func<Pair?, int> TierResolver { get; set; } = _ => PriorityTiers.Everyone;
 
-    public static readonly PriorityWorkGate Apply = new(4);
+    public static readonly PriorityWorkGate Apply = new(2); // 1.15.5.1419: two pair applies/redraws at a time (1418 tested 1; was 4)
     public static readonly PriorityWorkGate Validation = new(4);
 
     private sealed class Waiter

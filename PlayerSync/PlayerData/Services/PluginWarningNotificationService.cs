@@ -22,7 +22,7 @@ public class PluginWarningNotificationService
         _mediator = mediator;
     }
 
-    public void NotifyForMissingPlugins(UserData user, string playerName, HashSet<PlayerChanges> changes)
+    public void NotifyForMissingPlugins(UserData user, string playerName, HashSet<PlayerChanges> changes, MareSynchronos.PlayerData.Pairs.Pair? pair = null)
     {
         if (!_cachedOptionalPluginWarnings.TryGetValue(user, out var warning))
         {
@@ -78,7 +78,7 @@ public class PluginWarningNotificationService
         {
             _mediator.Publish(new NotificationMessage("Missing plugins for " + playerName,
                 $"Received data for {playerName} that contained information for plugins you have not installed. Install {string.Join(", ", missingPluginsForData)} to experience their character fully.",
-                NotificationType.Warning, TimeSpan.FromSeconds(10)));
+                NotificationType.Warning, TimeSpan.FromSeconds(10), Pair: pair, PlayerLinkName: playerName)); // 1.15.5.1417: player link
         }
     }
 }
