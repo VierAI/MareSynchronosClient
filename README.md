@@ -22,7 +22,7 @@ Per-build notes are on the [releases page](https://github.com/VierAI/MareSynchro
 
 ### PSync (VierAI) changes
 
-Everything in this section is VierAI's fork work, not part of the official PlayerSync. Items marked *(in testing)* were added after the first public release (1.15.5.1209); the version in brackets is the build that added them, and all of them are included in 1.15.5.1500.
+Everything in this section is VierAI's fork work, not part of the official PlayerSync. Items marked *(in testing)* were added after the first public release (1.15.5.1209); the version in brackets is the build that added them, and all of them are included in 1.15.5.1700.
 
 #### Features
 
@@ -92,6 +92,22 @@ Everything in this section is VierAI's fork work, not part of the official Playe
 ### Upstream PlayerSync changes
 
 Changes made by the official PlayerSync developers, included in this fork through merges from upstream. They are not VierAI's work; credit goes to the PlayerSync team. Summarized from the upstream history.
+
+#### 1.15.5.16 and 1.15.5.17 (November 2026)
+
+Fixes:
+
+- Animation (.pap) files are now validated before they are applied, like .avfx and .tmb files
+- Database lifecycle and recovery reworked; database driver updated
+- Fix for mod filtering
+- Fix for the server connection not shutting down cleanly
+- Turning off height auto-pause now unpauses the players it paused
+- NUL characters are cleaned up during the CSV cache migration
+- Startup waits correctly when PlayerSync and Penumbra are updated at the same time
+- A draw-wait timeout while building character data is now a warning and no longer stops the build
+- File upload checks (FilesSend) are retried up to 3 times on network errors
+
+All of these are merged into PSync 1.15.5.1700.
 
 #### 1.15.5.15 (November 2026)
 

@@ -45,7 +45,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
     }
 
     private static readonly PriorityWorkGate _dataApplicationGate = PriorityWorkGate.Apply; // fork: tier-ordered when full
-    private static readonly IImmutableList<string> FileExtensionsToValidate = [".avfx", ".tmb", ".mdl"]; // 1415: + .mdl
+    private static readonly IImmutableList<string> FileExtensionsToValidate = [".avfx", ".tmb", ".mdl", ".pap"]; // 1415: + .mdl; 1700: + .pap (upstream)
     private static readonly ConcurrentDictionary<string, byte> _filesThatHaveBeenVerifiedGood = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, byte> _filesThatHaveBeenVerifiedBad = new(StringComparer.OrdinalIgnoreCase);
     // 1225 (audit 8): the verified-file sets are only a shortcut; past this size they start over (files are just checked again).

@@ -2,6 +2,7 @@ using Dalamud.Plugin;
 using Lumina.Excel;
 using PlayerSync.Validation.Avfx;
 using PlayerSync.Validation.Mdl;
+using PlayerSync.Validation.Pap;
 using PlayerSync.Validation.Tmb;
 using System;
 using System.Collections.Generic;
@@ -43,6 +44,11 @@ public static class FileValidation
         {
             // 1.15.5.1415: model files (corrupt offsets crash ModelResourceHandle.Load)
             return MdlValidation.ValidateMdlFile(fileData);
+        }
+        else if (extension.Equals(".pap", StringComparison.OrdinalIgnoreCase)
+           || (fileData.Length >= sizeof(uint) && MemoryMarshal.Read<uint>(fileData) == PapValidation.PapMagic))
+        {
+            return PapValidation.ValidatePapFile(fileData);
         }
         else
         {

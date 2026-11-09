@@ -41,6 +41,7 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
     private Task? _dbFilesToUpdateTicksTask;
     private FileStoreRoots _fileStoreRoots = new(null, null);
     private DateTimeOffset _lastMemCacheUpdateTime = DateTimeOffset.MinValue;
+    private DateTimeOffset _nextDatabaseBackupUtc = DateTimeOffset.MinValue;
 
 
     public FileCacheManager(ILogger<FileCacheManager> logger, IpcManager ipcManager, MareConfigService configService,
@@ -70,9 +71,11 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
 
         await _databaseWriteSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
 
+        var databaseWasReset = false;
         try
         {
-            await _db.StartAsync(cancellationToken).ConfigureAwait(false);
+            var rebuildIfMissing = _configService.Current.InitialScanComplete && (_configService.Current.DataHasBeenMigratedToNewDb || !File.Exists(_oldDataFile));
+            databaseWasReset = await _db.StartAsync(cancellationToken, rebuildIfMissing).ConfigureAwait(false);
         }
         finally
         {
@@ -81,7 +84,7 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
 
         _startupCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         // Must run this on a different threae to not block Dalamud init
-        _startupTask = Task.Run(() => RunStartupAsync(_startupCancellationTokenSource.Token), CancellationToken.None);
+        _startupTask = Task.Run(() => RunStartupAsync(_startupCancellationTokenSource.Token, databaseWasReset), CancellationToken.None);
 
         _dbFilesToUpdateTicksTokenSource = _dbFilesToUpdateTicksTokenSource.CancelRecreate();
         _dbFilesToUpdateTicksTask = UpdateFileCacheTicks(_dbFilesToUpdateTicksTokenSource.Token);
@@ -628,9 +631,11 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
     /// This is used for file scans and file downloads, do not use it for player/pair mod lookups!
     /// This method does not use memory caching.
     /// </summary>
-    public async Task<List<FileCacheEntity>> UpdateOrCreateFileCacheEntitiesByPathsAsync(List<string> paths, FileCacheStore store, CancellationToken cancellationToken = default, bool forceUpdate = false, bool markAccessed = false)
+    public async Task<List<FileCacheEntity>> UpdateOrCreateFileCacheEntitiesByPathsAsync(List<string> paths, FileCacheStore store, CancellationToken cancellationToken = default, bool forceUpdate = false, bool markAccessed = false, int maxDegreeOfParallelism = 4)
     {
         ArgumentNullException.ThrowIfNull(paths);
+
+        var batchStart = Stopwatch.GetTimestamp();
 
         ConcurrentDictionary<string, (string FullPath, long LastModifiedDateTicks, long Size)> fileCachesToCheck = [];
 
@@ -658,7 +663,7 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
                 new ParallelOptions
                 {
                     CancellationToken = cancellationToken,
-                    MaxDegreeOfParallelism = 4
+                    MaxDegreeOfParallelism = maxDegreeOfParallelism
                 }, CheckPath);
         }
         else
@@ -707,6 +712,7 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
             }
         }
 
+        var hashStart = Stopwatch.GetTimestamp(); // timing
         var updatePaths = pathsToUpdate.ToArray();
         ConcurrentBag<FileCacheEntity> fileCachesToUpdate = [];
 
@@ -744,7 +750,7 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
                 new ParallelOptions
                 {
                     CancellationToken = cancellationToken,
-                    MaxDegreeOfParallelism = 4
+                    MaxDegreeOfParallelism = maxDegreeOfParallelism
                 },
                 CreateFileCache);
         }
@@ -757,13 +763,16 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
         }
 
         var createdFileCaches = fileCachesToUpdate.ToList();
+        var hashEnd = Stopwatch.GetTimestamp(); // timing
 
         foreach (var fileCache in createdFileCaches)
         {
             _logger.LogTrace("[DATABASE] Updating or creating cache entry for {path} in store {store}", fileCache.ResolvedFilepath, store);
         }
 
+        var writeStart = Stopwatch.GetTimestamp(); // timing
         var updatedFileCaches = await UpdateOrCreateFileCacheEntitiesAsync(createdFileCaches, store, cancellationToken, markAccessed).ConfigureAwait(false);
+        var writeEnd = Stopwatch.GetTimestamp(); // timing
 
         foreach (var fileCache in updatedFileCaches)
         {
@@ -774,6 +783,14 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
         {
             _logger.LogTrace("[DATABASE] Updating or creating cache entity for {name} success: {success}", fileCache.ResolvedFilepath, true);
         }
+
+        _logger.LogInformation("[SCAN PERF] Store: {store}- {paths} paths, {hashed} hashed ({MiB:N1} MiB), load {load:N0} ms, hash {hash:N0} ms, write {write:N0} ms, total {Total:N0} ms",
+            store, paths.Count, createdFileCaches.Count,
+            createdFileCaches.Sum(file => file.Size) / (1024d * 1024d),
+            Stopwatch.GetElapsedTime(batchStart, hashStart).TotalMilliseconds,
+            Stopwatch.GetElapsedTime(hashStart, hashEnd).TotalMilliseconds,
+            Stopwatch.GetElapsedTime(writeStart, writeEnd).TotalMilliseconds,
+            Stopwatch.GetElapsedTime(batchStart).TotalMilliseconds);
 
         return fileCachesByPath.Values.ToList();
     }
@@ -1694,7 +1711,7 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
             await using var db = _db.CreateDbContext();
             List<FileCacheEntity> returnFileCaches = [];
 
-            foreach (var cacheBatch in fileCaches.Chunk(500))
+            foreach (var cacheBatch in fileCaches.Chunk(5000))
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -2173,6 +2190,7 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
                 try
                 {
                     await FlushFileCacheTicksAsync(cancellationToken).ConfigureAwait(false);
+                    await RefreshDatabaseBackupAsync(cancellationToken, periodic: true).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
@@ -2243,26 +2261,92 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
 
     // This runs as a seperate thread to not block the Dalamud loading of the plugin and the plugin itself starting
     // The reason being the MigrateCsvToDatabaseAsync can take up to a minute for slower PCs/large data sets
-    private async Task RunStartupAsync(CancellationToken cancellationToken)
+    private async Task RunStartupAsync(CancellationToken cancellationToken, bool databaseWasReset)
     {
         try
         {
-            await MigrateCsvToDatabaseAsync(cancellationToken).ConfigureAwait(false);
+            var canBackUp = databaseWasReset || await MigrateCsvToDatabaseAsync(cancellationToken).ConfigureAwait(false);
 
             DatabaseStatus = (false, DatabaseState.Validating);
+
+            await RemoveInvalidFileCachePathsAsync(cancellationToken).ConfigureAwait(false);
 
             await using (var db = _db.CreateDbContext())
             {
                 var hasPenumbraEntries = await db.FileCaches.AsNoTracking().AnyAsync(fileCache => fileCache.Store == FileCacheStore.Penumbra, cancellationToken).ConfigureAwait(false);
-                if (hasPenumbraEntries && (!_ipcManager.Penumbra.APIAvailable || string.IsNullOrEmpty(_ipcManager.Penumbra.ModDirectory)))
+                if (databaseWasReset || hasPenumbraEntries)
                 {
-                    Mediator.Publish(new NotificationMessage("Penumbra not connected", "Could not load local file cache data. " +
-                        "Penumbra is not connected or not properly set up. Please enable and/or configure Penumbra properly to use PlayerSync. " +
-                        "After, reload PlayerSync in the Plugin installer.", MareConfiguration.Models.NotificationType.Error));
+                    var waitForPenumbraStartTime = Stopwatch.GetTimestamp();
+                    while (!_ipcManager.Penumbra.APIAvailable || string.IsNullOrWhiteSpace(_ipcManager.Penumbra.ModDirectory))
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        if (Stopwatch.GetElapsedTime(waitForPenumbraStartTime) >= TimeSpan.FromSeconds(30))
+                        {
+                            throw new TimeoutException("Penumbra API, or mod directory, was not available! Try toggling PlayerSync off/on again in Dalamud or restart your game.");
+                        }
+
+                        await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+                    }
                 }
             }
 
+            RefreshFileStoreRoots();
+
+            if (databaseWasReset)
+            {
+                DatabaseStatus = (false, DatabaseState.Rebuilding);
+                _logger.LogError("Database initialization failed, the database is being rebuilt, please report this issue to the developers!");
+                Mediator.Publish(new NotificationMessage("Database Error", "Database initialization failed, the database is being rebuilt, please report this issue to the developers!",
+                    MareConfiguration.Models.NotificationType.Error));
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var fileStores = new[]
+                {
+                    (Store: FileCacheStore.Cache, Root: _configService.Current.CacheFolder),
+                    (Store: FileCacheStore.Penumbra, Root: _ipcManager.Penumbra.ModDirectory)
+                };
+
+                int processedFiles = 0;
+                foreach (var (store, root) in fileStores)
+                {
+                    int processedFileForThisStore = 0;
+                    if (string.IsNullOrWhiteSpace(root))
+                    {
+                        throw new DirectoryNotFoundException($"The directory for {store} is missing!");
+                    }
+
+                    var isPenumbra = store == FileCacheStore.Penumbra;
+                    var files = Directory.EnumerateFiles(root, "*.*", isPenumbra ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly).Where(path =>
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        return isPenumbra ? CacheMonitor.IsScannablePenumbraFile(path) : CacheMonitor.IsCacheFileName(path);
+                    });
+
+                    foreach (var batch in files.Chunk(5000))
+                    {
+                        await UpdateOrCreateFileCacheEntitiesByPathsAsync(batch.ToList(), store, cancellationToken, forceUpdate: true, maxDegreeOfParallelism: 8).ConfigureAwait(false);
+
+                        processedFiles += batch.Length;
+                        processedFileForThisStore += batch.Length;
+                        _logger.LogInformation("[DATABASE] Rebuild progress: {processed:N0} files processed thus far. Current store: {store} Store files: {curr:N0}/{total:N0}",
+                            processedFiles, store, processedFileForThisStore, files.Count());
+                    }
+                }
+
+                _configService.Current.DataHasBeenMigratedToNewDb = true;
+                _configService.Save();
+            }
+
+            if (canBackUp)
+            {
+                await RefreshDatabaseBackupAsync(cancellationToken, periodic: false).ConfigureAwait(false);
+            }
+
             DatabaseStatus = (false, DatabaseState.CacheInit);
+
             await PreloadMostRecentlyAccessedFileCacheEntitiesAsync(_dbLifetimeCts.Token).ConfigureAwait(false);
 
             DatabaseStatus = (true, DatabaseState.Ready);
@@ -2281,11 +2365,11 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
     }
 
     // This does the CSV to Database migration
-    private async Task MigrateCsvToDatabaseAsync(CancellationToken cancellationToken)
+    private async Task<bool> MigrateCsvToDatabaseAsync(CancellationToken cancellationToken)
     {
         if (!File.Exists(_oldDataFile) || _configService.Current.DataHasBeenMigratedToNewDb)
         {
-            return;
+            return true;
         }
 
         _logger.LogInformation("[DATABASE] Found legacy file cache CSV {path}, starting migration", _oldDataFile);
@@ -2460,6 +2544,8 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
             //{
             //    _logger.LogWarning(ex, "[DATABASE] CSV migration completed but {path} could not be renamed to {migratedPath}; migration will safely run again next startup", _oldDataFile, migratedCsvPath);
             //}
+
+            return true;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -2470,6 +2556,77 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "[DATABASE] Legacy CSV migration failed after processing {count} entries, migration will run again next startup", processedEntries);
+
+            return false;
+        }
+    }
+
+    private async Task RemoveInvalidFileCachePathsAsync(CancellationToken cancellationToken)
+    {
+        await _databaseWriteSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            await using var db = _db.CreateDbContext();
+            var nulCharacter = "\0";
+            var removedEntries = await db.FileCaches
+                .Where(fileCache => fileCache.FilePathWithinFileStore.Contains(nulCharacter))
+                .ExecuteDeleteAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            if (removedEntries > 0)
+            {
+                _memoryCache.Clear();
+                _logger.LogWarning("[DATABASE] Removed {count} file cache entries containing NUL characters in their paths", removedEntries);
+            }
+        }
+        finally
+        {
+            _databaseWriteSemaphore.Release();
+        }
+    }
+
+    private async Task RefreshDatabaseBackupAsync(CancellationToken cancellationToken, bool periodic)
+    {
+        if (periodic)
+        {
+            if (!DatabaseStatus.IsReady || !_configService.Current.InitialScanComplete)
+            {
+                return;
+            }
+
+            if (!await _databaseWriteSemaphore.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            {
+                return;
+            }
+        }
+        else
+        {
+            await _databaseWriteSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        try
+        {
+            if (periodic && (!DatabaseStatus.IsReady || !_configService.Current.InitialScanComplete || DateTimeOffset.UtcNow < _nextDatabaseBackupUtc
+                || (!_configService.Current.DataHasBeenMigratedToNewDb && File.Exists(_oldDataFile))))
+            {
+                return;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            await _db.BackupDatabaseAsync(cancellationToken).ConfigureAwait(false);
+
+            _nextDatabaseBackupUtc = DateTimeOffset.UtcNow.AddHours(1);
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            _nextDatabaseBackupUtc = DateTimeOffset.UtcNow.AddMinutes(10);
+            _logger.LogWarning(ex, "Could not refresh FileCache.GOOD.bak! The previous backup was not replaced");
+        }
+        finally
+        {
+            _databaseWriteSemaphore.Release();
         }
     }
 }
