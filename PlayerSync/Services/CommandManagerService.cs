@@ -116,6 +116,9 @@ public sealed class CommandManagerService : IDisposable
         $"\t {alias} broadcast on|off - Enables or disables the Syncshell Broadcast feature" + Environment.NewLine +
         $"\t {alias} zonesync - Toggles the ZoneSync feature" + Environment.NewLine +
         $"\t {alias} zonesync on|off - Enables or disables the ZoneSync feature" + Environment.NewLine +
+#if PSYNC_INTERNAL
+        $"\t {alias} dump - Writes a sync info dump file (pairs, files, sound loads, playing sounds) to the config folder" + Environment.NewLine +
+#endif
         $"\t {alias} settings - Opens the PlayerSync Settings window";
 
     // Build the help string for the secondary if both commands are available
@@ -220,6 +223,12 @@ public sealed class CommandManagerService : IDisposable
         {
             _cacheMonitor.InvokeScan();
         }
+#if PSYNC_INTERNAL
+        else if (string.Equals(splitArgs[0], "dump", StringComparison.OrdinalIgnoreCase))
+        {
+            _mediator.Publish(new PSyncDumpSyncInfoMessage()); // 1.15.5.1703: Dump all sync info
+        }
+#endif
         else if (string.Equals(splitArgs[0], "perf", StringComparison.OrdinalIgnoreCase))
         {
             if (splitArgs.Length > 1 && int.TryParse(splitArgs[1], CultureInfo.InvariantCulture, out var limitBySeconds))

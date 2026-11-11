@@ -1,5 +1,6 @@
 using MareSynchronos.API.Data;
 using MareSynchronos.MareConfiguration;
+using MareSynchronos.Services.Mediator;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
@@ -29,10 +30,11 @@ public sealed class TextureCapService : IHostedService, IDisposable
         public DateTime LastRun;
     }
 
-    private sealed record Job(string Uid, Dictionary<string, string> Map);
+    private sealed record Job(string Uid, string Name, Dictionary<string, string> Map);
 
     private readonly ILogger<TextureCapService> _logger;
     private readonly PlayerPerformanceConfigService _perfConfig;
+    private readonly MareMediator _mediator;
     private readonly TextureSizeClassifier _classifier = new();
     private readonly BlockingCollection<Job> _queue = new(new ConcurrentQueue<Job>(), 512);
     private readonly ConcurrentDictionary<string, Job> _pending = new(StringComparer.Ordinal);
@@ -44,10 +46,11 @@ public sealed class TextureCapService : IHostedService, IDisposable
 
     public DownscaledTextureCache Cache { get; }
 
-    public TextureCapService(ILogger<TextureCapService> logger, MareConfigService config, PlayerPerformanceConfigService perfConfig)
+    public TextureCapService(ILogger<TextureCapService> logger, MareConfigService config, PlayerPerformanceConfigService perfConfig, MareMediator mediator)
     {
         _logger = logger;
         _perfConfig = perfConfig;
+        _mediator = mediator;
         Cache = new DownscaledTextureCache(config);
     }
 
@@ -76,7 +79,7 @@ public sealed class TextureCapService : IHostedService, IDisposable
                 return moddedPaths;
             }
 
-            Enqueue(user.UID, moddedPaths);
+            Enqueue(user.UID, user.AliasOrUID, moddedPaths);
 
             if (!_decisions.TryGetValue(user.UID, out var decisions) || decisions.Count == 0)
                 return moddedPaths;
@@ -120,10 +123,10 @@ public sealed class TextureCapService : IHostedService, IDisposable
         return _swapped.TryGetValue(user.UID, out var map) && map.TryGetValue(hash, out var small) && small > 0 && small < size ? small : size;
     }
 
-    private void Enqueue(string uid, Dictionary<string, string> map)
+    private void Enqueue(string uid, string name, Dictionary<string, string> map)
     {
         if (!map.Keys.Any(k => k.EndsWith(".tex", StringComparison.OrdinalIgnoreCase))) return;
-        var job = new Job(uid, new Dictionary<string, string>(map, StringComparer.Ordinal));
+        var job = new Job(uid, name, new Dictionary<string, string>(map, StringComparer.Ordinal));
         if (_pending.TryAdd(uid, job))
         {
             if (!_queue.TryAdd(job)) _pending.TryRemove(uid, out _);
@@ -181,14 +184,16 @@ public sealed class TextureCapService : IHostedService, IDisposable
         foreach (var d in decisions.Where(d => d.Cap > 0).DistinctBy(d => d.Hash, StringComparer.OrdinalIgnoreCase))
         {
             ct.ThrowIfCancellationRequested();
-            capped++;
-            if (Cache.TryGet(d.Hash, d.Cap, out _, out _) || Cache.HasFailed(d.Hash, d.Cap)) continue;
+            // 1706: Capped counts only textures that really have a smaller copy (already cached or made now).
+            if (Cache.TryGet(d.Hash, d.Cap, out _, out _)) { capped++; continue; }
+            if (Cache.HasFailed(d.Hash, d.Cap)) continue;
             if (!File.Exists(d.FilePath)) continue;
             var dest = Cache.PathFor(d.Hash, d.Cap);
             if (TexMipTrimmer.TryTrim(d.FilePath, d.Cap, dest, out var before, out var w, out var h, out var reason))
             {
                 Cache.Record(d.Hash, d.Cap, new FileInfo(dest).Length);
                 made++;
+                capped++;
                 _logger.LogDebug("Texture cap: {hash} {ow}x{oh} -> {w}x{h} (model {m:0.000} m, eye {eye})", d.Hash, before.Width, before.Height, w, h, d.LargestModelMetres, d.Eye);
             }
             else
@@ -199,11 +204,16 @@ public sealed class TextureCapService : IHostedService, IDisposable
         }
 
         var stats = _stats.GetOrAdd(job.Uid, _ => new PairStats());
+        if (!string.IsNullOrEmpty(job.Name)) stats.Name = job.Name;
         stats.Classified = decisions.Count;
         stats.Capped = capped;
         stats.LastRun = DateTime.Now;
         if (made > 0)
-            _logger.LogInformation("Texture cap: made {n} smaller texture(s) for {uid}; used from the next apply", made, job.Uid);
+            {
+            _logger.LogInformation("Texture cap: made {n} smaller texture(s) for {uid}; reapplying so they are used now", made, job.Uid);
+            // 1706: nothing else triggers a re-apply, so ask for one; the next pass finds every copy cached (made = 0), so this does not loop.
+            _mediator.Publish(new TextureCapReadyMessage(job.Uid));
+        }
     }
 
     public Task StartAsync(CancellationToken cancellationToken)

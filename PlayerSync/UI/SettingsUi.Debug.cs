@@ -42,6 +42,34 @@ public partial class SettingsUi
 
         _uiShared.BigText("Debug");
         ImGuiHelpers.ScaledDummy(2);
+
+#if PSYNC_INTERNAL
+        // 1.15.5.1703 (ghost clapping item): one file with the full sync, pair and sound state, to track down sounds the mute misses.
+        using (ImRaii.Disabled(MareSynchronos.Services.PSyncSyncDump.IsRunning))
+        {
+            if (_uiShared.IconTextButton(FontAwesomeIcon.FileExport, "Dump all sync info"))
+            {
+                Mediator.Publish(new MareSynchronos.Services.PSyncDumpSyncInfoMessage());
+            }
+        }
+        _uiShared.DrawHelpText("Writes one text file to the PlayerSync config folder (dumps) with every visible and paired player: permissions (paused, sounds, animations, VFX),"
+            + " noise state, files received and applied by type (game path -> file and source), what Penumbra has loaded on them now, recent sound (.scd) and"
+            + " VFX/animation loads per object (modded or raw), and the sounds the game is playing right now with the nearest object."
+            + " Read-only; nothing is muted or changed. Also: /psync dump. The path is shown here and in chat.");
+        var lastDump = MareSynchronos.Services.PSyncSyncDump.LastDumpPath;
+        if (lastDump != null)
+        {
+            if (_uiShared.IconButton(FontAwesomeIcon.Copy)) ImGui.SetClipboardText(lastDump);
+            UiSharedService.AttachToolTip("Copy the path");
+            ImGui.SameLine();
+            ImGui.TextUnformatted("Last dump: " + lastDump);
+        }
+        if (MareSynchronos.Services.PSyncSyncDump.LastDumpError is { } dumpError)
+        {
+            ImGui.TextColored(Dalamud.Interface.Colors.ImGuiColors.DalamudRed, "Dump failed: " + dumpError);
+        }
+#endif
+        ImGuiHelpers.ScaledDummy(5);
         ImGui.SetNextItemWidth(300);
         _uiShared.DrawCombo("Log Level", Enum.GetValues<LogLevel>(), (l) => l.ToString(), (l) =>
         {

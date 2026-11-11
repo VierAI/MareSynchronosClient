@@ -109,7 +109,20 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             return;
         }
         // Next build: only the pair's own synced sound files count (see SoundActivity.IsOwnSound).
-        if (!SoundActivity.IsOwnSound(Pair, resourceLoad.GamePath)) return;
+        // 1.15.5.1704: other .scd loads on this object count too when PSyncForeignSounds says so (referenced by the pair's
+        // applied .tmb/.pap/.avfx, or a redirected .scd under vfx/); they also feed the pair's mute redirects.
+        var own = !resourceLoad.Raw && SoundActivity.IsOwnSound(Pair, resourceLoad.GamePath);
+        if (!own)
+        {
+            if (!PSyncForeignSounds.Counts(Pair, resourceLoad.GamePath, resourceLoad.FilePath, resourceLoad.Raw)) return;
+            Pair.PSyncObserveForeignSound(resourceLoad.GamePath);
+            if (!PSyncForeignSounds.IsDiskPath(resourceLoad.FilePath))
+            {
+                // a game file (nothing on disk to read the header from): counted as a short sound
+                ApplySoundLoad(resourceLoad.GamePath, resourceLoad.FilePath, DateTimeOffset.UtcNow, new ScdClass(true, false, 0));
+                return;
+            }
+        }
 
         // Fork: sound activity state machine and Noise makers window.
         // 1210: the SCD header decides failed / short / looping / long (cached; read off the game thread the first time).

@@ -130,7 +130,7 @@ public static class PapValidation
 
                     stream.Position = position + SummonIdOffset;
                     var summonId = reader.ReadByte();
-                    if (summonId != 0 || summonId != 1)
+                    if (summonId is not (0 or 1)) // 1.15.5.1701 (VierAI): was '!= 0 || != 1', always true
                     {
                         ValidationMessage message = summonId == 8 ? PAP198A : PAP198B;
                         yield return message;

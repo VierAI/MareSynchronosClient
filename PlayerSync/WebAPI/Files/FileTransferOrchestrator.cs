@@ -25,6 +25,16 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
     // Download slots. One semaphore for the life of the orchestrator. Swapping it
     // leaves a waiter on the old instance and Release on the new one.
     private const int MaxTransferSlots = 100;
+
+    // 1.15.5.1705: Wine only. Mac crashes (Oct 31) hit Wine's certificate code during download bursts, so under Wine at most
+    // WineMaxDownloadSlots transfers (and TLS handshakes) run at once for the whole plugin, whatever Settings > Transfers says.
+    // The configured value is kept and still applies on Windows.
+    public const int WineMaxDownloadSlots = 2;
+    private static int EffectiveDownloadLimit(int configured)
+    {
+        var clamped = Math.Clamp(configured, 1, MaxTransferSlots);
+        return MareSynchronos.FileCache.LowPriorityFile.IsWine ? Math.Min(clamped, WineMaxDownloadSlots) : clamped;
+    }
     private readonly object _semaphoreModificationLock = new();
     private int _availableDownloadSlots;
     private readonly SemaphoreSlim _downloadSemaphore;
@@ -47,19 +57,22 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
         _tokenProvider = tokenProvider;
         _httpClientProvider = httpClientProvider;
 
-        _availableDownloadSlots = Math.Clamp(mareConfig.Current.ParallelDownloads, 1, MaxTransferSlots);
+        var configuredDownloads = Math.Clamp(mareConfig.Current.ParallelDownloads, 1, MaxTransferSlots);
+        _availableDownloadSlots = EffectiveDownloadLimit(configuredDownloads);
         _downloadSemaphore = new(_availableDownloadSlots, MaxTransferSlots);
 
         _availableUploadSlots = Math.Clamp(mareConfig.Current.ParallelUploads, 1, MaxTransferSlots);
         // temp for now until a better config validation framework can be worked out
-        if (_availableDownloadSlots != mareConfig.Current.ParallelDownloads || _availableUploadSlots != mareConfig.Current.ParallelUploads)
+        if (configuredDownloads != mareConfig.Current.ParallelDownloads || _availableUploadSlots != mareConfig.Current.ParallelUploads)
         {
-            mareConfig.Current.ParallelDownloads = _availableDownloadSlots;
+            mareConfig.Current.ParallelDownloads = configuredDownloads;
             mareConfig.Current.ParallelUploads = _availableUploadSlots;
             mareConfig.Save();
         }
 
         _uploadSemaphore = new(_availableUploadSlots, MaxTransferSlots);
+        if (MareSynchronos.FileCache.LowPriorityFile.IsWine)
+            logger.LogInformation("Wine: download cap active, at most {max} transfers at once (configured {configured})", WineMaxDownloadSlots, configuredDownloads);
 
         Mediator.Subscribe<ConnectedMessage>(this, (msg) =>
         {
@@ -108,7 +121,7 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
     public void ReleaseDownloadSlot(string? key = null)
     {
         _priorityQueue.OnSlotReleased(key);
-        var released = ReleaseTransferSlot(_semaphoreModificationLock, _downloadSemaphore, ref _availableDownloadSlots, ref _downloadSlotsToReclaim, _mareConfig.Current.ParallelDownloads);
+        var released = ReleaseTransferSlot(_semaphoreModificationLock, _downloadSemaphore, ref _availableDownloadSlots, ref _downloadSlotsToReclaim, EffectiveDownloadLimit(_mareConfig.Current.ParallelDownloads));
         _priorityQueue.Pump();
         if (released)
             Mediator.Publish(new DownloadLimitChangedMessage());
@@ -256,7 +269,7 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
     public const int AbandonedTransferGraceMs = 4000;
 
     /// <summary>The configured parallel download count (Settings, Transfers).</summary>
-    public int ConfiguredParallelDownloads => Math.Clamp(_mareConfig.Current.ParallelDownloads, 1, MaxTransferSlots);
+    public int ConfiguredParallelDownloads => EffectiveDownloadLimit(_mareConfig.Current.ParallelDownloads);
 
     /// <summary>
     /// 1225: like <see cref="GetOrStartDownloadTask"/>, but the transfer runs on its own token. A caller whose token is
@@ -414,7 +427,7 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
     {
         lock (_semaphoreModificationLock)
         {
-            ApplyTransferLimit(_downloadSemaphore, ref _availableDownloadSlots, ref _downloadSlotsToReclaim, _mareConfig.Current.ParallelDownloads);
+            ApplyTransferLimit(_downloadSemaphore, ref _availableDownloadSlots, ref _downloadSlotsToReclaim, EffectiveDownloadLimit(_mareConfig.Current.ParallelDownloads));
         }
 
         await _priorityQueue.WaitForSlotAsync(key, tier, token, pair).ConfigureAwait(false);

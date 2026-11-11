@@ -83,7 +83,7 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
         CheckAPI();
         CheckModDirectory();
 
-        Mediator.Subscribe<FrameworkUpdateMessage>(this, (_) => { _redrawsThisFrame = 0; if (!_pendingSoundLoads.IsEmpty) DrainPendingSoundLoads(); ProcessDeferredRedraws(); });
+        Mediator.Subscribe<FrameworkUpdateMessage>(this, (_) => { _redrawsThisFrame = 0; if (!_pendingSoundLoads.IsEmpty) DrainPendingSoundLoads(); PSyncRefreshSoundAddressMap(); if (!_pendingRawSoundLoads.IsEmpty) DrainPendingRawSoundLoads(); ProcessDeferredRedraws(); });
 
         Mediator.Subscribe<PenumbraRedrawCharacterMessage>(this, (msg) =>
         {
@@ -466,9 +466,23 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
 
     private void ResourceLoaded(IntPtr ptr, string arg1, string arg2)
     {
+        // 1.15.5.1703: keep recent .scd/.avfx/.tmb/.pap loads (raw and modded, with or without an object) for the sync info dump.
+        PSyncResourceLoadLog.Record(ptr, arg1, arg2, _dalamudUtil.IsOnFrameworkThread);
         // Fork perf: this fires for every redirected file load. Cheap checks first, ordinal compare instead of culture-aware.
-        if (ptr == IntPtr.Zero || string.Equals(arg1, arg2, StringComparison.OrdinalIgnoreCase))
+        if (ptr == IntPtr.Zero)
         {
+            return;
+        }
+
+        if (string.Equals(arg1, arg2, StringComparison.OrdinalIgnoreCase))
+        {
+            // 1.15.5.1704: a raw (not redirected) .scd load on a paired player's object is queued for Noises and mute
+            // (PSyncForeignSounds). Hook-thread cost: a suffix check, a lookup in a prebuilt address map, a bounded enqueue.
+            if (arg1.EndsWith(".scd", StringComparison.OrdinalIgnoreCase) && PairSoundRouter.TryGetContentIdForAddress(ptr, out _)
+                && _pendingRawSoundLoads.Count < 128)
+            {
+                _pendingRawSoundLoads.Enqueue((ptr, arg1, arg2));
+            }
             return;
         }
 
@@ -499,6 +513,41 @@ public sealed class IpcCallerPenumbra : DisposableMediatorSubscriberBase, IIpcCa
     }
 
     private readonly System.Collections.Concurrent.ConcurrentQueue<(nint Ptr, string GamePath, string FilePath)> _pendingSoundLoads = new();
+    private readonly System.Collections.Concurrent.ConcurrentQueue<(nint Ptr, string GamePath, string FilePath)> _pendingRawSoundLoads = new(); // 1704
+    private long _soundAddressMapNextTick;
+
+    /// <summary>1.15.5.1704: rebuilds the address map the hook uses for raw .scd loads (every 500 ms, framework thread).</summary>
+    private void PSyncRefreshSoundAddressMap()
+    {
+        var now = Environment.TickCount64;
+        if (now < _soundAddressMapNextTick) return;
+        _soundAddressMapNextTick = now + 500;
+        PairSoundRouter.SetAddressMap(PairSoundRouter.HasAnyHandler ? _dalamudUtil.GetSoundHandledPlayerAddressesOnFramework() : null);
+    }
+
+    /// <summary>1.15.5.1704: hands queued raw .scd loads to the pair's handler (at most 256 per frame).</summary>
+    private void DrainPendingRawSoundLoads()
+    {
+        int n = 0;
+        while (n++ < 256 && _pendingRawSoundLoads.TryDequeue(out var load))
+        {
+            if (PairSoundRouter.TryGetContentIdForAddress(load.Ptr, out var contentId) && PairSoundRouter.HasHandler(contentId))
+                PairSoundRouter.Dispatch(new PenumbraSoundResourceLoadMessage(contentId, load.FilePath, load.GamePath, Raw: true));
+        }
+    }
+
+    /// <summary>1.15.5.1704: sets (or with null clears) the pair's mute redirects as a separate temporary mod above their files mod.</summary>
+    public bool SetMuteRedirectsOnFramework(ILogger logger, Guid collId, string uid, Dictionary<string, string>? redirects)
+    {
+        _dalamudUtil.EnsureIsOnFramework();
+        if (!APIAvailable) return false;
+        string modKey = $"PS_{uid}_Mute";
+        _penumbraRemoveTemporaryMod.Invoke(modKey, collId, 1);
+        if (redirects == null || redirects.Count == 0) return true;
+        var result = _penumbraAddTemporaryMod.Invoke(modKey, collId, redirects, string.Empty, 1);
+        logger.LogTrace("Setting mute redirects ({count}) for {collId}: {result}", redirects.Count, collId, result);
+        return result == PenumbraApiEc.Success;
+    }
 
     /// <summary>Attributes queued off-thread .scd loads on the framework thread (no work when the queue is empty).</summary>
     private void DrainPendingSoundLoads()

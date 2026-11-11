@@ -300,8 +300,18 @@ public class PlayerPerformanceService
         var minVal = hasMin ? minRsp : defaultRspMin;
         var maxVal = hasMax ? maxRsp : defaultRspMax;
         var actualRsp = ManipRsp.GetRspFromSlider(minVal, maxVal, height);
-        var maxVanillaHeight = HeightConversion.GetCharacterHeightCm(race, gender, defaultRspMax);
-        var actualHeight = HeightConversion.GetCharacterHeightCm(race, gender, actualRsp);
+        // 1706: HeightConversion throws KeyNotFoundException for race/gender pairs it has no factor for; skip the check instead.
+        float maxVanillaHeight, actualHeight;
+        try
+        {
+            maxVanillaHeight = HeightConversion.GetCharacterHeightCm(race, gender, defaultRspMax);
+            actualHeight = HeightConversion.GetCharacterHeightCm(race, gender, actualRsp);
+        }
+        catch (KeyNotFoundException ex)
+        {
+            _logger.LogDebug("RSP height check skipped for {name}: {msg}", pair.PlayerName, ex.Message);
+            return true;
+        }
         var maxThreshold = maxVanillaHeight * (multiMax / 100f);
 
         if (!manualHeight)

@@ -142,6 +142,13 @@ public partial class SettingsUi : WindowMediatorSubscriberBase
         };
 
         Mediator.Subscribe<OpenSettingsUiMessage>(this, (_) => Toggle());
+        // 1706: Noises window gear: open at Interface > Game UI.
+        Mediator.Subscribe<OpenSettingsGameUiMessage>(this, (_) =>
+        {
+            IsOpen = true;
+            _selectedNavItem = NavItems.SelectMany(g => g.Items).FirstOrDefault(i => string.Equals(i.Label, "Interface", StringComparison.Ordinal)) ?? _selectedNavItem;
+            _selectedTabInterface = InterfaceTabsList.First(t => t.Id == InterfaceTabs.Game);
+        });
         Mediator.Subscribe<SwitchToIntroUiMessage>(this, (_) => IsOpen = false);
         Mediator.Subscribe<CutsceneStartMessage>(this, (_) => UiSharedService_GposeStart());
         Mediator.Subscribe<CutsceneEndMessage>(this, (_) => UiSharedService_GposeEnd());

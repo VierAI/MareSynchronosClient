@@ -36,6 +36,11 @@ namespace PlayerSync.FileCache
         Task DeleteAndResetDatabase(CancellationToken cancellationToken);
 
         /// <summary>
+        /// 1.15.5.1701 (VierAI): last write time (UTC) of the .GOOD.bak backup, or null when there is none
+        /// </summary>
+        DateTime? GetBackupTimeUtc();
+
+        /// <summary>
         /// Gets a database context of the database provider's type
         /// </summary>
         /// <returns>A DbContext of the type the DatabaseProvider was created with</returns>
@@ -207,6 +212,20 @@ namespace PlayerSync.FileCache
             return _contextFactory(_databaseOptions);
         }
 
+        public DateTime? GetBackupTimeUtc()
+        {
+            try
+            {
+                var info = new FileInfo(GoodDatabasePath);
+                return info.Exists && info.Length > 0 ? info.LastWriteTimeUtc : null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Could not read the backup time of {backup}", GoodDatabasePath);
+                return null;
+            }
+        }
+
         public async Task BackupDatabaseAsync(CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -281,6 +300,10 @@ namespace PlayerSync.FileCache
                 _logger.LogWarning("Starting file cache database restore from {backup} Previous database: {bad}", GoodDatabasePath, badPath);
                 await MigrateDatabaseAsync(cancellationToken).ConfigureAwait(false);
 
+                // 1.15.5.1701 (VierAI, audit M1): apply markers inside the backup are a snapshot of applies that were running when it was
+                // taken, not evidence of a crash. Left in place they would quarantine those files on this start.
+                await ClearForkApplyMarkersAsync(cancellationToken).ConfigureAwait(false);
+
                 File.Delete(RebuildPendingPath);
 
                 return true;
@@ -290,6 +313,23 @@ namespace PlayerSync.FileCache
                 _logger.LogCritical(ex, "Failed to restore file cache database {db} from {backup}!", _databasePath, GoodDatabasePath);
 
                 throw;
+            }
+        }
+
+        private async Task ClearForkApplyMarkersAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await using var context = CreateDbContext();
+                var removed = await context.Database.ExecuteSqlRawAsync("DELETE FROM PSyncApplyMarkers;", cancellationToken).ConfigureAwait(false);
+                if (removed > 0)
+                {
+                    _logger.LogInformation("[FileSafety] removed {count} apply marker(s) that came from the restored backup", removed);
+                }
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogWarning(ex, "[FileSafety] could not clear apply markers after restoring {db}", _databasePath);
             }
         }
 

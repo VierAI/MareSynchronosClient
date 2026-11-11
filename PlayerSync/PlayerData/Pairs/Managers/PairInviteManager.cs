@@ -198,6 +198,10 @@ namespace MareSynchronos.PlayerData.Pairs
             var targetIdent = _dalamudUtilService.GetHashedCIDFromPlayerPointer(target);
             if (targetIdent == null) return;
 
+            // 1.15.5.1702: a player with a pending pair request to you gets "View Pair Request": it opens the request list and
+            // targets that player (the list has no title bar, so this is also the way back to it after it was hidden).
+            AddViewPairRequestItem(args, targetIdent);
+
             // Fork: Send Pair Request lives in the Pair Data submenu for synced players; Reapply Last Data takes its spot (PairMenuSwap)
             var visiblePair = _pairManager.GetVisiblePairs().FirstOrDefault(p => p.Address == target);
             if (PairMenuSwap.Applies(visiblePair, _configurationService))
@@ -214,6 +218,23 @@ namespace MareSynchronos.PlayerData.Pairs
             {
                 Logger.LogDebug(ex, "Something went wrong adding context menu.");
             }
+        }
+
+        private void AddViewPairRequestItem(IMenuOpenedArgs args, string targetIdent)
+        {
+            if (!_apiController.IsConnected) return;
+            var request = _pendingPairRequests.FirstOrDefault(r => string.Equals(r.RequestorIdent, targetIdent, StringComparison.Ordinal));
+            if (request == null) return;
+
+            var name = _serverConfigurationManager.GetPendingRequestNameForIdent(targetIdent);
+            args.AddMenuItem(new MenuItem()
+            {
+                Name = new SeStringBuilder().AddText("View Pair Request").Build(),
+                OnClicked = (a) => Mediator.Publish(new PSyncOpenPairRequestsMessage(0, targetIdent, string.IsNullOrWhiteSpace(name) || string.Equals(name, "Unknown", StringComparison.Ordinal) ? null : name)),
+                UseDefaultPrefix = false,
+                PrefixChar = 'P',
+                PrefixColor = 530
+            });
         }
 
         private void AddContextMenu(IMenuOpenedArgs args, string targetIdent)

@@ -53,7 +53,7 @@ public record GlamourerChangedMessage(ObjectKind? ObjectKind) : MessageBase;
 public record PlayerDrawEndMessage(string PlayerName) : MessageBase;
 public record HeelsOffsetMessage : MessageBase;
 public record PenumbraResourceLoadMessage(IntPtr GameObject, string GamePath, string FilePath) : SameThreadMessage;
-public record PenumbraSoundResourceLoadMessage(ulong ContentId, string FilePath, string GamePath = "") : SameThreadMessage;
+public record PenumbraSoundResourceLoadMessage(ulong ContentId, string FilePath, string GamePath = "", bool Raw = false) : SameThreadMessage; // 1704: Raw = not redirected
 public record CustomizePlusMessage(ObjectKind? ObjectKind, bool All = false) : MessageBase;
 public record HonorificMessage(string NewHonorificTitle) : MessageBase;
 public record MoodlesMessage(ObjectKind? ObjectKind) : MessageBase;
@@ -69,6 +69,8 @@ public record ResumeScanMessage(string Source) : MessageBase;
 public record NotificationMessage
     (string Title, string Message, NotificationType Type, TimeSpan? TimeShownOnScreen = null, string? UpdatedStageFilename = null, string? UpdatedStageId = null, Pair? Pair = null, string? PlayerLinkName = null, string? PlayerIdent = null) : MessageBase; // 1414: Pair = player link in chat; 1417: name/ident for players who are not pairs
 public record ReapplyCachedPairDataMessage(Pair Pair, bool Force = true) : MessageBase;
+public record TextureCapReadyMessage(string Uid) : MessageBase;
+public record OpenSettingsGameUiMessage : MessageBase;
 public record CreateCacheForObjectMessage(GameObjectHandler ObjectToCreateFor) : SameThreadMessage;
 public record CreateCacheForEverythingMessage() : MessageBase;
 public record ClearCacheForObjectMessage(GameObjectHandler ObjectToCreateFor) : SameThreadMessage;

@@ -162,8 +162,8 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
 
         mediator.Subscribe<TargetPairMessage>(this, (msg) => TargetPairByTargetType(msg.Pair, msg.TargetType));
         mediator.Subscribe<HoverTargetPairMessage>(this, (msg) => HoverTargetPair(msg.Pair, msg.TargetType));
-        mediator.Subscribe<HoverTargetPlayerMessage>(this, (msg) => HoverTargetPlayer(msg.ContentId, msg.Ident, msg.TargetType)); // 1.15.5.1417
-        mediator.Subscribe<TargetPlayerMessage>(this, (msg) => TargetPlayer(msg.ContentId, msg.Ident, msg.TargetType)); // 1.15.5.1417
+        mediator.Subscribe<HoverTargetPlayerMessage>(this, (msg) => HoverTargetPlayer(msg.ContentId, msg.Ident, msg.TargetType, msg.Name)); // 1.15.5.1417
+        mediator.Subscribe<TargetPlayerMessage>(this, (msg) => TargetPlayer(msg.ContentId, msg.Ident, msg.TargetType, msg.Name)); // 1.15.5.1417
 
         IsWine = Util.IsWine();
         _cid = RebuildCID();
@@ -819,6 +819,25 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
         return await RunOnFrameworkThread(GetHomeWorldId).ConfigureAwait(false);
     }
 
+    /// <summary>1.15.5.1704: address -> content id of the visible players that have a sound handler (PairSoundRouter).</summary>
+    public unsafe Dictionary<nint, ulong> GetSoundHandledPlayerAddressesOnFramework()
+    {
+        EnsureIsOnFramework();
+        var map = new Dictionary<nint, ulong>();
+        for (int i = 0; i < 200; i += 2)
+        {
+            if (_objectTable[i] is not IBattleChara chara || chara.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc || !chara.IsValid())
+            {
+                continue;
+            }
+            nint playerAddress = chara.Address;
+            if (playerAddress == nint.Zero) continue;
+            ulong contentId = ((BattleChara*)playerAddress)->Character.ContentId;
+            if (PairSoundRouter.HasHandler(contentId)) map[playerAddress] = contentId;
+        }
+        return map;
+    }
+
     public unsafe ulong GetContentIdForObjectAddressOnFramework(nint address)
     {
         EnsureIsOnFramework();
@@ -1184,9 +1203,65 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
         return 0;
     }
 
+    // 1.15.5.1702: a pair request row's player is found by content id, then ident, then exact name. Before, a non-zero content id
+    // (a pair's last known character) that was not in the object table ended the lookup, and an ident was only found once the
+    // player had been hashed by the throttled framework scan (8 new players per frame), so right-click target and hover focus
+    // did nothing for the requester. Framework thread only.
+    private unsafe bool TryResolvePlayerIndexOnFramework(ulong contentId, string? ident, string? name, out ushort index)
+    {
+        index = ushort.MaxValue;
+        if (contentId != 0 && TryGetPlayerAddressAndIndexOnFrameworkByContentId(contentId, out _, out index)) return true;
+
+        if (!string.IsNullOrEmpty(ident))
+        {
+            if (_frameworkCharacterIdByIdent.TryGetValue(ident, out var cid) && cid != 0 && cid != contentId
+                && TryGetPlayerAddressAndIndexOnFrameworkByContentId(cid, out _, out index))
+            {
+                return true;
+            }
+
+            // not hashed yet: hash the players in the object table (only on a hover change or a click)
+            for (int i = 0; i < 200; i += 2)
+            {
+                if (_objectTable[i] is not IBattleChara chara || chara.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc || !chara.IsValid())
+                {
+                    continue;
+                }
+                var id = ((BattleChara*)chara.Address)->Character.ContentId;
+                if (id != 0 && string.Equals(id.ToString().GetHash256(), ident, StringComparison.Ordinal))
+                {
+                    index = (ushort)i;
+                    return true;
+                }
+            }
+        }
+
+        if (!string.IsNullOrEmpty(name))
+        {
+            var localPlayer = _objectTable.LocalPlayer?.Address ?? nint.Zero;
+            for (int i = 0; i < 200; i += 2)
+            {
+                if (_objectTable[i] is IPlayerCharacter pc && pc.Address != localPlayer && pc.IsValid()
+                    && string.Equals(pc.Name.TextValue, name, StringComparison.Ordinal))
+                {
+                    index = (ushort)i;
+                    return true;
+                }
+            }
+        }
+
+        index = ushort.MaxValue;
+        return false;
+    }
+
     private void HoverTargetContentIdOnFramework(ulong contentId, TargetType targetType)
     {
         if (contentId == 0 || !TryGetPlayerAddressAndIndexOnFrameworkByContentId(contentId, out _, out var index)) return;
+        HoverTargetIndexOnFramework(index, targetType);
+    }
+
+    private void HoverTargetIndexOnFramework(ushort index, TargetType targetType)
+    {
         var obj = _objectTable[index];
         if (obj == null) return;
         if (_hoverActive && _hoverType != targetType) RestoreHoverTarget();
@@ -1203,27 +1278,30 @@ public partial class DalamudUtilService : IHostedService, IMediatorSubscriber
         PSyncHoverTarget.Touch();
     }
 
-    private void HoverTargetPlayer(ulong contentId, string? ident, TargetType targetType)
+    private void HoverTargetPlayer(ulong contentId, string? ident, TargetType targetType, string? name = null)
     {
         if (_clientState.IsPvP) return;
         _ = RunOnFrameworkThread(() =>
         {
-            if (contentId == 0 && string.IsNullOrEmpty(ident))
+            if (contentId == 0 && string.IsNullOrEmpty(ident) && string.IsNullOrEmpty(name))
             {
                 RestoreHoverTarget();
                 return;
             }
-            HoverTargetContentIdOnFramework(ResolveContentId(contentId, ident), targetType);
+            if (TryResolvePlayerIndexOnFramework(contentId, ident, name, out var index)) HoverTargetIndexOnFramework(index, targetType);
         });
     }
 
-    private void TargetPlayer(ulong contentId, string? ident, TargetType targetType)
+    private void TargetPlayer(ulong contentId, string? ident, TargetType targetType, string? name = null)
     {
         if (_clientState.IsPvP) return;
         _ = RunOnFrameworkThread(() =>
         {
-            var cid = ResolveContentId(contentId, ident);
-            if (cid == 0 || !TryGetPlayerAddressAndIndexOnFrameworkByContentId(cid, out _, out var index)) return;
+            if (!TryResolvePlayerIndexOnFramework(contentId, ident, name, out var index))
+            {
+                _logger.LogDebug("Target player: no player in range for content id {cid} / ident / name {name}", contentId, name);
+                return;
+            }
             var obj = _objectTable[index];
             if (obj == null) return;
             SetTargetOfType(targetType, obj);

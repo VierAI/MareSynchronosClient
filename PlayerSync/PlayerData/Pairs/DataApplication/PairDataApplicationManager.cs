@@ -59,6 +59,8 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
         _maxConcurrentApplyData = _configurationService.Current.MaxConcurrentApplications < 1 ? 1 : _configurationService.Current.MaxConcurrentApplications;
 
         Mediator.Subscribe<ReapplyCachedPairDataMessage>(this, (msg) => { ResetBackoff(msg.Pair); _ = ReapplyCachedPairData(msg.Pair, msg.Force); });
+        // 1706: texture cap made smaller copies for a visible pair; re-apply so they are swapped in now.
+        Mediator.Subscribe<TextureCapReadyMessage>(this, (msg) => _pairManager.GetVisiblePairs().FirstOrDefault(x => string.Equals(x.UserData.UID, msg.Uid, StringComparison.Ordinal))?.ReapplyCachedData(forced: true));
         Mediator.Subscribe<DisconnectedMessage>(this, (_) =>
         {
             _isConnected = false;

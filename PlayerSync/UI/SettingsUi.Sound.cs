@@ -1,4 +1,6 @@
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 using MareSynchronos.Services;
 using MareSynchronos.Services.Mediator;
@@ -8,6 +10,38 @@ namespace MareSynchronos.UI;
 // Game UI options for "who is making noise" (name tag speaker and the Noises window).
 public partial class SettingsUi
 {
+    // 1706: rules that glow a Noises row's name while the player plays a matching sound.
+    private void DrawNoiseGlowRules()
+    {
+        var store = MareSynchronos.Services.VierAIConfigStore.Current;
+        store.NoiseGlowRules ??= MareSynchronos.Services.NoiseGlowRule.Defaults();
+        var rules = store.NoiseGlowRules;
+        ImGui.TextUnformatted("Noises name glow while playing");
+        _uiShared.DrawHelpText("A player's name in the Noises window glows in the rule's color while they play a sound whose file name contains the text (not case-sensitive)." + Environment.NewLine +
+            "The first matching rule wins. Defaults: plap = red, bpmloop = green.");
+        var remove = -1;
+        for (var i = 0; i < rules.Count; i++)
+        {
+            using var id = ImRaii.PushId("noiseglow" + i);
+            var rule = rules[i];
+            var enabled = rule.Enabled;
+            if (ImGui.Checkbox("##enabled", ref enabled)) { rule.Enabled = enabled; MareSynchronos.Services.VierAIConfigStore.MarkDirty(); }
+            ImGui.SameLine();
+            var match = rule.Match ?? string.Empty;
+            ImGui.SetNextItemWidth(160 * ImGuiHelpers.GlobalScale);
+            if (ImGui.InputText("##match", ref match, 64)) { rule.Match = match; MareSynchronos.Services.VierAIConfigStore.MarkDirty(); }
+            ImGui.SameLine();
+            var color = ImGui.ColorConvertU32ToFloat4(rule.Color);
+            if (ImGui.ColorEdit4("##color", ref color, ImGuiColorEditFlags.NoInputs)) { rule.Color = ImGui.ColorConvertFloat4ToU32(color); MareSynchronos.Services.VierAIConfigStore.MarkDirty(); }
+            ImGui.SameLine();
+            if (_uiShared.IconButton(FontAwesomeIcon.Trash)) remove = i;
+        }
+        if (remove >= 0) { rules.RemoveAt(remove); MareSynchronos.Services.VierAIConfigStore.MarkDirty(); }
+        if (ImGui.Button("Add glow rule")) { rules.Add(new MareSynchronos.Services.NoiseGlowRule { Match = "", Color = 0xFFFFAA00 }); MareSynchronos.Services.VierAIConfigStore.MarkDirty(); }
+        ImGui.SameLine();
+        if (ImGui.Button("Reset glow rules")) { store.NoiseGlowRules = MareSynchronos.Services.NoiseGlowRule.Defaults(); MareSynchronos.Services.VierAIConfigStore.MarkDirty(); }
+    }
+
     private void DrawSoundActivitySettings()
     {
         var nameTagSpeaker = _configService.Current.NamePlatePairedSoundIndicator;
@@ -32,6 +66,17 @@ public partial class SettingsUi
         _uiShared.DrawHelpText("Opens a small window listing visible players who are making noise, with quick mute and pause buttons." + Environment.NewLine +
             "It sizes itself to its rows, stays invisible until you hover it, and hides while the main window is open (the main window has a Noises folder instead)." + Environment.NewLine +
             "Closing that window turns this setting off.");
+
+        var hoverOnly = MareSynchronos.Services.VierAIConfigStore.Current.NoisesOnlyShowOnHover;
+        if (ImGui.Checkbox("Only show window on hover", ref hoverOnly))
+        {
+            MareSynchronos.Services.VierAIConfigStore.Current.NoisesOnlyShowOnHover = hoverOnly;
+            MareSynchronos.Services.VierAIConfigStore.MarkDirty();
+        }
+        _uiShared.DrawHelpText("On: the Noises window's background, title and buttons stay invisible until you hover it (names still show)." + Environment.NewLine +
+            "Off (default): the window stays fully visible.");
+
+        DrawNoiseGlowRules();
 
         var fadeSeconds = Math.Clamp(MareSynchronos.Services.VierAIConfigStore.Current.NoisesFadeSeconds, 10, 300);
         ImGui.SetNextItemWidth(250 * Dalamud.Interface.Utility.ImGuiHelpers.GlobalScale);

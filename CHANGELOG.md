@@ -6,6 +6,8 @@ The fork's own changes (VierAI) come first, split into features, testing items a
 
 Everything in this section is VierAI's fork work, not part of the official PlayerSync. Items marked *(in testing)* were added after the first public release (1.15.5.1209); the version in brackets is the build that added them, and all of them are included in 1.15.5.1700.
 
+**1.15.6.001** is based on the official PlayerSync 1.15.6.0 (API 40) and includes every VierAI change listed below.
+
 ### Features
 
 - Noises window and Noises folder in the main window: see who is playing modded sounds, hover a row to target them, mute or pause from the list; detection counts only a player's own sounds; unmuting or Reapply Last Data restores their music, looping emote sounds and speaker icon
@@ -31,6 +33,7 @@ Everything in this section is VierAI's fork work, not part of the official Playe
 - *(in testing, 1417)* Settings > Sync: count of blocked files, with a button to clear them
 - *(in testing, 1424)* Help > Their Pair Data > Workload tab: how many pairs are online, visible, loaded, waiting, applying or paused, with total file size, estimated VRAM and triangles, and a sortable top list
 - *(in testing, 1423)* Local debug tools (only with 'Allow local debug tools to read pair info' on) can read per-pair file size, VRAM and triangle estimates
+- *(internal debug builds only, not in public releases)* Settings > Debug > "Dump all sync info" (or /psync dump): writes one local text file with every player and pair in view (permissions incl. sounds/animations/VFX off, noise state), the files received and applied per pair by type (game path -> file and source: PS cache, local mod, file swap or raw), what Penumbra has loaded on them now, recent sound (.scd, incl. VFX-bound under vfx/) and VFX/animation loads per object with a modded flag, and the sounds the game is playing right now matched to the nearest object. Read-only; mute behavior is unchanged
 
 ### Fixes
 
@@ -52,9 +55,22 @@ Everything in this section is VierAI's fork work, not part of the official Playe
 - *(in testing, 1417)* Crash-loop quarantine: files tied to repeated game crashes are held back, with a chat warning
 - *(in testing, 1421; 25 files 1425)* Mac/Wine: download batches are split into groups of at most 25 files, with a short pause between groups
 - *(in testing, 1426)* Mac/Wine: downloaded files are saved to the cache one at a time, with a short pause after each, to limit disk load
+- *(in testing, 1701)* Blocked files: a file cache database restore from its backup or a database reset no longer brings back cleared blocked files, loses the blocked list, or falsely quarantines files from stale apply markers
+- *(in testing, 1701)* Animation (.pap) check: the C198 SummonId warning no longer fires for the valid values 0 and 1 (upstream check was always true)
+- *(in testing, 1702)* Pair request list: hovering or right-clicking a request now targets the player who sent it even when their pair entry points at another character or they were not hashed yet (falls back to the request's ident, then the character name)
+- *(in testing, 1704)* Noises: sounds a pair's synced animations or VFX play under paths they did not sync (vanilla sounds, .scd under vfx/, raw not-redirected loads) now count as that pair's noise, not only their own synced .scd files
+- *(in testing, 1704)* Mute / sounds disabled now also silences those sounds for that pair only (redirected in their own Penumbra collection to a path that does not exist); other players and your own sounds are untouched
+- *(in testing, 1702)* Pair request list: Escape no longer hides it (it has no title bar, so it could not be found again); right-click a player who sent you a request and pick "View Pair Request" to open the list and target them, and the chat link now always opens it
 
 ### Performance
 
+- *(in testing, 1705)* Mac/Linux (Wine): at most 2 downloads run at once for the whole plugin, and every batch spaces file starts 50 ms apart, to stop crashes during download bursts; Windows is unchanged
+- *(in testing, 1706)* Noises window: on by default and fully visible (new Only show window on hover option in Interface > Game UI), gear button opens those settings, and names glow while a player plays a matching sound (configurable rules, defaults plap red and bpmloop green)
+- *(in testing, 1706)* Texture size cap: smaller copies are swapped in right away (the pair is re-applied once they are made), so In use and VRAM saved show real numbers; Capped counts only textures with a real smaller copy
+- *(in testing, 1706)* Fixed a KeyNotFoundException in the RSP height check for race and gender combinations without a height factor; the check is skipped for them
+
+- *(in testing, 1701)* File cache database backup: skipped at startup when the last backup is under an hour old, and no longer holds up downloads and cache writes while it copies
+- *(in testing, 1701)* Database rebuild: counts the files once instead of re-reading the whole folder tree after every batch
 - Pair data is applied across several frames instead of one
 - Lighter per-frame work for name plates, sound polling, the Noises list and the Penumbra callback
 - Logins and plugin start hash at most 8 new players per frame
@@ -74,6 +90,13 @@ Everything in this section is VierAI's fork work, not part of the official Playe
 ## Upstream PlayerSync changes
 
 Changes made by the official PlayerSync developers, included in this fork through merges from upstream. They are not VierAI's work; credit goes to the PlayerSync team. Summarized from the upstream history.
+
+### 1.15.6.0 (November 2026)
+
+- Server API version 40 (required to connect to the current PlayerSync servers)
+- Build updated to Dalamud.NET.Sdk 15 and .NET 10; Stagehand 0.5.5
+- Intro wording: the file cache is now FileCache.db
+
 
 ### 1.15.5.16 and 1.15.5.17 (November 2026)
 

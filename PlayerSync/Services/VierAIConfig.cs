@@ -20,7 +20,13 @@ public class VierAIConfig
 
     // Sound activity / name tags / Noise makers window (were in config.json)
     public bool NamePlatePairedSoundIndicator { get; set; } = false;
-    public bool ShowNoiseMakersWindow { get; set; } = false;
+    public bool ShowNoiseMakersWindow { get; set; } = true; // 1706: on by default
+
+    // 1706: Noises window background/title/buttons only while hovered (the old look). Off by default = always visible.
+    public bool NoisesOnlyShowOnHover { get; set; } = false;
+
+    // 1706: glow on a Noises row's name while that player plays a sound whose file name contains Match (case-insensitive).
+    public List<NoiseGlowRule> NoiseGlowRules { get; set; } = NoiseGlowRule.Defaults();
 
     // Seconds a noise entry takes to fade out and drop from the Noises window / folder (10-300).
     public int NoisesFadeSeconds { get; set; } = 60;
@@ -407,6 +413,12 @@ public static class VierAIConfigStore
         Try(nameof(VierAIConfig.SchemaVersion), el => target.SchemaVersion = el.GetInt32());
         Try(nameof(VierAIConfig.NamePlatePairedSoundIndicator), el => target.NamePlatePairedSoundIndicator = el.GetBoolean());
         Try(nameof(VierAIConfig.ShowNoiseMakersWindow), el => target.ShowNoiseMakersWindow = el.GetBoolean());
+        Try(nameof(VierAIConfig.NoisesOnlyShowOnHover), el => target.NoisesOnlyShowOnHover = el.GetBoolean());
+        Try(nameof(VierAIConfig.NoiseGlowRules), el =>
+        {
+            var list = el.Deserialize<List<NoiseGlowRule>>(new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            if (list != null) target.NoiseGlowRules = list;
+        });
         Try(nameof(VierAIConfig.CacheFolderWarningDismissed), el => target.CacheFolderWarningDismissed = el.GetBoolean());
         Try(nameof(VierAIConfig.WineSkipAnimationAnalysis), el => target.WineSkipAnimationAnalysis = el.GetBoolean());
         Try(nameof(VierAIConfig.SplitApplyAcrossFrames), el => target.SplitApplyAcrossFrames = el.GetBoolean());
@@ -577,4 +589,18 @@ public sealed class VierAIConfigService : IHostedService, IDisposable
         else
             _logger.LogTrace("Saved {file}", VierAIConfigStore.FileName);
     }
+}
+
+/// <summary>1706: one Noises name-glow rule (Color is ImGui ABGR, e.g. 0xFF0000FF = red).</summary>
+public sealed class NoiseGlowRule
+{
+    public string Match { get; set; } = string.Empty;
+    public uint Color { get; set; } = 0xFF0000FF;
+    public bool Enabled { get; set; } = true;
+
+    public static List<NoiseGlowRule> Defaults() =>
+    [
+        new() { Match = "plap", Color = 0xFF0000FF },
+        new() { Match = "bpmloop", Color = 0xFF00FF00 },
+    ];
 }

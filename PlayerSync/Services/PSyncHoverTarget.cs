@@ -30,7 +30,7 @@ public static class PSyncHoverTarget
 public record HoverTargetPairMessage(Pair? Pair, TargetType TargetType) : MessageBase;
 
 /// <summary>1.15.5.1417: temporary hover target by content id or ident (0 and null end the hover).</summary>
-public record HoverTargetPlayerMessage(ulong ContentId, string? Ident, TargetType TargetType) : MessageBase;
+public record HoverTargetPlayerMessage(ulong ContentId, string? Ident, TargetType TargetType, string? Name = null) : MessageBase;
 
 /// <summary>1.15.5.1417: target a player by content id or ident (for rows whose player may not be a pair).</summary>
-public record TargetPlayerMessage(ulong ContentId, string? Ident, TargetType TargetType) : MessageBase;
+public record TargetPlayerMessage(ulong ContentId, string? Ident, TargetType TargetType, string? Name = null) : MessageBase;

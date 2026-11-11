@@ -45,7 +45,7 @@ public class NotificationService : DisposableMediatorSubscriberBase, IHostedServ
         Mediator.Subscribe<NotificationMessage>(this, ShowNotification);
         Mediator.Subscribe<PSyncChatNoticeMessage>(this, m => PrintWarnChat(m.Message, m.Pair));
 
-        _inviteTogglePayload = _chatGui.AddChatLinkHandler(0, (_, _) => Mediator.Publish(new UiToggleMessage(typeof(PairingRequestsUi))));
+        _inviteTogglePayload = _chatGui.AddChatLinkHandler(0, (_, _) => Mediator.Publish(new PSyncOpenPairRequestsMessage())); // 1702: open, not toggle
         // LifeStreamHandler uses ID 1
         _stageUpdatePayload = _chatGui.AddChatLinkHandler(2, (_, _) => Mediator.Publish(new OpenStageUpdateWindow(_savedStageId, _savedStageFilename)));
 

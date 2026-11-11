@@ -6,6 +6,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
+using System.Text.Json;
 
 namespace PlayerSync.FileCache;
 
@@ -16,6 +17,8 @@ namespace PlayerSync.FileCache;
 /// - PSyncApplyMarkers: written right before a pair's mod files are handed to Penumbra, removed once the redraw settled.
 ///   A marker from an earlier session means the game died mid-apply: that pair's .mdl hashes are quarantined.
 /// Everything here is best effort: a DB error is logged and never blocks syncing.
+/// 1.15.5.1701 (audit M1): the blocked list is mirrored to PSyncBadFiles.json next to the DB. A DB restore (FileCache.GOOD.bak, up to an hour
+/// old) or reset rolls the table back or wipes it; on start the mirror re-applies a later "Clear blocked files" and re-adds lost entries.
 /// </summary>
 public sealed class PSyncFileSafetyStore : IHostedService
 {
@@ -30,6 +33,17 @@ public sealed class PSyncFileSafetyStore : IHostedService
     private readonly MareMediator _mediator;
     private readonly CancellationTokenSource _cts = new();
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SemaphoreSlim _mirrorLock = new(1, 1);
+    private string? _mirrorPath;
+    private long _clearedTicks;
+
+    private sealed record MirrorEntry(string Hash, string? Reason, long AddedTicks, string? SourcePairUid);
+
+    private sealed class Mirror
+    {
+        public long ClearedTicks { get; set; }
+        public List<MirrorEntry> Bad { get; set; } = [];
+    }
 
     public PSyncFileSafetyStore(ILogger<PSyncFileSafetyStore> logger, IDatabaseProvider<FileCacheDbContext> db, PairManager pairManager,
         DalamudUtilService dalamudUtil, MareMediator mediator)
@@ -98,8 +112,46 @@ public sealed class PSyncFileSafetyStore : IHostedService
         var pending = new List<(string Uid, int Count)>();
         try
         {
+            _mirrorPath = GetMirrorPath();
             await using (var connection = await OpenAsync(ct).ConfigureAwait(false))
             {
+                // 0) 1.15.5.1701: re-apply the mirrored blocked list (see the class summary)
+                var mirror = await ReadMirrorAsync(ct).ConfigureAwait(false);
+                if (mirror != null)
+                {
+                    Interlocked.Exchange(ref _clearedTicks, mirror.ClearedTicks);
+                    await using var tx0 = (SqliteTransaction)await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+                    var removed = 0;
+                    if (mirror.ClearedTicks > 0)
+                    {
+                        await using var delete = connection.CreateCommand();
+                        delete.Transaction = tx0;
+                        delete.CommandText = "DELETE FROM PSyncBadFiles WHERE AddedTicks <= $c;";
+                        delete.Parameters.AddWithValue("$c", mirror.ClearedTicks);
+                        removed = await delete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                    }
+
+                    var readded = 0;
+                    foreach (var entry in mirror.Bad)
+                    {
+                        if (string.IsNullOrEmpty(entry.Hash) || entry.AddedTicks <= mirror.ClearedTicks) continue;
+                        await using var insert = connection.CreateCommand();
+                        insert.Transaction = tx0;
+                        insert.CommandText = "INSERT OR IGNORE INTO PSyncBadFiles (Hash, Reason, AddedTicks, SourcePairUid) VALUES ($h, $r, $t, $u);";
+                        insert.Parameters.AddWithValue("$h", entry.Hash.ToUpperInvariant());
+                        insert.Parameters.AddWithValue("$r", entry.Reason ?? string.Empty);
+                        insert.Parameters.AddWithValue("$t", entry.AddedTicks);
+                        insert.Parameters.AddWithValue("$u", (object?)entry.SourcePairUid ?? DBNull.Value);
+                        readded += await insert.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                    }
+
+                    await tx0.CommitAsync(ct).ConfigureAwait(false);
+                    if (removed > 0 || readded > 0)
+                    {
+                        _logger.LogInformation("[FileSafety] blocked list mirror: removed {removed} entry(s) cleared earlier, re-added {readded} missing entry(s)", removed, readded);
+                    }
+                }
+
                 // 1) quarantine hashes from apply markers left by an earlier session (the game died mid-apply)
                 var markers = new List<(string Id, string Uid, string[] Hashes)>();
                 await using (var command = connection.CreateCommand())
@@ -157,6 +209,7 @@ public sealed class PSyncFileSafetyStore : IHostedService
                     }
                 }
             }
+            await WriteMirrorAsync(ct).ConfigureAwait(false);
             MareSynchronos.PlayerData.Pairs.PairDataApplicationHandler.ForkSeedVerifiedBad(s_bad.Keys);
             _logger.LogInformation("[FileSafety] loaded {count} known-bad file hash(es)", s_bad.Count);
         }
@@ -227,6 +280,7 @@ public sealed class PSyncFileSafetyStore : IHostedService
                     c.Parameters.AddWithValue("$t", DateTime.UtcNow.Ticks);
                     c.Parameters.AddWithValue("$u", (object?)pairUid ?? DBNull.Value);
                 }, _cts.Token).ConfigureAwait(false);
+                await WriteMirrorAsync(_cts.Token).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -336,9 +390,11 @@ public sealed class PSyncFileSafetyStore : IHostedService
         var count = s_bad.Count;
         s_bad.Clear();
         MareSynchronos.PlayerData.Pairs.PairDataApplicationHandler.ForkClearVerifiedBad();
+        Interlocked.Exchange(ref _clearedTicks, DateTime.UtcNow.Ticks); // 1701: also undoes older entries a DB restore brings back
         try
         {
             await ExecAsync("DELETE FROM PSyncBadFiles;", null, _cts.Token).ConfigureAwait(false);
+            await WriteMirrorAsync(_cts.Token).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -346,5 +402,84 @@ public sealed class PSyncFileSafetyStore : IHostedService
         }
         _logger.LogInformation("[FileSafety] cleared {count} known-bad file hash(es)", count);
         return count;
+    }
+
+    private string? GetMirrorPath()
+    {
+        try
+        {
+            using var context = _db.CreateDbContext();
+            var dataSource = new SqliteConnectionStringBuilder(context.Database.GetConnectionString()).DataSource;
+            var folder = string.IsNullOrEmpty(dataSource) ? null : Path.GetDirectoryName(Path.GetFullPath(dataSource));
+            return string.IsNullOrEmpty(folder) ? null : Path.Combine(folder, "PSyncBadFiles.json");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "[FileSafety] no blocked list mirror path");
+            return null;
+        }
+    }
+
+    private async Task<Mirror?> ReadMirrorAsync(CancellationToken ct)
+    {
+        var path = _mirrorPath;
+        if (path == null || !File.Exists(path)) return null;
+        try
+        {
+            var json = await File.ReadAllTextAsync(path, ct).ConfigureAwait(false);
+            return JsonSerializer.Deserialize<Mirror>(json);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "[FileSafety] could not read the blocked list mirror {path}", path);
+            return null;
+        }
+    }
+
+    // Rewrites the mirror from the table. The blocked list is small and changes rarely (a bad file, a crash quarantine, the clear button).
+    private async Task WriteMirrorAsync(CancellationToken ct)
+    {
+        var path = _mirrorPath;
+        if (path == null) return;
+        try
+        {
+            await _mirrorLock.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
+        try
+        {
+            var mirror = new Mirror { ClearedTicks = Interlocked.Read(ref _clearedTicks) };
+            await using (var connection = await OpenAsync(ct).ConfigureAwait(false))
+            await using (var command = connection.CreateCommand())
+            {
+                command.CommandText = "SELECT Hash, Reason, AddedTicks, SourcePairUid FROM PSyncBadFiles;";
+                await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                {
+                    mirror.Bad.Add(new MirrorEntry(reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetString(1),
+                        reader.GetInt64(2), reader.IsDBNull(3) ? null : reader.GetString(3)));
+                }
+            }
+
+            var tempPath = path + ".tmp";
+            await File.WriteAllTextAsync(tempPath, JsonSerializer.Serialize(mirror), ct).ConfigureAwait(false);
+            File.Move(tempPath, path, overwrite: true);
+        }
+        catch (OperationCanceledException)
+        {
+            // unloading
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "[FileSafety] could not write the blocked list mirror {path}", path);
+        }
+        finally
+        {
+            _mirrorLock.Release();
+        }
     }
 }

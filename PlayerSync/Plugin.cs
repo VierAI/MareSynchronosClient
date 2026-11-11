@@ -125,6 +125,12 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddSingleton<InGameFriendService>();
             collection.AddSingleton<DownloadPriorityQueue>();
             collection.AddSingleton<SoundActivityTracker>();
+#if PSYNC_INTERNAL
+            collection.AddSingleton((s) => new PSyncSyncDump(s.GetRequiredService<ILogger<PSyncSyncDump>>(), s.GetRequiredService<MareMediator>(),
+                s.GetRequiredService<MareConfigService>(), s.GetRequiredService<DalamudUtilService>(), s.GetRequiredService<PairManager>(),
+                s.GetRequiredService<IpcManager>(), s.GetRequiredService<SoundActivityTracker>(), s.GetRequiredService<MareSynchronos.Services.Events.EventAggregator>(),
+                objectTable, clientState, gameConfig, chatGui)); // 1.15.5.1703: Dump all sync info
+#endif
             collection.AddSingleton<AutoAnimationSync>(); // fork 1210
             collection.AddSingleton<MareSynchronos.Services.PSyncCrowdService>(); // 1.15.5.1217
             collection.AddSingleton<FileTransferOrchestrator>();
@@ -312,6 +318,9 @@ public sealed class Plugin : IDalamudPlugin
             collection.AddHostedService(p => p.GetRequiredService<NotificationService>());
             collection.AddHostedService(p => p.GetRequiredService<NamePlateManagerService>());
             collection.AddHostedService(p => p.GetRequiredService<SoundActivityTracker>());
+#if PSYNC_INTERNAL
+            collection.AddHostedService(p => p.GetRequiredService<PSyncSyncDump>()); // 1.15.5.1703
+#endif
             collection.AddHostedService(p => p.GetRequiredService<InGameFriendService>());
             collection.AddHostedService(p => p.GetRequiredService<FileCacheManager>());
         collection.AddHostedService(p => p.GetRequiredService<PSyncFileSafetyStore>()); // 1.15.5.1415: after FileCacheManager (migrations)

@@ -14,6 +14,7 @@ using MareSynchronos.PlayerData.Pairs;
 using MareSynchronos.Services.ServerConfiguration;
 using MareSynchronos.API.Data;
 using System.Numerics;
+using TargetType = MareSynchronos.Services.Models.TargetType;
 
 namespace MareSynchronos.UI;
 
@@ -22,6 +23,10 @@ namespace MareSynchronos.UI;
 // player on the same line. The old "PlayerSync Pair Requests" pill (PairingRequestsNoticeUi) is gone: this window opens
 // by itself when a new request arrives. Hovering a row does the temporary hover focus (restored when the hover ends),
 // right-clicking a row (not a button) targets the player, left-clicking the name copies the ID.
+/// <summary>1.15.5.1702: opens the pair request list (not a toggle), e.g. from the "View Pair Request" right-click entry or the chat link.
+/// With a player: that player (the requester) is targeted too.</summary>
+public record PSyncOpenPairRequestsMessage(ulong ContentId = 0, string? Ident = null, string? Name = null) : MessageBase;
+
 public class PairingRequestsUi : WindowMediatorSubscriberBase
 {
     private const float FadeSeconds = 0.2f;
@@ -40,6 +45,7 @@ public class PairingRequestsUi : WindowMediatorSubscriberBase
     private int _pushedColors;
     private Vector4 _baseText = new(1, 1, 1, 1);
     private readonly PairHoverTargeter _hover;
+    private readonly MareConfigService _configService;
     private int _lastPendingCount;
     private bool _autoOpened;
     private bool _inGpose;
@@ -63,6 +69,23 @@ public class PairingRequestsUi : WindowMediatorSubscriberBase
             | ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoFocusOnAppearing;
 
         _hover = new PairHoverTargeter(mediator, configService);
+
+        // 1.15.5.1702: the list has no title bar or close button, so Escape was the only way to hide it, and a hidden list only
+        // came back when a newer request arrived. Escape no longer closes it; it closes by itself once every request is handled,
+        // and the envelope button, the chat link and the "View Pair Request" right-click entry open it.
+        RespectCloseHotkey = false;
+        _configService = configService;
+        Mediator.Subscribe<PSyncOpenPairRequestsMessage>(this, (msg) =>
+        {
+            if (_inGpose) return;
+            IsOpen = true;
+            BringToFront();
+            if (msg.ContentId != 0 || !string.IsNullOrEmpty(msg.Ident) || !string.IsNullOrEmpty(msg.Name))
+            {
+                Mediator.Publish(new TargetPlayerMessage(msg.ContentId, msg.Ident,
+                    _configService.Current.UseFocusTarget ? TargetType.FocusTarget : TargetType.Target, msg.Name));
+            }
+        });
 
         Mediator.Subscribe<GposeStartMessage>(this, (_) => { _inGpose = true; IsOpen = false; });
         Mediator.Subscribe<GposeEndMessage>(this, (_) =>
@@ -139,7 +162,12 @@ public class PairingRequestsUi : WindowMediatorSubscriberBase
     }
 
     private readonly record struct Row(string Key, UserData? Requestor, ulong ContentId, string? Ident, string Name, string? Group,
-        string ShownId, string CopyId, Action Accept, Action Dismiss, Action Ignore, string DismissTooltip);
+        string ShownId, string CopyId, Action Accept, Action Dismiss, Action Ignore, string DismissTooltip)
+    {
+        // 1.15.5.1702: the character name, used to find the player when the content id and ident don't (not the UID/alias fallback)
+        public string? PlayerName => string.IsNullOrWhiteSpace(Name) || string.Equals(Name, "Unknown", StringComparison.Ordinal)
+            || string.Equals(Name, Requestor?.AliasOrUID, StringComparison.Ordinal) || string.Equals(Name, Requestor?.UID, StringComparison.Ordinal) ? null : Name;
+    }
 
     private readonly List<Row> _rows = [];
 
@@ -291,7 +319,7 @@ public class PairingRequestsUi : WindowMediatorSubscriberBase
         ImGui.Dummy(Vector2.Zero);
 
         var rowHovered = ImGui.IsMouseHoveringRect(rowMin, rowMax) && ImGui.IsWindowHovered(ImGuiHoveredFlags.AllowWhenBlockedByActiveItem);
-        _hover.Row(r.Key, r.ContentId, r.Ident, rowHovered, overButton);
+        _hover.Row(r.Key, r.ContentId, r.Ident, rowHovered, overButton, r.PlayerName);
     }
 
     private void DrawAvatar(UserData? user, Vector2 size)

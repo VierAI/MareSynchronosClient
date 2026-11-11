@@ -918,9 +918,9 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
         // transfers really run; this only stops a big batch from opening every file and socket at the same moment.
         // Under Wine a batch is fed a few files at a time and file starts are spaced out a little.
         var configured = _orchestrator.ConfiguredParallelDownloads;
-        var parallelism = LowPriorityFile.IsWine ? Math.Clamp(configured, 2, 6) : Math.Clamp(configured + 2, 4, 16);
+        var parallelism = LowPriorityFile.IsWine ? Math.Clamp(configured, 1, FileTransferOrchestrator.WineMaxDownloadSlots) : Math.Clamp(configured + 2, 4, 16);
         parallelism = Math.Max(1, Math.Min(parallelism, directDownloads.Count));
-        var startSpacing = LowPriorityFile.IsWine && directDownloads.Count > parallelism ? TimeSpan.FromMilliseconds(15) : TimeSpan.Zero;
+        var startSpacing = LowPriorityFile.IsWine ? TimeSpan.FromMilliseconds(WineMinFileStartGapMs) : TimeSpan.Zero; // 1705: every Wine batch, 50 ms (was 15 ms, big batches only)
         // 1228 DownloadCaps legacy (pre-1225, read once per batch): one task per file at once, no start spacing.
 
         var pacerLock = new object();

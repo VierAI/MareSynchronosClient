@@ -55,11 +55,11 @@ internal sealed class PairHoverTargeter
 
     /// <summary>1.15.5.1417: same as <see cref="Row(Pair, bool, bool)"/> for rows whose player may not be a pair
     /// (pair request rows): the player is found by content id or ident. <paramref name="key"/> identifies the row.</summary>
-    public void Row(string key, ulong contentId, string? ident, bool rowHovered, bool overButton)
+    public void Row(string key, ulong contentId, string? ident, bool rowHovered, bool overButton, string? name = null)
     {
         if (!rowHovered) return;
         _hoveredThisFrame = true;
-        if (contentId == 0 && string.IsNullOrEmpty(ident)) return;
+        if (contentId == 0 && string.IsNullOrEmpty(ident) && string.IsNullOrEmpty(name)) return;
 
         var cfg = _configService.Current;
         if (cfg.TargetPairsOnHover)
@@ -68,13 +68,13 @@ internal sealed class PairHoverTargeter
             if (stale || !string.Equals(_hoveredUid, key, StringComparison.Ordinal))
             {
                 _hoveredUid = key;
-                _mediator.Publish(new HoverTargetPlayerMessage(contentId, ident, cfg.OnHoverTargetType));
+                _mediator.Publish(new HoverTargetPlayerMessage(contentId, ident, cfg.OnHoverTargetType, name));
             }
         }
 
         if (!overButton && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
         {
-            _mediator.Publish(new TargetPlayerMessage(contentId, ident, cfg.UseFocusTarget ? TargetType.FocusTarget : TargetType.Target));
+            _mediator.Publish(new TargetPlayerMessage(contentId, ident, cfg.UseFocusTarget ? TargetType.FocusTarget : TargetType.Target, name));
         }
     }
 

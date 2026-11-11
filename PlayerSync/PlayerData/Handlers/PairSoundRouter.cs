@@ -26,6 +26,16 @@ public static class PairSoundRouter
 
     public static bool HasAnyHandler => !Handlers.IsEmpty;
 
+    // 1.15.5.1704: object address -> content id of visible players with a handler, rebuilt on the framework thread every
+    // 500 ms and swapped in whole (never mutated after publishing), so the resource load hook can check it from any thread.
+    private static readonly Dictionary<nint, ulong> EmptyAddressMap = new();
+    private static Dictionary<nint, ulong> s_addressMap = EmptyAddressMap;
+
+    public static void SetAddressMap(Dictionary<nint, ulong>? map) => Volatile.Write(ref s_addressMap, map ?? EmptyAddressMap);
+
+    public static bool TryGetContentIdForAddress(nint address, out ulong contentId)
+        => Volatile.Read(ref s_addressMap).TryGetValue(address, out contentId);
+
     public static void Dispatch(PenumbraSoundResourceLoadMessage msg)
     {
         if (Handlers.TryGetValue(msg.ContentId, out var handler)) handler(msg);

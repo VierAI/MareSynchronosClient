@@ -211,6 +211,10 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
     public IReadOnlyDictionary<ObjectKind, ConcurrentDictionary<PlayerChanges, double>> DataApplicationTiming => _frameworkTimings;
     public ConcurrentDictionary<string, string> MissingFiles { get; private set; } = new ConcurrentDictionary<string, string>();
     public long LastAppliedDataBytes { get; private set; }
+    // 1.15.5.1703: what the last mod-file apply handed to Penumbra (game path -> cache file or swap game path), for the sync info dump.
+    public IReadOnlyDictionary<string, string>? PSyncLastAppliedModPaths { get; private set; }
+    public IReadOnlySet<string>? PSyncLastAppliedSwapPaths { get; private set; }
+    public DateTimeOffset? PSyncLastAppliedModPathsAt { get; private set; }
     public long PendingDataSequenceNumber => Volatile.Read(ref _pendingVersion);
     public DateTimeOffset? LastDataApplicationTime { get; private set; } = DateTimeOffset.MinValue;
     private Pair Pair { get; set; }
@@ -1348,6 +1352,18 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
             if (safetyStore != null && penumbraApplied && dataApplication.UpdateModdedPaths)
             {
                 safetyStore.RecordApplied(moddedPaths.Keys.Where(k => k.Hash != null).Select(k => (k.Hash!, k.GamePath)).Distinct().ToArray());
+            }
+
+            if (penumbraApplied && dataApplication.UpdateModdedPaths)
+            {
+                // 1.15.5.1703: snapshot for the sync info dump (read-only use).
+                var snapshot = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kv in moddedPathsData) snapshot[kv.Key] = kv.Value;
+                PSyncLastAppliedModPaths = snapshot;
+                PSyncLastAppliedSwapPaths = moddedPaths.Keys.Where(k => k.Hash == null).Select(k => k.GamePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                PSyncLastAppliedModPathsAt = DateTimeOffset.UtcNow;
+                // 1.15.5.1704: find the .scd paths their applied .tmb/.pap/.avfx play (background), then refresh the mute redirects.
+                PSyncStartReferenceScan(snapshot, PSyncLastAppliedSwapPaths!);
             }
 
             if (dataApplication.UpdateModdedPaths)

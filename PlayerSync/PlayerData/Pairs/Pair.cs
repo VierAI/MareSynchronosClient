@@ -62,6 +62,15 @@ public class Pair
     public DateTimeOffset LastDataApplicationTime => DataHandler?.LastDataApplicationTime ?? DateTimeOffset.MinValue;
     public IReadOnlyDictionary<ObjectKind, ConcurrentDictionary<PlayerChanges, double>>? DataApplicationTiming => DataHandler?.DataApplicationTiming;
     public ConcurrentDictionary<string, string> MissingFiles => DataHandler?.MissingFiles ?? [];
+    // 1.15.5.1703: last mod-file apply (game path -> file), for the sync info dump.
+    public IReadOnlyDictionary<string, string>? PSyncLastAppliedModPaths => DataHandler?.PSyncLastAppliedModPaths;
+    public IReadOnlySet<string>? PSyncLastAppliedSwapPaths => DataHandler?.PSyncLastAppliedSwapPaths;
+    public DateTimeOffset? PSyncLastAppliedModPathsAt => DataHandler?.PSyncLastAppliedModPathsAt;
+    // 1.15.5.1704: non-own sounds (PSyncForeignSounds)
+    public IReadOnlySet<string>? PSyncReferencedScdPaths => DataHandler?.PSyncReferencedScdPaths;
+    public IReadOnlyCollection<string> PSyncMuteRedirectPaths => DataHandler?.PSyncMuteRedirectPaths ?? [];
+    public void PSyncObserveForeignSound(string gamePath) => DataHandler?.PSyncObserveForeignSound(gamePath);
+    public void PSyncUpdateMuteRedirects() => DataHandler?.PSyncUpdateMuteRedirects();
     public long LastAppliedDataTris { get; set; } = -1;
     public long LastAppliedApproximateVRAMBytes { get; set; } = -1;
     public int LastAppliedCompressedAlternates { get; set; } = -1;

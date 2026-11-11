@@ -371,6 +371,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         }
 
         pair.UserPair.OtherPermissions = dto.Permissions;
+        pair.PSyncUpdateMuteRedirects(); // 1.15.5.1704: their sounds-disabled also covers non-own sounds
 
         Logger.LogTrace("Paused: {paused}, Anims: {anims}, Sounds: {sounds}, VFX: {vfx}",
             pair.UserPair.OtherPermissions.IsPaused(),
@@ -405,6 +406,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         // Fork: remember whether this change unmutes the pair, so the reapply below can restore their sound in full.
         var unmuted = pair.UserPair.OwnPermissions.IsDisableSounds() && !dto.Permissions.IsDisableSounds();
         pair.UserPair.OwnPermissions = dto.Permissions;
+        pair.PSyncUpdateMuteRedirects(); // 1.15.5.1704: mute also covers non-own sounds (VFX-bound, raw)
 
         Logger.LogTrace("Paused: {paused}, Anims: {anims}, Sounds: {sounds}, VFX: {vfx}",
             pair.UserPair.OwnPermissions.IsPaused(),

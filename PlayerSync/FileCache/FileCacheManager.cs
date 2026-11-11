@@ -42,6 +42,9 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
     private FileStoreRoots _fileStoreRoots = new(null, null);
     private DateTimeOffset _lastMemCacheUpdateTime = DateTimeOffset.MinValue;
     private DateTimeOffset _nextDatabaseBackupUtc = DateTimeOffset.MinValue;
+    // 1.15.5.1701 (VierAI, audit M2): backups are serialized by their own lock; the write lock is only taken when the DB is not in WAL mode.
+    private readonly SemaphoreSlim _databaseBackupSemaphore = new(1, 1);
+    private bool? _databaseIsWal;
 
 
     public FileCacheManager(ILogger<FileCacheManager> logger, IpcManager ipcManager, MareConfigService configService,
@@ -69,17 +72,26 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
         DatabaseStatus = (false, DatabaseState.Starting);
         _logger.LogInformation("Starting FileCacheManager");
 
-        await _databaseWriteSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
-
         var databaseWasReset = false;
+        // 1.15.5.1701: no backup copy may run while the DB file is restored or reset
+        await _databaseBackupSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var rebuildIfMissing = _configService.Current.InitialScanComplete && (_configService.Current.DataHasBeenMigratedToNewDb || !File.Exists(_oldDataFile));
-            databaseWasReset = await _db.StartAsync(cancellationToken, rebuildIfMissing).ConfigureAwait(false);
+            await _databaseWriteSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                var rebuildIfMissing = _configService.Current.InitialScanComplete && (_configService.Current.DataHasBeenMigratedToNewDb || !File.Exists(_oldDataFile));
+                databaseWasReset = await _db.StartAsync(cancellationToken, rebuildIfMissing).ConfigureAwait(false);
+                _databaseIsWal = null;
+            }
+            finally
+            {
+                _databaseWriteSemaphore.Release();
+            }
         }
         finally
         {
-            _databaseWriteSemaphore.Release();
+            _databaseBackupSemaphore.Release();
         }
 
         _startupCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -2325,6 +2337,8 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
                         return isPenumbra ? CacheMonitor.IsScannablePenumbraFile(path) : CacheMonitor.IsCacheFileName(path);
                     });
 
+                    // 1.15.5.1701 (VierAI, audit M3): count once. files.Count() in the progress line re-walked the whole tree after every batch.
+                    var totalFilesForThisStore = files.Count();
                     foreach (var batch in files.Chunk(5000))
                     {
                         await UpdateOrCreateFileCacheEntitiesByPathsAsync(batch.ToList(), store, cancellationToken, forceUpdate: true, maxDegreeOfParallelism: 8).ConfigureAwait(false);
@@ -2332,7 +2346,7 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
                         processedFiles += batch.Length;
                         processedFileForThisStore += batch.Length;
                         _logger.LogInformation("[DATABASE] Rebuild progress: {processed:N0} files processed thus far. Current store: {store} Store files: {curr:N0}/{total:N0}",
-                            processedFiles, store, processedFileForThisStore, files.Count());
+                            processedFiles, store, processedFileForThisStore, totalFilesForThisStore);
                     }
                 }
 
@@ -2342,7 +2356,8 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
 
             if (canBackUp)
             {
-                await RefreshDatabaseBackupAsync(cancellationToken, periodic: false).ConfigureAwait(false);
+                // 1.15.5.1701: a rebuilt DB is always backed up; otherwise a backup under an hour old is kept
+                await RefreshDatabaseBackupAsync(cancellationToken, periodic: false, force: databaseWasReset).ConfigureAwait(false);
             }
 
             DatabaseStatus = (false, DatabaseState.CacheInit);
@@ -2586,25 +2601,38 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
         }
     }
 
-    private async Task RefreshDatabaseBackupAsync(CancellationToken cancellationToken, bool periodic)
+    private async Task RefreshDatabaseBackupAsync(CancellationToken cancellationToken, bool periodic, bool force = false)
     {
-        if (periodic)
+        if (periodic && (!DatabaseStatus.IsReady || !_configService.Current.InitialScanComplete || DateTimeOffset.UtcNow < _nextDatabaseBackupUtc))
         {
-            if (!DatabaseStatus.IsReady || !_configService.Current.InitialScanComplete)
+            return;
+        }
+
+        // 1.15.5.1701 (VierAI, audit M2): keep a backup that is under an hour old, so a plugin start no longer copies the whole DB every time.
+        if (!force && IsDatabaseBackupFresh(out var backupDueUtc))
+        {
+            if (backupDueUtc > _nextDatabaseBackupUtc)
             {
-                return;
+                _nextDatabaseBackupUtc = backupDueUtc;
             }
 
-            if (!await _databaseWriteSemaphore.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            _logger.LogDebug("[DATABASE] FileCache.GOOD.bak is under an hour old, next refresh after {due:u}", backupDueUtc);
+            return;
+        }
+
+        if (periodic)
+        {
+            if (!await _databaseBackupSemaphore.WaitAsync(0, cancellationToken).ConfigureAwait(false))
             {
                 return;
             }
         }
         else
         {
-            await _databaseWriteSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await _databaseBackupSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        var holdsWriteLock = false;
         try
         {
             if (periodic && (!DatabaseStatus.IsReady || !_configService.Current.InitialScanComplete || DateTimeOffset.UtcNow < _nextDatabaseBackupUtc
@@ -2614,6 +2642,26 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
             }
 
             cancellationToken.ThrowIfCancellationRequested();
+
+            // 1.15.5.1701: VACUUM INTO only needs a read transaction. In WAL mode readers never block writers, so the copy runs without the
+            // write lock and downloads and tick flushes keep going. Any other journal mode keeps the old behavior (copy under the write lock).
+            _databaseIsWal ??= await IsDatabaseWalAsync(cancellationToken).ConfigureAwait(false);
+            if (_databaseIsWal != true)
+            {
+                if (periodic)
+                {
+                    if (!await _databaseWriteSemaphore.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    await _databaseWriteSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                holdsWriteLock = true;
+            }
 
             await _db.BackupDatabaseAsync(cancellationToken).ConfigureAwait(false);
 
@@ -2626,7 +2674,51 @@ public sealed class FileCacheManager : MediatorSubscriberBase, IHostedService, I
         }
         finally
         {
-            _databaseWriteSemaphore.Release();
+            if (holdsWriteLock)
+            {
+                _databaseWriteSemaphore.Release();
+            }
+
+            _databaseBackupSemaphore.Release();
+        }
+    }
+
+    // 1.15.5.1701: true when FileCache.GOOD.bak exists and is under an hour old (a timestamp in the future counts as stale)
+    private bool IsDatabaseBackupFresh(out DateTimeOffset dueUtc)
+    {
+        dueUtc = DateTimeOffset.MinValue;
+        var lastBackupUtc = _db.GetBackupTimeUtc();
+        if (lastBackupUtc == null)
+        {
+            return false;
+        }
+
+        var age = DateTimeOffset.UtcNow - new DateTimeOffset(DateTime.SpecifyKind(lastBackupUtc.Value, DateTimeKind.Utc));
+        if (age < TimeSpan.Zero || age >= TimeSpan.FromHours(1))
+        {
+            return false;
+        }
+
+        dueUtc = DateTimeOffset.UtcNow + (TimeSpan.FromHours(1) - age);
+        return true;
+    }
+
+    private async Task<bool> IsDatabaseWalAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var db = _db.CreateDbContext();
+            await db.Database.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            await using var command = db.Database.GetDbConnection().CreateCommand();
+            command.CommandText = "PRAGMA journal_mode;";
+            var mode = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
+            _logger.LogDebug("[DATABASE] Journal mode: {mode}", mode);
+            return string.Equals(mode, "wal", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogDebug(ex, "[DATABASE] Could not read the journal mode, the backup keeps the write lock");
+            return false;
         }
     }
 }

@@ -121,7 +121,7 @@ internal class NoiseMakersUi : WindowMediatorSubscriberBase
 
         var mainOpen = MainWindowOpen();
         if (mainOpen) _windowHovered = false;
-        _hoverFade = Approach(_hoverFade, _windowHovered ? 1f : 0f, step);
+        _hoverFade = Approach(_hoverFade, (_windowHovered || !MareSynchronos.Services.VierAIConfigStore.Current.NoisesOnlyShowOnHover) ? 1f : 0f, step); // 1706: hover-only is optional
     }
 
     public override bool DrawConditions() => _rows.Count > 0 && !MainWindowOpen();
@@ -247,6 +247,11 @@ internal class NoiseMakersUi : WindowMediatorSubscriberBase
         // Fork: fixed width (name column sized for a typical long name, NoiseNameFit.cs); longer names are clipped with an ellipsis.
         var rowWidth = speakerWidth + spacingX + NoiseNameFit.NameWidth() + (spacingX * 2) + pauseWidth; // 1210: no mute button (speaker toggles)
 
+        // 1706: gear opens Settings > Interface > Game UI (the Noises options).
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + rowWidth - _uiSharedService.GetIconSize(FontAwesomeIcon.Cog).X - (ImGui.GetStyle().FramePadding.X * 2));
+        if (_uiSharedService.IconButton(FontAwesomeIcon.Cog)) Mediator.Publish(new OpenSettingsGameUiMessage());
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Noises window settings");
+
         _hover.BeginFrame();
         foreach (var pair in rows)
         {
@@ -277,6 +282,8 @@ internal class NoiseMakersUi : WindowMediatorSubscriberBase
         ImGui.SameLine();
         ImGui.AlignTextToFramePadding();
         var (shownName, truncated) = NoiseNameFit.Fit(RowName(pair, muted), NoiseNameFit.NameWidth());
+        var glow = NoiseGlow.ColorFor(pair, _tracker, now); // 1706
+        if (glow != null) NoiseGlow.Draw(ImGui.GetCursorScreenPos() + new Vector2(0, ImGui.GetStyle().FramePadding.Y), shownName, glow.Value);
         ImGui.TextUnformatted(shownName);
         if (ImGui.IsItemHovered())
         {
@@ -286,7 +293,7 @@ internal class NoiseMakersUi : WindowMediatorSubscriberBase
         // Mute / unmute, pause (shared with the Noises folder in the main window).
         // Fork: buttons only while the window is hovered (not in its transparent monitoring state). When hidden, a same-height
         // placeholder keeps the row height, width and order unchanged.
-        var buttons = _windowHovered
+        var buttons = (_windowHovered || !MareSynchronos.Services.VierAIConfigStore.Current.NoisesOnlyShowOnHover)
             ? NoiseRowButtons.Draw(pair, endX, _uiSharedService, _apiController, Mediator)
             : NoiseRowButtons.Placeholder(endX, _uiSharedService);
         var buttonHovered = buttons.Hovered || speaker.Hovered;

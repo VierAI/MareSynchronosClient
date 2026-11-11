@@ -49,6 +49,7 @@ Everything in this section is VierAI's fork work, not part of the official Playe
 - *(in testing, 1417)* Settings > Sync: count of blocked files, with a button to clear them
 - *(in testing, 1424)* Help > Their Pair Data > Workload tab: how many pairs are online, visible, loaded, waiting, applying or paused, with total file size, estimated VRAM and triangles, and a sortable top list
 - *(in testing, 1423)* Local debug tools (only with 'Allow local debug tools to read pair info' on) can read per-pair file size, VRAM and triangle estimates
+- *(internal debug builds only, not in public releases)* Settings > Debug > "Dump all sync info" (or /psync dump): writes one local text file with every player and pair in view (permissions incl. sounds/animations/VFX off, noise state), the files received and applied per pair by type (game path -> file and source: PS cache, local mod, file swap or raw), what Penumbra has loaded on them now, recent sound (.scd, incl. VFX-bound under vfx/) and VFX/animation loads per object with a modded flag, and the sounds the game is playing right now matched to the nearest object. Read-only; mute behavior is unchanged
 
 #### Fixes
 
@@ -70,9 +71,17 @@ Everything in this section is VierAI's fork work, not part of the official Playe
 - *(in testing, 1417)* Crash-loop quarantine: files tied to repeated game crashes are held back, with a chat warning
 - *(in testing, 1421; 25 files 1425)* Mac/Wine: download batches are split into groups of at most 25 files, with a short pause between groups
 - *(in testing, 1426)* Mac/Wine: downloaded files are saved to the cache one at a time, with a short pause after each, to limit disk load
+- *(in testing, 1701)* Blocked files: a file cache database restore from its backup or a database reset no longer brings back cleared blocked files, loses the blocked list, or falsely quarantines files from stale apply markers
+- *(in testing, 1701)* Animation (.pap) check: the C198 SummonId warning no longer fires for the valid values 0 and 1 (upstream check was always true)
+- *(in testing, 1702)* Pair request list: hovering or right-clicking a request now targets the player who sent it even when their pair entry points at another character or they were not hashed yet (falls back to the request's ident, then the character name)
+- *(in testing, 1704)* Noises: sounds a pair's synced animations or VFX play under paths they did not sync (vanilla sounds, .scd under vfx/, raw not-redirected loads) now count as that pair's noise, not only their own synced .scd files
+- *(in testing, 1704)* Mute / sounds disabled now also silences those sounds for that pair only (redirected in their own Penumbra collection to a path that does not exist); other players and your own sounds are untouched
+- *(in testing, 1702)* Pair request list: Escape no longer hides it (it has no title bar, so it could not be found again); right-click a player who sent you a request and pick "View Pair Request" to open the list and target them, and the chat link now always opens it
 
 #### Performance
 
+- *(in testing, 1701)* File cache database backup: skipped at startup when the last backup is under an hour old, and no longer holds up downloads and cache writes while it copies
+- *(in testing, 1701)* Database rebuild: counts the files once instead of re-reading the whole folder tree after every batch
 - Pair data is applied across several frames instead of one
 - Lighter per-frame work for name plates, sound polling, the Noises list and the Penumbra callback
 - Logins and plugin start hash at most 8 new players per frame
