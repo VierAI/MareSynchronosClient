@@ -547,7 +547,7 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
         ImGui.InputText("Storage Folder##cache", ref cacheDirectory, 255, ImGuiInputTextFlags.ReadOnly);
 
         ImGui.SameLine();
-        using (ImRaii.Disabled(_cacheMonitor.PlayerSyncWatcher != null))
+        using (ImRaii.Disabled(_configService.Current.FirstTimeSetupComplete ? _cacheMonitor.PlayerSyncWatcher != null : _cacheMonitor.IsScanRunning))
         {
             if (IconButton(FontAwesomeIcon.Folder))
             {
@@ -585,17 +585,35 @@ public partial class UiSharedService : DisposableMediatorSubscriberBase
                         && !_isPenumbraDirectory
                         && !_isOneDrive
                         && !_cacheDirectoryHasOtherFilesThanCache
-                        && _cacheDirectoryIsValidPath)
+                        && _cacheDirectoryIsValidPath
+                        && (_configService.Current.FirstTimeSetupComplete || !_cacheMonitor.IsScanRunning))
                     {
+                        var defaultCompactorOn = !_configService.Current.FirstTimeSetupComplete && (string.IsNullOrWhiteSpace(_configService.Current.CacheFolder) 
+                            || (_cacheMonitor.PlayerSyncWatcher != null && !_cacheMonitor.StorageisNTFS));
+                        if (!_configService.Current.FirstTimeSetupComplete && !string.Equals(_configService.Current.CacheFolder, path, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _configService.Current.InitialScanComplete = false;
+                        }
+
                         _configService.Current.CacheFolder = path;
-                        _configService.Save();
                         _cacheMonitor.StartPlayerSyncWatcher(path);
+
+                        if (!OperatingSystem.IsWindows() || _dalamudUtil.IsWine)
+                        {
+                            _configService.Current.UseCompactor = false;
+                        }
+                        else if (_cacheMonitor.PlayerSyncWatcher != null)
+                        {
+                            _configService.Current.UseCompactor = _cacheMonitor.StorageisNTFS && (defaultCompactorOn || _configService.Current.UseCompactor);
+                        }
+
+                        _configService.Save();
                         _cacheMonitor.InvokeScan();
                     }
                 }, _dalamudUtil.IsWine ? @"Z:\" : @"C:\");
             }
         }
-        if (_cacheMonitor.PlayerSyncWatcher != null)
+        if (_configService.Current.FirstTimeSetupComplete && _cacheMonitor.PlayerSyncWatcher != null)
         {
             AttachToolTip("Stop the Monitoring before changing the Storage folder. As long as monitoring is active, you cannot change the Storage folder location.");
         }

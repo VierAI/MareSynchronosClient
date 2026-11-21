@@ -27,14 +27,20 @@ internal static class NoiseRowButtons
     public static float Width(UiSharedService ui) => PauseWidth(ui);
 
     /// <summary>Mute/unmute toggle (same as the old mute button): a pair permission stored on the server, so it stays when the
-    /// player unloads and comes back. Muting marks the permission sticky (preferred), like the permission window does.</summary>
-    public static void ToggleMute(Pair pair, ApiController api)
+    /// player unloads and comes back. Muting marks the permission sticky (preferred), like the permission window does.
+    /// 1.15.6.205: <paramref name="auto"/> false = a click by you: the pair leaves the blacklist auto-mute tracking, so an
+    /// auto-unmute never undoes or overrides what you chose by hand.</summary>
+    public static void ToggleMute(Pair pair, ApiController api, bool auto = false)
     {
         var perm = pair.UserPair!.OwnPermissions;
         var muted = perm.IsDisableSounds();
+        // 1.15.6.207: before the server echo, whose redirect refresh (PairManager) then drops this pair's blacklist silencing.
+        if (!auto) NoiseAutoMute.OnManualChange(pair.UserData.UID, unmuting: muted);
         if (!muted) perm.SetSticky(true);
         perm.SetDisableSounds(!muted);
-        _ = api.UserSetPairPermissions(new(pair.UserData, perm));
+        // 1.15.6.209: an automatic send is marked so its echo is not taken for a manual unmute (NoiseAutoMute.OnUnmuteConfirmed).
+        if (auto) { using (NoiseAutoMute.AutoSendScope()) _ = api.UserSetPairPermissions(new(pair.UserData, perm)); }
+        else _ = api.UserSetPairPermissions(new(pair.UserData, perm));
     }
 
     /// <summary>

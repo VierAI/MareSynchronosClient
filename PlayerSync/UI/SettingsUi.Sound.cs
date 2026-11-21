@@ -16,9 +16,9 @@ public partial class SettingsUi
         var store = MareSynchronos.Services.VierAIConfigStore.Current;
         store.NoiseGlowRules ??= MareSynchronos.Services.NoiseGlowRule.Defaults();
         var rules = store.NoiseGlowRules;
-        ImGui.TextUnformatted("Noises name glow while playing");
+        ImGui.TextUnformatted("Custom Noises name glow colors");
         _uiShared.DrawHelpText("A player's name in the Noises window glows in the rule's color while they play a sound whose file name contains the text (not case-sensitive)." + Environment.NewLine +
-            "The first matching rule wins. Defaults: plap = red, bpmloop = green.");
+            "The first matching rule wins. The Noises filter whitelist (green) and blacklist (red) come first; no custom rules by default.");
         var remove = -1;
         for (var i = 0; i < rules.Count; i++)
         {
@@ -39,7 +39,7 @@ public partial class SettingsUi
         if (remove >= 0) { rules.RemoveAt(remove); MareSynchronos.Services.VierAIConfigStore.MarkDirty(); }
         if (ImGui.Button("Add glow rule")) { rules.Add(new MareSynchronos.Services.NoiseGlowRule { Match = "", Color = 0xFFFFAA00 }); MareSynchronos.Services.VierAIConfigStore.MarkDirty(); }
         ImGui.SameLine();
-        if (ImGui.Button("Reset glow rules")) { store.NoiseGlowRules = MareSynchronos.Services.NoiseGlowRule.Defaults(); MareSynchronos.Services.VierAIConfigStore.MarkDirty(); }
+        if (ImGui.Button("Clear glow rules")) { store.NoiseGlowRules = []; MareSynchronos.Services.VierAIConfigStore.MarkDirty(); }
     }
 
     private void DrawSoundActivitySettings()
@@ -76,7 +76,38 @@ public partial class SettingsUi
         _uiShared.DrawHelpText("On: the Noises window's background, title and buttons stay invisible until you hover it (names still show)." + Environment.NewLine +
             "Off (default): the window stays fully visible.");
 
+        // 1.15.6.202
+        var hideGameMuted = MareSynchronos.Services.VierAIConfigStore.Current.NoisesHideGameMutedChannels;
+        if (ImGui.Checkbox("Hide noises on game sound channels you muted", ref hideGameMuted))
+        {
+            MareSynchronos.Services.VierAIConfigStore.Current.NoisesHideGameMutedChannels = hideGameMuted;
+            MareSynchronos.Services.VierAIConfigStore.MarkDirty();
+        }
+        _uiShared.DrawHelpText("On (default): a player drops out of the Noises window and folder while every sound they just played is on a channel" +
+            " you muted or set to 0 in the game's Sound settings (Sound Effects, Voice, System Sounds, BGM, Ambient), or while Master is muted." + Environment.NewLine +
+            "They come back as soon as you unmute that channel. The channel comes from the sound file itself (its bus number), so a mod" +
+            " can play on System Sounds even if it sounds like an effect. Sounds whose channel is unknown are always shown." + Environment.NewLine +
+            "Hover a name in the Noises window to see each sound's channel.");
+
+        // 1.15.6.203: Noises filter (same editor as the filter button in the Noises window title bar).
+        ImGui.TextUnformatted("Noises filter");
+        _uiShared.DrawHelpText("Words matched against sound file names (not case-sensitive). Whitelist words glow green, blacklist words glow red" +
+            " (blacklist wins). Also in the Noises window: the filter button in its title bar.");
+        using (ImRaii.PushIndent())
+        {
+            MareSynchronos.UI.Components.NoiseFilterEditor.Draw(_uiShared, "set");
+        }
+
         DrawNoiseGlowRules();
+
+        var expire = Math.Clamp(MareSynchronos.Services.VierAIConfigStore.Current.NoisesRecentExpireMinutes, 1, 60);
+        ImGui.SetNextItemWidth(250 * Dalamud.Interface.Utility.ImGuiHelpers.GlobalScale);
+        if (ImGui.SliderInt("Recent sounds expire after (minutes)", ref expire, 1, 60))
+        {
+            MareSynchronos.Services.VierAIConfigStore.Current.NoisesRecentExpireMinutes = Math.Clamp(expire, 1, 60);
+            MareSynchronos.Services.VierAIConfigStore.MarkDirty();
+        }
+        _uiShared.DrawHelpText("Recently played sounds in the Noises tooltips drop off after this many minutes. 1 to 60, default 5.");
 
         var fadeSeconds = Math.Clamp(MareSynchronos.Services.VierAIConfigStore.Current.NoisesFadeSeconds, 10, 300);
         ImGui.SetNextItemWidth(250 * Dalamud.Interface.Utility.ImGuiHelpers.GlobalScale);

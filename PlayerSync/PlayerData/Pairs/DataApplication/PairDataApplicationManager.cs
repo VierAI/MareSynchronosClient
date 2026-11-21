@@ -56,11 +56,28 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
         _dalamudUtilService = dalamudUtilService;
         _ipcManager = ipcManager;
         _pairManager = pairManager;
+        // 1.15.6.213: the default went from 10 to 20 (pair loading is split per priority tier). A saved value still at the old
+        // default is raised once; any other value is kept, and a later choice of 10 is not touched again.
+        if (!MareSynchronos.Services.VierAIConfigStore.Current.PairLoadingDefault20Applied)
+        {
+            if (_configurationService.Current.MaxConcurrentApplications == 10)
+            {
+                _configurationService.Current.MaxConcurrentApplications = 20;
+                _configurationService.Save();
+                logger.LogInformation("Pair loading: raised the old default 10 to the new default 20");
+            }
+            MareSynchronos.Services.VierAIConfigStore.Current.PairLoadingDefault20Applied = true;
+            MareSynchronos.Services.VierAIConfigStore.MarkDirty();
+        }
         _maxConcurrentApplyData = _configurationService.Current.MaxConcurrentApplications < 1 ? 1 : _configurationService.Current.MaxConcurrentApplications;
 
         Mediator.Subscribe<ReapplyCachedPairDataMessage>(this, (msg) => { ResetBackoff(msg.Pair); _ = ReapplyCachedPairData(msg.Pair, msg.Force); });
         // 1706: texture cap made smaller copies for a visible pair; re-apply so they are swapped in now.
         Mediator.Subscribe<TextureCapReadyMessage>(this, (msg) => _pairManager.GetVisiblePairs().FirstOrDefault(x => string.Equals(x.UserData.UID, msg.Uid, StringComparison.Ordinal))?.ReapplyCachedData(forced: true));
+        // 1.15.6.219: a pair came back after a reconnect without new data from the server: queue its kept data like received data.
+        // 1.15.6.220: take the kept data only now, under the same lock server data uses to drop it, and skip when the pair is paused
+        // or already has data (cached, queued, deferred or running), so the older kept copy never replaces newer server data.
+        Mediator.Subscribe<PSyncRestoreKeptPairDataMessage>(this, (msg) => PSyncRestoreKeptData(msg.Pair));
         Mediator.Subscribe<DisconnectedMessage>(this, (_) =>
         {
             _isConnected = false;
@@ -139,13 +156,48 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
         || !_ipcManager.Penumbra.APIAvailable
         || !_ipcManager.Glamourer.APIAvailable;
 
-    public void ProcessIncommingCharacterDataDto(OnlineUserCharaDataDto dto)
+    private readonly object _psyncRestoreLock = new();
+
+    /// <summary>1.15.6.220: reconnect restore. Taking the kept data and queueing it happen under the lock that server data takes to
+    /// drop it, so server data either drops it first (no restore) or queues after it with a higher sequence (server data wins).</summary>
+    private void PSyncRestoreKeptData(Pair pair)
+    {
+        lock (_psyncRestoreLock)
+        {
+            if (pair.IsPaused || pair.HasCachedData || PSyncHasFullDataPending(pair)) return;
+            var data = _pairManager.PSyncTakeReconnectStash(pair.UserData.UID);
+            if (data == null) return;
+            Logger.LogInformation("Reconnect: re-applying the last data of {pair}", pair.PairUIDName);
+            ProcessIncommingCharacterDataDto(new OnlineUserCharaDataDto(pair.UserData, data), fromReconnectStash: true);
+        }
+    }
+
+    private bool PSyncHasFullDataPending(Pair pair)
+    {
+        lock (_applyDataLock)
+        {
+            if (_runningApplyDataTasks.Contains(pair)) return true;
+            if (_applyQueuedDataQueue.TryGetValue(pair, out var q) && q.Dto.AddonPlugin == null) return true;
+        }
+        return _deferredPairDataApplications.TryGetValue(pair, out var d) && d.Dto.AddonPlugin == null;
+    }
+
+    public void ProcessIncommingCharacterDataDto(OnlineUserCharaDataDto dto, bool fromReconnectStash = false)
     {
         if (!_pairManager.TryGetPairByUserData(dto.User, out var pair) || pair == null)
         {
             // Fork: data for a pair we no longer have (unpaired or left the shell mid-flight, or a reconnect race). Drop it.
+            // 1.15.6.220: full data is kept for the reconnect restore instead of the older kept copy (used only if the pair appears).
+            if (!fromReconnectStash && dto.AddonPlugin == null)
+            {
+                lock (_psyncRestoreLock) _pairManager.PSyncKeepServerDataForRestore(dto.User.UID, dto.CharaData);
+            }
             Logger.LogDebug("Dropping character data for unknown pair {uid}", dto.User.UID);
             return;
+        }
+        if (!fromReconnectStash && dto.AddonPlugin == null)
+        {
+            lock (_psyncRestoreLock) _pairManager.PSyncDropReconnectStash(dto.User.UID); // 1.15.6.219: server data is newer (1.15.6.220: locked)
         }
 
         CharacterDataApplication queuedData;
@@ -487,6 +539,33 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
     }
 
     // This runs through the queue and kicks off the data application task per queued pair entry
+    /// <summary>1.15.6.213: queue index of the next pair to load: queue order, skipping running pairs and pairs whose tier is
+    /// at its share of <see cref="_maxConcurrentApplyData"/> (TierSlots; no split below 5). -1 when none may start.</summary>
+    private int PSyncNextApplyIndexLocked()
+    {
+        var running = new int[MareSynchronos.WebAPI.Files.TierSlots.Tiers];
+        var demand = new int[MareSynchronos.WebAPI.Files.TierSlots.Tiers];
+        foreach (var p in _runningApplyDataTasks) running[MareSynchronos.WebAPI.Files.TierSlots.Clamp(MareSynchronos.WebAPI.Files.PriorityWorkGate.SafeTier(p))]++;
+        var queuedTiers = new int[_applyDataQueue.Count];
+        for (var i = 0; i < _applyDataQueue.Count; i++)
+        {
+            var p = _applyDataQueue[i];
+            if (_runningApplyDataTasks.Contains(p)) { queuedTiers[i] = -1; continue; }
+            var t = MareSynchronos.WebAPI.Files.TierSlots.Clamp(MareSynchronos.WebAPI.Files.PriorityWorkGate.SafeTier(p));
+            queuedTiers[i] = t;
+            demand[t]++;
+        }
+        for (var t = 0; t < demand.Length; t++) demand[t] += running[t];
+        var allow = _maxConcurrentApplyData == 0 ? null : MareSynchronos.WebAPI.Files.TierSlots.Allowances(_maxConcurrentApplyData, demand);
+        for (var i = 0; i < queuedTiers.Length; i++)
+        {
+            var t = queuedTiers[i];
+            if (t < 0) continue;
+            if (allow == null || running[t] < allow[t]) return i;
+        }
+        return -1;
+    }
+
     private async Task ProcessApplyDataQueue(CancellationToken cancellationToken)
     {
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
@@ -511,7 +590,8 @@ public sealed class PairDataApplicationManager : DisposableMediatorSubscriberBas
                         while (_applyDataQueue.Count > 0 && (_maxConcurrentApplyData == 0 || _runningApplyDataTasks.Count < _maxConcurrentApplyData))
                         {
                             // find the next pair in the queu that is not already running
-                            var index = _applyDataQueue.FindIndex(pair => !_runningApplyDataTasks.Contains(pair));
+                            // 1.15.6.213: and whose priority tier is below its share of the pair loading slots (TierSlots).
+                            var index = PSyncNextApplyIndexLocked();
 
                             if (index < 0)
                             {

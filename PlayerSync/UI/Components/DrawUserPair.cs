@@ -473,6 +473,16 @@ public class DrawUserPair
         {
             userPairText += Environment.NewLine + "Files from: " + psyncOrigin;
         }
+        // 1.15.6.215: blocked files skipped for this pair (Settings > Sync > Filtering > Blocked files list can unblock each one).
+        var psyncSkipped = _pair.PSyncGetSkippedBadFiles();
+        if (psyncSkipped.Count > 0)
+        {
+            userPairText += UiSharedService.TooltipSeparator + $"Blocked files skipped ({psyncSkipped.Count}):";
+            foreach (var skipped in psyncSkipped.Take(8))
+                userPairText += Environment.NewLine + "  " + Path.GetFileName(skipped.Value);
+            if (psyncSkipped.Count > 8) userPairText += Environment.NewLine + $"  and {psyncSkipped.Count - 8} more";
+            userPairText += Environment.NewLine + "Unblock in Settings > Sync > Filtering > Blocked files list";
+        }
 
         if (_syncedGroups.Any())
         {

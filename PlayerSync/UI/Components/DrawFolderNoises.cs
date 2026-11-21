@@ -52,6 +52,8 @@ public class DrawFolderNoises
         {
             if (pair.UserPair == null || pair.IsPaused || pair.SoundStateSince == null) continue;
             if (!SoundActivity.IsListedOrMuted(pair, now)) continue;
+            if (pair.UserPair.OwnPermissions.IsDisableSounds() && NoiseAutoMute.IsTracked(pair.UserData.UID)) continue; // 1.15.6.206
+            if (SoundChannelLog.HiddenByGameMute(pair.UserData.UID, now)) continue; // 1.15.6.202
             if (!_mutedLinger.Keep(pair.UserData.UID, pair.UserPair.OwnPermissions.IsDisableSounds(), now)) continue;
             rows.Add(pair);
         }

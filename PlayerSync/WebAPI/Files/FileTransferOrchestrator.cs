@@ -53,6 +53,7 @@ public class FileTransferOrchestrator : DisposableMediatorSubscriberBase
     {
         _priorityQueue = priorityQueue;
         _priorityQueue.SetSlotAcquirer(() => _downloadSemaphore.Wait(0));
+        _priorityQueue.SetSlotLimit(() => EffectiveDownloadLimit(_mareConfig.Current.ParallelDownloads)); // 1.15.6.213 per-tier split
         _mareConfig = mareConfig;
         _tokenProvider = tokenProvider;
         _httpClientProvider = httpClientProvider;

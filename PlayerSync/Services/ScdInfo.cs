@@ -1,3 +1,5 @@
+using Dalamud.Plugin.Services;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 
 namespace MareSynchronos.Services;
@@ -6,7 +8,9 @@ namespace MareSynchronos.Services;
 /// <param name="Valid">False when the file is missing, unreadable or has no playable audio entry: the load failed.</param>
 /// <param name="Looped">Any audio entry has loop points.</param>
 /// <param name="Seconds">Estimated length of the longest audio entry.</param>
-public readonly record struct ScdClass(bool Valid, bool Looped, double Seconds)
+/// <param name="Channels">1.15.6.202: mixer channel(s) from the sound entries' bus numbers (None = not read / no sound entry).</param>
+/// <param name="UnmappedBus">1.15.6.205: first bus number with no known channel (shown as "bus N" instead of "?"), -1 = none.</param>
+public readonly record struct ScdClass(bool Valid, bool Looped, double Seconds, SoundChannels Channels = SoundChannels.None, int UnmappedBus = -1)
 {
     /// <summary>Long enough to count as a song (DJ music etc.).</summary>
     public bool Long => Seconds >= ScdInfo.SustainedSeconds;
@@ -68,34 +72,82 @@ public static class ScdInfo
     private static ScdClass Read(string filePath)
     {
         if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath)) return ScdClass.Failed;
-        byte[] b;
-        using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var r = new ScdReader(fs);
+        return Parse(r);
+    }
+
+    // ---- 1.15.6.205: game files (not on disk) ----
+
+    private static IDataManager? s_gameData;
+    private const string GameKeyPrefix = "game:";
+
+    /// <summary>Set once from the plugin constructor: lets a sound that is not on disk be checked against the game data.</summary>
+    public static void AttachGameData(IDataManager? dataManager) => s_gameData = dataManager;
+
+    /// <summary>Cached answer for a game path (not on disk), or null if it was not checked yet.</summary>
+    public static ScdClass? TryGetGameInfo(string gamePath) => s_cache.TryGetValue(GameKeyPrefix + gamePath, out var v) ? v : null;
+
+    /// <summary>
+    /// 1.15.6.205: a sound request whose file is not on disk. Missing from the game data = the load failed and nothing
+    /// played (custom mod paths the player's data does not contain, Penumbra logs "Failed to load resource"): Failed.
+    /// Present = a real game file: its header is read from the game data, so the channel comes from its real bus number
+    /// instead of a guess from the path. Both answers are cached (game data does not change while the game runs).
+    /// Without game data access the old behaviour stays: a short sound, channel by path.
+    /// </summary>
+    public static Task<ScdClass> ClassifyGameFileAsync(string gamePath) => Task.Run(() =>
+    {
+        var key = GameKeyPrefix + gamePath;
+        if (s_cache.TryGetValue(key, out var cached)) return cached;
+        var dm = s_gameData;
+        if (dm == null) return new ScdClass(true, false, 0);
+        ScdClass info;
+        try
         {
-            b = new byte[Math.Min(HeaderBytes, fs.Length)];
-            var read = 0;
-            while (read < b.Length)
+            var path = NormalizePath(gamePath).Replace('\\', '/').ToLowerInvariant();
+            if (!dm.FileExists(path)) info = ScdClass.Failed;
+            else
             {
-                var n = fs.Read(b, read, b.Length - read);
-                if (n <= 0) break;
-                read += n;
+                var data = dm.GetFile(path)?.Data;
+                if (data == null) info = ScdClass.Failed;
+                else
+                {
+                    using var r = new ScdReader(data);
+                    info = Parse(r);
+                }
             }
         }
-        if (b.Length < 0x40 || !System.Text.Encoding.ASCII.GetString(b, 0, 8).Equals("SEDBSSCF", StringComparison.Ordinal)) return ScdClass.Failed;
+        catch
+        {
+            return new ScdClass(true, false, 0); // could not check: keep the old "short sound, channel by path" answer, uncached
+        }
+        if (s_cache.Count >= MaxCacheEntries) s_cache.Clear();
+        s_cache[key] = info;
+        return info;
+    });
 
-        int count = BitConverter.ToUInt16(b, 0x32);
-        var list = (int)BitConverter.ToUInt32(b, 0x3C);
+    // ---- header parsing ----
+
+    /// <summary>Upper bounds against corrupt headers.</summary>
+    private const int MaxAudioEntries = 4096;
+    private const int MaxSoundEntries = 1024;
+
+    private static ScdClass Parse(ScdReader r)
+    {
+        if (r.Length < 0x40 || !r.IsMagic()) return ScdClass.Failed;
+        if (!r.U16(0x32, out var count) || !r.U32(0x3C, out var listU)) return ScdClass.Failed;
+        long list = listU;
         var any = false;
         var looped = false;
         double longest = 0;
-        for (var i = 0; i < count && list + (4 * i) + 4 <= b.Length; i++)
+        for (var i = 0; i < count && i < MaxAudioEntries; i++)
         {
-            var e = (int)BitConverter.ToUInt32(b, list + (4 * i));
-            if (e <= 0 || e + 0x20 > b.Length) continue;
-            var length = BitConverter.ToUInt32(b, e);
-            var channels = BitConverter.ToUInt32(b, e + 4);
-            var rate = BitConverter.ToUInt32(b, e + 8);
-            var format = BitConverter.ToUInt32(b, e + 12);
-            var loopEnd = BitConverter.ToUInt32(b, e + 0x14);
+            if (!r.U32(list + (4L * i), out var eU)) break;
+            long e = eU;
+            if (e <= 0 || e + 0x20 > r.Length) continue;
+            // 1.15.6.205: entries past the first 16 KB are read from the file instead of being skipped.
+            if (!r.U32(e, out var length) || !r.U32(e + 4, out var channels) || !r.U32(e + 8, out var rate)
+                || !r.U32(e + 12, out var format) || !r.U32(e + 0x14, out var loopEnd)) continue;
             if (format == uint.MaxValue || length == 0) continue;
             any = true;
             // A loop marker counts as continuous no matter how short (VierAI 2026-10-25).
@@ -108,6 +160,123 @@ public static class ScdInfo
             longest = Math.Max(longest, seconds);
         }
         // Header without any audio entry (e.g. a file that is only a placeholder) is treated like an ordinary one-shot.
-        return any ? new ScdClass(true, looped, longest) : new ScdClass(true, false, 0);
+        var (mixer, unmapped) = ReadChannels(r);
+        return any ? new ScdClass(true, looped, longest, mixer, unmapped) : new ScdClass(true, false, 0, mixer, unmapped);
+    }
+
+    /// <summary>1.15.6.202: sound entry table (offset list right after the 0x20-byte offsets header): byte 1 of each entry is the bus number.
+    /// 1.15.6.205: also returns the first bus number that has no mapped channel (-1 = none), and reads entries past 16 KB.</summary>
+    private static (SoundChannels Channels, int UnmappedBus) ReadChannels(ScdReader r)
+    {
+        try
+        {
+            int hs = r.I16(0x0E, out var h) ? h : 0;
+            if (hs <= 0 || hs + 0x20 > r.Length) hs = 0x30;
+            if (!r.I16(hs, out var soundCount)) return (SoundChannels.None, -1);
+            long list = hs + 0x20;
+            var ch = SoundChannels.None;
+            var unmapped = -1;
+            for (var i = 0; i < soundCount && i < MaxSoundEntries; i++)
+            {
+                if (!r.I32(list + (4L * i), out var o)) break;
+                if (o <= 0 || o + 2 > r.Length) continue;
+                if (!r.U8(o + 1, out var bus)) continue;
+                var c = SoundChannelMap.FromBus(bus);
+                if (c == SoundChannels.Unknown && unmapped < 0) unmapped = bus;
+                ch |= c;
+            }
+            return (ch, unmapped);
+        }
+        catch { return (SoundChannels.None, -1); }
+    }
+
+    /// <summary>
+    /// 1.15.6.205: SCD bytes. The first <see cref="HeaderBytes"/> are read once; anything past them (entries of a large file
+    /// whose tables or later audio entries sit beyond 16 KB) is read from the stream on demand. In-memory data (game files)
+    /// is used as is.
+    /// </summary>
+    private sealed class ScdReader : IDisposable
+    {
+        private readonly byte[] _head;
+        private readonly Stream? _stream;
+        public long Length { get; }
+
+        public ScdReader(byte[] data) { _head = data; Length = data.Length; }
+
+        public ScdReader(Stream stream)
+        {
+            _stream = stream;
+            Length = stream.Length;
+            _head = new byte[(int)Math.Min(HeaderBytes, Length)];
+            var read = 0;
+            while (read < _head.Length)
+            {
+                var n = stream.Read(_head, read, _head.Length - read);
+                if (n <= 0) break;
+                read += n;
+            }
+            if (read < _head.Length) Array.Resize(ref _head, read);
+        }
+
+        public bool IsMagic() => _head.Length >= 8 && System.Text.Encoding.ASCII.GetString(_head, 0, 8).Equals("SEDBSSCF", StringComparison.Ordinal);
+
+        private bool Bytes(long offset, Span<byte> dst)
+        {
+            if (offset < 0 || offset + dst.Length > Length) return false;
+            if (offset + dst.Length <= _head.Length) { _head.AsSpan((int)offset, dst.Length).CopyTo(dst); return true; }
+            if (_stream == null) return false;
+            _stream.Position = offset;
+            var read = 0;
+            while (read < dst.Length)
+            {
+                var n = _stream.Read(dst[read..]);
+                if (n <= 0) return false;
+                read += n;
+            }
+            return true;
+        }
+
+        public bool U8(long o, out byte v)
+        {
+            Span<byte> s = stackalloc byte[1];
+            v = 0;
+            if (!Bytes(o, s)) return false;
+            v = s[0];
+            return true;
+        }
+        public bool U16(long o, out ushort v)
+        {
+            Span<byte> s = stackalloc byte[2];
+            v = 0;
+            if (!Bytes(o, s)) return false;
+            v = BinaryPrimitives.ReadUInt16LittleEndian(s);
+            return true;
+        }
+        public bool I16(long o, out short v)
+        {
+            Span<byte> s = stackalloc byte[2];
+            v = 0;
+            if (!Bytes(o, s)) return false;
+            v = BinaryPrimitives.ReadInt16LittleEndian(s);
+            return true;
+        }
+        public bool U32(long o, out uint v)
+        {
+            Span<byte> s = stackalloc byte[4];
+            v = 0;
+            if (!Bytes(o, s)) return false;
+            v = BinaryPrimitives.ReadUInt32LittleEndian(s);
+            return true;
+        }
+        public bool I32(long o, out int v)
+        {
+            Span<byte> s = stackalloc byte[4];
+            v = 0;
+            if (!Bytes(o, s)) return false;
+            v = BinaryPrimitives.ReadInt32LittleEndian(s);
+            return true;
+        }
+
+        public void Dispose() { } // the stream belongs to the caller
     }
 }

@@ -76,8 +76,16 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
         IsOpen = true;
 
-        Mediator.Subscribe<DownloadStartedMessage>(this, (msg) => _currentDownloads[msg.BatchInfo] = msg.DownloadStatus);
-        Mediator.Subscribe<DownloadFinishedMessage>(this, (msg) => _currentDownloads.TryRemove(msg.BatchInfo, out _));
+        Mediator.Subscribe<DownloadStartedMessage>(this, (msg) =>
+        {
+            _rowOrder.TryAdd(msg.BatchInfo, Interlocked.Increment(ref _rowSequence)); // 1.15.6.213: stable order within a tier
+            _currentDownloads[msg.BatchInfo] = msg.DownloadStatus;
+        });
+        Mediator.Subscribe<DownloadFinishedMessage>(this, (msg) =>
+        {
+            _currentDownloads.TryRemove(msg.BatchInfo, out _);
+            _rowOrder.TryRemove(msg.BatchInfo, out _);
+        });
         Mediator.Subscribe<GposeStartMessage>(this, (_) => IsOpen = false);
         Mediator.Subscribe<GposeEndMessage>(this, (_) => IsOpen = true);
         Mediator.Subscribe<PlayerUploadingMessage>(this, (msg) =>
@@ -480,12 +488,21 @@ public class DownloadUi : WindowMediatorSubscriberBase
 
     // The transfers shown in the list: batches with a file downloading or decompressing right now (at most ParallelDownloads).
     // Everything else (waiting for a slot) is only counted.
+    // 1.15.6.213: rows sorted by the player's priority tier (best first, see PriorityTiers), then by when their transfer
+    // started, so a player whose tier rises (priority list, friend, party) moves to the top on the next frame.
+    private readonly ConcurrentDictionary<DownloadBatchInfo, long> _rowOrder = new();
+    private long _rowSequence;
+
     private List<KeyValuePair<DownloadBatchInfo, ConcurrentDictionary<string, FileDownloadStatus>>> ActiveRows(out int waiting)
     {
         var rows = new List<KeyValuePair<DownloadBatchInfo, ConcurrentDictionary<string, FileDownloadStatus>>>();
         waiting = 0;
         var cap = Math.Max(1, _configService.Current.ParallelDownloads);
-        foreach (var item in _currentDownloads)
+        var sorted = _currentDownloads
+            .Select(item => (Item: item, Tier: SafeTier(item.Key), Seq: _rowOrder.TryGetValue(item.Key, out var s) ? s : long.MaxValue))
+            .OrderBy(x => x.Tier).ThenBy(x => x.Seq)
+            .Select(x => x.Item);
+        foreach (var item in sorted)
         {
             // Fork: a started transfer stays listed between file groups instead of dropping to '+N waiting' for a moment.
             var active = item.Value.Any(c => c.Value.DownloadStatus is DownloadStatus.Downloading or DownloadStatus.Decompressing)
@@ -495,6 +512,12 @@ public class DownloadUi : WindowMediatorSubscriberBase
         }
 
         return rows;
+    }
+
+    private int SafeTier(DownloadBatchInfo batch)
+    {
+        try { return _priorityQueue.GetTier(batch); }
+        catch { return MareSynchronos.WebAPI.Files.PriorityTiers.Everyone; }
     }
 
     // "+N waiting"; null when nobody is waiting.

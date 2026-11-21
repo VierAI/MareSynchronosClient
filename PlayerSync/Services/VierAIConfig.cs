@@ -26,13 +26,35 @@ public class VierAIConfig
     public bool NoisesOnlyShowOnHover { get; set; } = false;
 
     // 1706: glow on a Noises row's name while that player plays a sound whose file name contains Match (case-insensitive).
-    public List<NoiseGlowRule> NoiseGlowRules { get; set; } = NoiseGlowRule.Defaults();
+    // 1.15.6.203: custom glow colors only; plap/bpmloop moved to the Noises filter lists below (old default rules are migrated).
+    public List<NoiseGlowRule> NoiseGlowRules { get; set; } = [];
+
+    // 1.15.6.203: Noises filter. File-name words: whitelist = green highlight, blacklist = red highlight.
+    public List<string> NoisesWhitelist { get; set; } = NoiseFilter.DefaultWhitelist();
+    public List<string> NoisesBlacklist { get; set; } = NoiseFilter.DefaultBlacklist();
+    // 1.15.6.203: mute (per-pair sound mute) a player when a blacklisted sound loads for them.
+    // 1.15.6.218: on by default (blocking blacklisted sounds is the point of the blacklist; it can still be turned off).
+    public bool NoisesAutoMuteBlacklisted { get; set; } = true;
+    // 1.15.6.218: the one-time switch of NoisesAutoMuteBlacklisted to on for existing configs was done. Turning it off later stays off.
+    public bool NoisesAutoMuteDefaultOnApplied { get; set; } = false;
+    // 1.15.6.204: unmute a player you muted when they play a whitelisted sound (blacklist wins). Off by default.
+    public bool NoisesAutoUnmuteWhitelisted { get; set; } = false;
+    // 1.15.6.213: the one-time raise of pair loading from the old default 10 to 20 was done (or found another value).
+    public bool PairLoadingDefault20Applied { get; set; } = false;
+    // 1.15.6.205: players muted by the blacklist auto-mute (not by hand) that are still muted; lifted after the banned sound
+    // goes quiet. Saved so a plugin reload doesn't turn an auto-mute into a permanent one.
+    public List<string> NoisesAutoMutedUids { get; set; } = new();
+    // 1.15.6.203: recently played sound entries (Noises tooltips) expire after this many minutes (1-60).
+    public int NoisesRecentExpireMinutes { get; set; } = 5;
 
     // Seconds a noise entry takes to fade out and drop from the Noises window / folder (10-300).
     public int NoisesFadeSeconds { get; set; } = 60;
 
     // Seconds a muted row stays in the Noises window after the mouse last hovered it (5-300).
     public int NoisesMutedHideSeconds { get; set; } = 15;
+
+    // 1.15.6.202: hide Noises entries whose sounds only play on game sound channels you muted (or set to 0), or when Master is off.
+    public bool NoisesHideGameMutedChannels { get; set; } = true;
 
 
     // 1.15.5.1210: Auto sync nearby animations (AutoAnimationSync): restart both looping emotes when a nearby pair and you
@@ -59,6 +81,10 @@ public class VierAIConfig
 
     // After a redraw, wait for the skeleton (max ~3s) and apply Customize+ scale and Heels once more. Off = upstream behavior.
     public bool ReapplyScaleAfterRedraw { get; set; } = true;
+
+    // 1.15.6.215: after a pair's apply settles, check their body, legs, head and face models; if one is missing or failed to load,
+    // reapply their last data once (5 s) and once more (30 s later). At most 2 tries per pair per data version. Off = no auto reapply.
+    public bool AutoHealMissingParts { get; set; } = true;
 
     // Download priority (were in playerperformance.json)
     // Priority tiers (schema 3): tier 0 = UIDsToPrioritize, tier 1 = in-game friends, tier 2 = party members, tier 3 = direct syncs, tier 4 = everyone else. All always on;
@@ -254,6 +280,19 @@ public static class VierAIConfigStore
                 _dirty = true;
             }
 
+            // 1.15.6.218: one-time switch of the blacklist auto-mute to the new default (on), like the pair loading 10 -> 20 raise.
+            // Older builds ignore the flag; a user who turns it off afterwards keeps it off.
+            if (!_current.NoisesAutoMuteDefaultOnApplied)
+            {
+                if (!_current.NoisesAutoMuteBlacklisted)
+                {
+                    _current.NoisesAutoMuteBlacklisted = true;
+                    StartupLog.Add(new(false, "Noises: blacklisted sounds are now blocked by default (auto-mute blacklisted turned on once)"));
+                }
+                _current.NoisesAutoMuteDefaultOnApplied = true;
+                _dirty = true;
+            }
+
             if (_dirty) TrySaveLocked(out _);
         }
     }
@@ -414,15 +453,33 @@ public static class VierAIConfigStore
         Try(nameof(VierAIConfig.NamePlatePairedSoundIndicator), el => target.NamePlatePairedSoundIndicator = el.GetBoolean());
         Try(nameof(VierAIConfig.ShowNoiseMakersWindow), el => target.ShowNoiseMakersWindow = el.GetBoolean());
         Try(nameof(VierAIConfig.NoisesOnlyShowOnHover), el => target.NoisesOnlyShowOnHover = el.GetBoolean());
+        Try(nameof(VierAIConfig.NoisesHideGameMutedChannels), el => target.NoisesHideGameMutedChannels = el.GetBoolean());
+        Try(nameof(VierAIConfig.NoisesWhitelist), el => target.NoisesWhitelist = el.Deserialize<List<string>>() ?? NoiseFilter.DefaultWhitelist());
+        Try(nameof(VierAIConfig.NoisesBlacklist), el => target.NoisesBlacklist = el.Deserialize<List<string>>() ?? NoiseFilter.DefaultBlacklist());
+        Try(nameof(VierAIConfig.NoisesAutoMuteBlacklisted), el => target.NoisesAutoMuteBlacklisted = el.GetBoolean());
+        Try(nameof(VierAIConfig.NoisesAutoMuteDefaultOnApplied), el => target.NoisesAutoMuteDefaultOnApplied = el.GetBoolean());
+        Try(nameof(VierAIConfig.NoisesAutoUnmuteWhitelisted), el => target.NoisesAutoUnmuteWhitelisted = el.GetBoolean());
+        Try(nameof(VierAIConfig.PairLoadingDefault20Applied), el => target.PairLoadingDefault20Applied = el.GetBoolean());
+        Try(nameof(VierAIConfig.NoisesAutoMutedUids), el => target.NoisesAutoMutedUids = el.Deserialize<List<string>>() ?? new());
+        Try(nameof(VierAIConfig.NoisesRecentExpireMinutes), el => target.NoisesRecentExpireMinutes = Math.Clamp(el.GetInt32(), 1, 60));
         Try(nameof(VierAIConfig.NoiseGlowRules), el =>
         {
             var list = el.Deserialize<List<NoiseGlowRule>>(new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-            if (list != null) target.NoiseGlowRules = list;
+            if (list != null)
+            {
+                // 1.15.6.203: a config from before the Noises filter still has the old default plap (red) / bpmloop (green) rules;
+                // those are now the default blacklist / whitelist words, so drop them here to avoid a double highlight.
+                if (!root.TryGetProperty(nameof(VierAIConfig.NoisesWhitelist), out _))
+                    list.RemoveAll(r => (string.Equals(r.Match, "plap", StringComparison.OrdinalIgnoreCase) && r.Color == NoiseFilter.BlacklistColor)
+                        || (string.Equals(r.Match, "bpmloop", StringComparison.OrdinalIgnoreCase) && r.Color == NoiseFilter.WhitelistColor));
+                target.NoiseGlowRules = list;
+            }
         });
         Try(nameof(VierAIConfig.CacheFolderWarningDismissed), el => target.CacheFolderWarningDismissed = el.GetBoolean());
         Try(nameof(VierAIConfig.WineSkipAnimationAnalysis), el => target.WineSkipAnimationAnalysis = el.GetBoolean());
         Try(nameof(VierAIConfig.SplitApplyAcrossFrames), el => target.SplitApplyAcrossFrames = el.GetBoolean());
         Try(nameof(VierAIConfig.ReapplyScaleAfterRedraw), el => target.ReapplyScaleAfterRedraw = el.GetBoolean());
+        Try(nameof(VierAIConfig.AutoHealMissingParts), el => target.AutoHealMissingParts = el.GetBoolean());
         Try(nameof(VierAIConfig.ShowSyncshellUniqueCount), el => target.ShowSyncshellUniqueCount = el.GetBoolean());
         Try(nameof(VierAIConfig.NoisesMutedHideSeconds), el => target.NoisesMutedHideSeconds = Math.Clamp(el.GetInt32(), 5, 60));
         Try(nameof(VierAIConfig.AutoSyncNearbyAnimations), el => target.AutoSyncNearbyAnimations = el.GetBoolean());

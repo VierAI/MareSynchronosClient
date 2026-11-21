@@ -88,12 +88,15 @@ public partial class SettingsUi
         ImGuiHelpers.ScaledDummy(2f);
 
         ImGui.TextUnformatted("Maximum Parallel Downloads");
-        if (ImGui.SliderInt("##maxDown", ref maxParallelDownloads, 1, 30))
+        if (ImGui.SliderInt("##maxDown", ref maxParallelDownloads, 1, 50)) // 1.15.6.213: was 1-30
         {
             maxParallelDownloads = Math.Clamp(maxParallelDownloads, 1, 100);
             _configService.Current.ParallelDownloads = maxParallelDownloads;
             _configService.Save();
+            Mediator.Publish(new DownloadLimitChangedMessage());
         }
+        _uiShared.DrawHelpText("Split per priority tier (Settings > Transfers > Priority: listed, in-game friends, party/alliance, direct syncs, everyone else): each tier gets 1/5 of this number, then each tier lends half (rounded down) of what it has to the tier below." + UiSharedService.TooltipSeparator + "A tier with more work than its share takes back as many slots as it needs from the tiers below it; their running work finishes first, only queued work waits. Shares of idle tiers stay reserved so their work starts at once. Below 5 there is no split (best tier first).");
+        ImGui.TextDisabled("Per tier now (listed/friends/party/direct/everyone): " + MareSynchronos.WebAPI.Files.TierSlots.Describe(maxParallelDownloads));
         UiSharedService.ColorText("Lower this if your game can't keep up.", ImGuiColors.DalamudYellow);
         ImGuiHelpers.ScaledDummy(2f);
 

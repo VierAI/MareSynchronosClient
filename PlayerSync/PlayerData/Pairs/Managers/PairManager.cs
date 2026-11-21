@@ -38,6 +38,10 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
     private readonly ConcurrentDictionary<string, byte> _initializingPairs = new(StringComparer.Ordinal);
     private bool _isConnected = false;
     private bool _isZoning = false;
+    // 1.15.6.219: last applied data per pair UID, kept across a disconnect (token refresh reconnect, connection drop). A disconnect
+    // disposes every pair (reverting them to vanilla) and the server does not always resend their data after the reconnect.
+    private readonly ConcurrentDictionary<string, (CharacterData Data, DateTimeOffset At)> _psyncReconnectStash = new(StringComparer.Ordinal);
+    private static readonly TimeSpan PSyncReconnectStashMaxAge = TimeSpan.FromMinutes(15);
 
     public PairManager(ILogger<PairManager> logger, PairFactory pairFactory, MareConfigService configurationService, DalamudUtilService dalamudUtilService,
         ServerConfigurationManager serverConfigurationManager, MareMediator mediator)
@@ -53,6 +57,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         Mediator.Subscribe<ConnectedMessage>(this, (__) =>
         {
             _isConnected = true;
+            PSyncPruneReconnectStash(); // 1.15.6.220
             _ = UpdateVisiblePairs();
         });
 
@@ -65,6 +70,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
         Mediator.Subscribe<DisconnectedMessage>(this, (_) =>
         {
             _isConnected = false;
+            PSyncStashDataForReconnect(); // 1.15.6.219: before ClearPairs, which disposes the handlers and their data
             ClearPairs();
         });
 
@@ -184,6 +190,64 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
             LastAddedUser = _allClientPairs[dto.User];
         _allClientPairs[dto.User].ReapplyCachedData();
         RecreateLazy();
+    }
+
+    /// <summary>1.15.6.219: keep each pair's last applied data before a disconnect clears the pairs.</summary>
+    private void PSyncStashDataForReconnect()
+    {
+        int count = 0;
+        var now = DateTimeOffset.UtcNow;
+        foreach (var pair in _allClientPairs.Values)
+        {
+            try
+            {
+                var data = pair.GetCopyOfPairCharacterData();
+                if (data == null) continue;
+                _psyncReconnectStash[pair.UserData.UID] = (data, now);
+                count++;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "Reconnect: could not keep data for {uid}", pair.UserData.UID);
+            }
+        }
+        foreach (var kv in _psyncReconnectStash)
+        {
+            if (now - kv.Value.At > PSyncReconnectStashMaxAge) _psyncReconnectStash.TryRemove(kv.Key, out _);
+        }
+        if (count > 0) Logger.LogInformation("Reconnect: kept the last data of {count} pair(s) to re-apply after the reconnect", count);
+    }
+
+    /// <summary>1.15.6.219: newer data arrived from the server for this pair, so the kept data is not needed.</summary>
+    public void PSyncDropReconnectStash(string uid) => _psyncReconnectStash.TryRemove(uid, out _);
+
+    /// <summary>1.15.6.220: full server data for a pair that does not exist yet (reconnect race) replaces the kept copy, so the
+    /// restore applies this newer data instead of the older kept one.</summary>
+    public void PSyncKeepServerDataForRestore(string uid, CharacterData data) => _psyncReconnectStash[uid] = (data, DateTimeOffset.UtcNow);
+
+    /// <summary>1.15.6.220: take (remove) the kept data for a restore that is about to queue. Expired entries are pruned here too.</summary>
+    public CharacterData? PSyncTakeReconnectStash(string uid)
+    {
+        PSyncPruneReconnectStash();
+        return _psyncReconnectStash.TryRemove(uid, out var kept) ? kept.Data : null;
+    }
+
+    private void PSyncPruneReconnectStash()
+    {
+        var now = DateTimeOffset.UtcNow;
+        foreach (var kv in _psyncReconnectStash)
+        {
+            if (now - kv.Value.At > PSyncReconnectStashMaxAge) _psyncReconnectStash.TryRemove(kv.Key, out _);
+        }
+    }
+
+    /// <summary>1.15.6.219: a pair came back after a reconnect: re-apply its kept data (queued like received data).
+    /// 1.15.6.220: the entry stays until the restore handler takes it right before queueing, so server data that arrives
+    /// meanwhile drops it first; paused pairs are skipped (the entry is kept and expires).</summary>
+    private void PSyncRestoreStashedData(Pair pair)
+    {
+        if (!_psyncReconnectStash.ContainsKey(pair.UserData.UID) || pair.HasCachedData || pair.IsPaused) return;
+        Mediator.Publish(new PSyncRestoreKeptPairDataMessage(pair));
     }
 
     public void ClearPairs()
@@ -405,6 +469,8 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
         // Fork: remember whether this change unmutes the pair, so the reapply below can restore their sound in full.
         var unmuted = pair.UserPair.OwnPermissions.IsDisableSounds() && !dto.Permissions.IsDisableSounds();
+        // 1.15.6.208: every unmute you make (any window) sets the Noises manual override; the plugin's own unmutes do not.
+        if (unmuted) MareSynchronos.UI.Components.NoiseAutoMute.OnUnmuteConfirmed(pair.UserData.UID);
         pair.UserPair.OwnPermissions = dto.Permissions;
         pair.PSyncUpdateMuteRedirects(); // 1.15.5.1704: mute also covers non-own sounds (VFX-bound, raw)
 
@@ -481,6 +547,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
         _isConnected = false;
         DisposePairs();
+        _psyncReconnectStash.Clear(); // 1.15.6.220
     }
 
     private void OnFrameworkCharactersChanged(IReadOnlyList<ObjectTablePlayersFrameworkUpdate> changes)
@@ -642,6 +709,7 @@ public sealed class PairManager : DisposableMediatorSubscriberBase
 
                 pair.UpdateVisibility(visible);
                 Logger.LogDebug("One-Time Initialized {uid}:{name}", pair.UserData.UID, name);
+                PSyncRestoreStashedData(pair); // 1.15.6.219
             }
             catch (Exception ex)
             {

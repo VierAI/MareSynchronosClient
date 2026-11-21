@@ -14,11 +14,21 @@ using CharacterData = MareSynchronos.API.Data.CharacterData;
 
 namespace MareSynchronos.Services;
 
-/// <summary>Raised by <c>PairHandler</c> whenever a sound file (.scd) is loaded for one of a pair's objects.</summary>
-public record PairSoundLoadedMessage(Pair Pair, string GamePath, string FilePath) : SameThreadMessage;
+/// <summary>Raised by <c>PairHandler</c> whenever a sound file (.scd) is loaded for one of a pair's objects.
+/// 1.15.6.206: <paramref name="Sustained"/> = looping or long (the sound keeps playing while the pair is ACTIVE);
+/// <paramref name="Restored"/> = re-counted by an unmute restore (no new load), never triggers the blacklist auto-mute.</summary>
+public record PairSoundLoadedMessage(Pair Pair, string GamePath, string FilePath, SoundChannels Channels = SoundChannels.None, int UnmappedBus = -1,
+    bool Sustained = false, bool Restored = false) : SameThreadMessage;
+
+/// <summary>1.15.6.207: the last sustained sound of a pair, game and file path together (one reference: read and written atomically).</summary>
+public sealed record SustainedSound(string GamePath, string FilePath);
 
 /// <summary>Raised when a pair's sound state enters or leaves <see cref="SoundState.Active"/> (name tags need a redraw).</summary>
 public record PairSoundActiveChangedMessage(Pair Pair) : SameThreadMessage;
+
+/// <summary>1.15.6.204: a pair whose sounds you muted just requested one of their synced sounds (stripped .scd or a mute-redirected
+/// path) on their character: the play is seen even though it is silent.</summary>
+public record PairMutedSoundPlayedMessage(Pair Pair, string GamePath) : SameThreadMessage;
 
 /// <summary>Asks the Noise makers window to re-read its on/off setting.</summary>
 public record NoiseMakersSettingChangedMessage : MessageBase;
@@ -485,10 +495,24 @@ public static class SoundActivity
 /// </summary>
 public sealed class SoundActivityTracker : DisposableMediatorSubscriberBase, IHostedService
 {
-    private const int MaxRecentSoundsPerPair = 4;
+    private const int MaxRecentSoundsPerPair = 32; // 1.15.6.203: was 4; a DJ effect can load more sounds than that at once
 
     private readonly MareConfigService _configService;
-    private readonly ConcurrentDictionary<string, List<(string GamePath, DateTimeOffset At)>> _recent = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, List<RecentSound>> _recent = new(StringComparer.Ordinal);
+
+    /// <summary>1.15.6.206: one recent sound. <see cref="PlayingSeen"/> = last time it was found still playing (expiry counts from
+    /// the later of that and the load).</summary>
+    private sealed class RecentSound(string gamePath, DateTimeOffset at, bool sustained)
+    {
+        public string GamePath { get; } = gamePath;
+        public DateTimeOffset At { get; } = at;
+        public bool Sustained { get; } = sustained;
+        public DateTimeOffset? PlayingSeen { get; set; }
+    }
+
+    /// <summary>1.15.6.206: sustained sounds loaded this close to the newest one (a DJ setup loads its track and loop together)
+    /// count as playing with it.</summary>
+    private const double PlayingGroupSeconds = 10;
 
     public SoundActivityTracker(ILogger<SoundActivityTracker> logger, MareMediator mediator, MareConfigService configService) : base(logger, mediator)
     {
@@ -504,26 +528,61 @@ public sealed class SoundActivityTracker : DisposableMediatorSubscriberBase, IHo
 
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
-    /// <summary>The newest sound files loaded for this pair, newest first.</summary>
-    public IReadOnlyList<(string GamePath, DateTimeOffset At)> GetRecentSounds(string uid)
+    /// <summary>The newest sound files loaded for this pair, newest first. <c>Playing</c>: still playing now.</summary>
+    /// <remarks>
+    /// 1.15.6.203: entries expire after NoisesRecentExpireMinutes (default 5) instead of showing "48 min ago".
+    /// 1.15.6.206: there is no per-voice play/stop hook (the only sound signal is Penumbra's resource load), so "still playing"
+    /// is the pair's ACTIVE state: the newest sustained (looping or long) sound loaded in the current ACTIVE period, plus any
+    /// sustained sound loaded within <see cref="PlayingGroupSeconds"/> of it, is exempt from expiry until ACTIVE ends (the
+    /// emote loop ends, the song's length runs out, the player walks off or unloads). A DJ track that plays longer than the
+    /// expiry therefore stays listed, and an ACTIVE row never shows "no sound files". After it stops it expires
+    /// RecentExpireMinutes after it was last seen playing.
+    /// </remarks>
+    public IReadOnlyList<(string GamePath, DateTimeOffset At, bool Playing)> GetRecentSounds(Pair pair)
     {
-        if (!_recent.TryGetValue(uid, out var list)) return [];
+        if (!_recent.TryGetValue(pair.UserData.UID, out var list)) return [];
+        var now = DateTimeOffset.UtcNow;
+        var cutoff = now.AddMinutes(-RecentExpireMinutes);
+        var activeSince = SoundActivity.IsActive(pair) ? pair.SoundStateSince : null;
         lock (list)
         {
-            return [.. list];
+            DateTimeOffset? newestSustained = null;
+            if (activeSince != null)
+            {
+                var from = activeSince.Value.AddSeconds(-SoundActivity.LoopStartGraceSeconds);
+                foreach (var e in list)
+                    if (e.Sustained && e.At >= from) { newestSustained = e.At; break; }
+            }
+            var result = new List<(string GamePath, DateTimeOffset At, bool Playing)>(list.Count);
+            list.RemoveAll(e =>
+            {
+                var playing = newestSustained != null && e.Sustained && e.At >= newestSustained.Value.AddSeconds(-PlayingGroupSeconds);
+                if (playing) e.PlayingSeen = now;
+                var last = e.PlayingSeen is { } seen && seen > e.At ? seen : e.At;
+                return last < cutoff;
+            });
+            foreach (var e in list) result.Add((e.GamePath, e.At, e.PlayingSeen == now));
+            return result;
         }
     }
+
+    /// <summary>1.15.6.203: minutes a recently played sound stays listed (1-60, default 5).</summary>
+    public static int RecentExpireMinutes => Math.Clamp(VierAIConfigStore.Current.NoisesRecentExpireMinutes, 1, 60);
 
     private void OnSoundLoaded(PairSoundLoadedMessage msg)
     {
         var uid = msg.Pair.UserData.UID;
         var now = DateTimeOffset.UtcNow;
+        SoundChannelLog.Record(uid, msg.GamePath, now, msg.Channels == SoundChannels.None ? SoundChannelMap.FromGamePath(msg.GamePath) : msg.Channels); // 1.15.6.202
+        // 1.15.6.205: a bus number we have not mapped yet: shown as "bus N", logged once per number so it can be mapped.
+        if (SoundChannelMap.NoteUnmappedBus(msg.GamePath, msg.UnmappedBus))
+            Logger.LogInformation("Noises: sound {path} uses SCD bus {bus}, which has no known game volume channel yet", msg.GamePath, msg.UnmappedBus);
 
         var list = _recent.GetOrAdd(uid, _ => []);
         lock (list)
         {
             list.RemoveAll(e => string.Equals(e.GamePath, msg.GamePath, StringComparison.OrdinalIgnoreCase));
-            list.Insert(0, (msg.GamePath, now));
+            list.Insert(0, new RecentSound(msg.GamePath, now, msg.Sustained));
             if (list.Count > MaxRecentSoundsPerPair) list.RemoveRange(MaxRecentSoundsPerPair, list.Count - MaxRecentSoundsPerPair);
         }
     }

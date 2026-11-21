@@ -1,4 +1,5 @@
 ﻿using MareSynchronos.API.Data;
+using MareSynchronos.API.Data.Extensions;
 using MareSynchronos.API.Dto;
 using MareSynchronos.API.Dto.Group;
 using MareSynchronos.API.Dto.User;
@@ -92,6 +93,21 @@ public partial class ApiController
 
     public async Task SetBulkPermissions(BulkPermissionsDto dto)
     {
+        // 1.15.6.209 (N5): every permission change is sent from here; note which ones unmute a pair you muted, and whether
+        // the plugin sent it (NoiseAutoMute.AutoSendScope, synchronous up to here) or you did.
+        try
+        {
+            foreach (var (uid, perm) in dto.AffectedUsers)
+            {
+                if (perm.IsDisableSounds()) continue;
+                if (_pairManager.GetPairByUID(uid)?.UserPair is { } up && up.OwnPermissions.IsDisableSounds())
+                    MareSynchronos.UI.Components.NoiseAutoMute.OnUnmuteSent(uid);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Noises: unmute bookkeeping failed");
+        }
         CheckConnection();
 
         try

@@ -55,6 +55,12 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
     {
         foreach (var hash in hashes) _filesThatHaveBeenVerifiedBad.TryAdd(hash, 0);
     }
+    /// <summary>1.15.6.215: one blocked file expired or was unblocked in Settings; it is checked again on its next apply.</summary>
+    public static void ForkRemoveVerifiedBad(string hash)
+    {
+        _filesThatHaveBeenVerifiedBad.TryRemove(hash, out _);
+        _filesThatHaveBeenVerifiedGood.TryRemove(hash, out _);
+    }
     public static void ForkClearVerifiedBad()
     {
         _filesThatHaveBeenVerifiedBad.Clear();
@@ -100,6 +106,8 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
 
     private GameObjectHandler? _charaHandler;
     private CharacterData? _cachedData = null;
+    /// <summary>1.15.6.204: .scd game paths in the last received (unfiltered) data.</summary>
+    public IReadOnlySet<string>? PSyncReceivedScdPaths { get; private set; }
     private CharacterData? _pendingData = null;
     private Guid? _penumbraCollection;
     private CancellationTokenSource? _dataApplicationCancellationTokenSource = new();
@@ -143,6 +151,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
         _configService = configService;
         _zoneSyncConfig = zoneSyncConfig;
         _isVanillaEnforced = IsVanillaEnforced();
+        PSyncInitAutoHeal(); // 1.15.6.215
 
         Mediator.Subscribe<PenumbraInitializedMessage>(this, (_) =>
         {
@@ -662,6 +671,8 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
         using CancellationTokenSource linkedCts = CancellationTokenSource.CreateLinkedTokenSource(dataApplicationToken, topLevelToken);
         var linkedToken = linkedCts.Token;
         Interlocked.Increment(ref _psyncApplyInFlight); // L1d: force re-download waits for this
+        PSyncGlobalApplyStart(); // 1.15.6.215: compaction waits while any apply runs
+        PSyncOnApplyStart(characterData.DataHash.Value); // 1.15.6.216: cancel a pending auto-fix check; count a requested auto-fix try
         try
         {
 
@@ -730,6 +741,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
         finally
         {
             Interlocked.Decrement(ref _psyncApplyInFlight);
+            PSyncGlobalApplyEnd();
         }
     }
 
@@ -751,8 +763,12 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
         lock (_cachedDataLock)
         {
             _cachedData = data?.DeepClone();
+            // 1.15.6.204: .scd game paths in the last RECEIVED data (kept while their sounds are muted: the mute strips them
+            // only from the applied copy), for the auto-unmute on a whitelisted sound.
+            PSyncReceivedScdPaths = data == null ? null : new HashSet<string>(data.FileReplacements.Values.SelectMany(l => l).SelectMany(r => r.GamePaths)
+                .Where(p => p.EndsWith(".scd", StringComparison.OrdinalIgnoreCase)), StringComparer.OrdinalIgnoreCase);
             _pendingData = null;
-            if (data == null) ForkSetApplied(null);
+            if (data == null) { ForkSetApplied(null); Pair.SoundLastSustained = null; } // 1.15.6.207: data reset clears the restore sound
             PSyncCachedDataChanged();
         }
     }
@@ -774,6 +790,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
         // Fork fix: filter a copy, so the cached 'last received' data keeps files we skip right now (muted sounds, animations,
         // VFX) and unmute/unpause can restore them; diff against what was actually applied.
         dataApplication.ReceivedData ??= characterData;
+        PSyncNoteStripSignature(characterData); // 1.15.6.217: which blacklisted sounds get stripped (filter signature)
         characterData = RemoveNotSyncedFiles(characterData.DeepClone())!;
         dataApplication.CharacterData = characterData;
         cachedData = ForkAppliedBaseline(cachedData);
@@ -1124,6 +1141,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
         // Proactively check the incoming files for specific known sources of crashes
         if (_configService.Current.EnableValidationChecks)
         {
+            _psyncSkippedBad.Clear(); // 1.15.6.215: rebuilt below for the pair tooltip and Settings blocked list
             Mediator.Publish(new EventMessage(new DataApplicationEvent(applicationBase, DataApplicationStatus.Applying, Pair.PlayerName,
                 Pair.UserData, nameof(ApplyDataApplicationAsync), EventSeverity.Informational,
                 $"Performing file validation checks for {Pair.PairUIDName}")));
@@ -1152,11 +1170,12 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
                 {
                     // Validate modded file
                     var extension = Path.GetExtension(file.Key.GamePath);
-                    if (_filesThatHaveBeenVerifiedBad.ContainsKey(file.Key.Hash) || PSyncFileSafetyStore.IsKnownBad(file.Key.Hash))
+                    if (PSyncFileSafetyStore.IsKnownBad(file.Key.Hash) || _filesThatHaveBeenVerifiedBad.ContainsKey(file.Key.Hash)) // 215: store first, it drops expired entries from both
                     {
                         Logger.LogWarning("{uid} ({name}): File {hash} to be used as {gamePath} looks like it could crash game and will be ignored.",
                             Pair.UserData.UID, PlayerName, file.Key.Hash, file.Key.GamePath);
                         moddedPaths.Remove(file.Key);
+                        PSyncNoteSkippedBad(file.Key.Hash, file.Key.GamePath); // 1.15.6.215
 
                         continue;
                     }
@@ -1184,6 +1203,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
                                     ForkTrimVerified(_filesThatHaveBeenVerifiedBad);
                                     _filesThatHaveBeenVerifiedBad.TryAdd(file.Key.Hash, 0);
                                     PSyncFileSafetyStore.Instance?.RecordBad(file.Key.Hash, messageString, Pair.UserData.UID); // 1415: persist
+                                    PSyncNoteSkippedBad(file.Key.Hash, file.Key.GamePath); // 1.15.6.215
                                     Logger.LogWarning("{uid} ({name}): File {hash} to be used as {gamePath} looks like it could crash game and will be ignored. \n  {description}",
                                         Pair.UserData.UID, PlayerName, file.Key.Hash, file.Key.GamePath, messageString);
                                     moddedPaths.Remove(file.Key);
@@ -1328,9 +1348,12 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
             var safetyStore = PSyncFileSafetyStore.Instance;
             if (safetyStore != null && dataApplication.UpdateModdedPaths)
             {
+                // 1.15.6.215: a shared body model (chara/human/cXXXX/obj/body/) is written as "~HASH": one crash only makes it a suspect.
                 var mdlHashes = moddedPaths.Keys
                     .Where(k => k.Hash != null && k.GamePath.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase))
-                    .Select(k => k.Hash!).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                    .GroupBy(k => k.Hash!, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => g.All(k => PSyncIsBodyModelPath(k.GamePath)) ? PSyncFileSafetyStore.BodyModelMarkerPrefix + g.Key : g.Key)
+                    .ToArray();
                 applyMarker = await safetyStore.BeginApplyAsync(Pair.UserData.UID, mdlHashes, cancellationToken).ConfigureAwait(false);
             }
             try
@@ -2198,6 +2221,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
         try
         {
             Guid applicationId = Guid.NewGuid();
+            PSyncCancelAutoHeal(); // 1.15.6.215
             _dataApplicationCancellationTokenSource?.CancelDispose();
             _dataApplicationCancellationTokenSource = null;
             _downloadManager.Dispose();
@@ -2361,6 +2385,21 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
         }
     }
 
+    /// <summary>1.15.6.210: drops every .scd entry except the whitelisted game paths (an entry keeps only those paths).</summary>
+    private static List<FileReplacementData> PSyncKeepWhitelistedSounds(List<FileReplacementData> list)
+    {
+        var result = new List<FileReplacementData>(list.Count);
+        foreach (var f in list)
+        {
+            if (!f.GamePaths.Any(p => p.EndsWith(".scd", StringComparison.OrdinalIgnoreCase))) { result.Add(f); continue; }
+            var kept = f.GamePaths.Where(p => p.EndsWith(".scd", StringComparison.OrdinalIgnoreCase) && NoiseFilter.IsWhitelisted(p)).ToArray();
+            if (kept.Length == 0) continue;
+            f.GamePaths = kept; // data is a deep clone of the received data
+            result.Add(f);
+        }
+        return result;
+    }
+
     private CharacterData? RemoveNotSyncedFiles(CharacterData? data)
     {
         Logger.LogTrace("Removing not synced files");
@@ -2408,10 +2447,17 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
                 disableIndividualAnimations, disableIndividualSounds, disableIndividualVFX);
             foreach (var objectKind in data.FileReplacements.Select(k => k.Key))
             {
-                if ((filterUserPerms && filterSounds) || disableIndividualSounds || (zoneSyncFiltering && filterZoneSyncSounds))
+                // 1.15.6.210: a sounds-only mute YOU set (direct, syncshell (the server folds it into your pair permissions) or the
+                // blacklist auto-mute) keeps .scd files matching the Noises whitelist. Their own "disable sounds", the global sound
+                // filter and the zone-sync sound filter still strip every sound. A full pause applies nothing at all.
+                bool stripAllSounds = (filterUserPerms && filterSounds) || Pair.UserPair.OtherPermissions.IsDisableSounds()
+                    || (zoneSyncFiltering && filterZoneSyncSounds);
+                if (stripAllSounds)
                     data.FileReplacements[objectKind] = data.FileReplacements[objectKind]
-                        .Where(f => !f.GamePaths.Any(p => p.EndsWith("scd", StringComparison.OrdinalIgnoreCase)))
+                        .Where(f => !f.GamePaths.Any(p => p.EndsWith(".scd", StringComparison.OrdinalIgnoreCase))) // 1.15.6.211 (Q4)
                         .ToList();
+                else if (disableIndividualSounds)
+                    data.FileReplacements[objectKind] = PSyncKeepWhitelistedSounds(data.FileReplacements[objectKind]);
                 if (((filterUserPerms && filterAnimations) || disableIndividualAnimations || (zoneSyncFiltering && filterZoneSyncAnimations)) && objectKind != ObjectKind.MinionOrMount)
                     data.FileReplacements[objectKind] = data.FileReplacements[objectKind]
                         .Where(f => !f.GamePaths.Any(p => p.EndsWith("tmb", StringComparison.OrdinalIgnoreCase) || p.EndsWith("pap", StringComparison.OrdinalIgnoreCase)))
@@ -2427,6 +2473,7 @@ public sealed partial class PairDataApplicationHandler : DisposableMediatorSubsc
             }
         }
 
+        PSyncStripBlacklistedSounds(data); // 1.15.6.217: auto-mute blacklisted on = blacklisted .scd files are not applied
         return data;
     }
 }

@@ -68,9 +68,11 @@ public class Pair
     public DateTimeOffset? PSyncLastAppliedModPathsAt => DataHandler?.PSyncLastAppliedModPathsAt;
     // 1.15.5.1704: non-own sounds (PSyncForeignSounds)
     public IReadOnlySet<string>? PSyncReferencedScdPaths => DataHandler?.PSyncReferencedScdPaths;
+    public IReadOnlySet<string>? PSyncReceivedScdPaths => DataHandler?.PSyncReceivedScdPaths; // 1.15.6.204
     public IReadOnlyCollection<string> PSyncMuteRedirectPaths => DataHandler?.PSyncMuteRedirectPaths ?? [];
     public void PSyncObserveForeignSound(string gamePath) => DataHandler?.PSyncObserveForeignSound(gamePath);
     public void PSyncUpdateMuteRedirects() => DataHandler?.PSyncUpdateMuteRedirects();
+    public bool PSyncTryUpdateMuteRedirectsNow() => DataHandler?.PSyncTryUpdateMuteRedirectsNow() ?? true; // 1.15.6.207
     public long LastAppliedDataTris { get; set; } = -1;
     public long LastAppliedApproximateVRAMBytes { get; set; } = -1;
     public int LastAppliedCompressedAlternates { get; set; } = -1;
@@ -114,6 +116,11 @@ public class Pair
     public bool SoundLoopHasSound { get; set; }
     /// <summary>Fork: was making noise when muted (for the unmute restore mark).</summary>
     public bool SoundNoisyAtMute { get; set; }
+    /// <summary>1.15.6.206: game/file path of the last sustained (looping or long) sound loaded for the pair, re-recorded by an
+    /// unmute restore so the Noises tooltip shows the sound the restored ACTIVE state stands for.
+    /// 1.15.6.207: one immutable record (was two separately written strings that a background read could tear).</summary>
+    public MareSynchronos.Services.SustainedSound? SoundLastSustained { get => Volatile.Read(ref _soundLastSustained); set => Volatile.Write(ref _soundLastSustained, value); }
+    private MareSynchronos.Services.SustainedSound? _soundLastSustained;
     /// <summary>Fork: .scd game paths in the pair's last applied data; loads outside it are not their own sound (null = nothing applied yet).</summary>
     public HashSet<string>? SoundOwnScdPaths { get; set; }
     public DateTimeOffset? SoundLastLoadAt { get; set; }
@@ -330,6 +337,12 @@ public class Pair
     }
 
     /// <summary>1.15.5.1218: hashes this pair currently uses (cached or pending data), for shared-file checks.</summary>
+    /// <summary>1.15.6.217: a Noises list edit or the blacklist auto-mute option changed which of this pair's sounds are stripped.</summary>
+    public bool PSyncBlacklistStripOutdated() => DataHandler?.PSyncBlacklistStripOutdated() ?? false;
+
+    /// <summary>1.15.6.215: files skipped on this pair's last apply because they are blocked (hash -> game path).</summary>
+    public IReadOnlyCollection<KeyValuePair<string, string>> PSyncGetSkippedBadFiles() => DataHandler?.PSyncGetSkippedBadFiles() ?? [];
+
     public IEnumerable<string> PSyncGetFileHashes()
     {
         var data = DataHandler?.PSyncGetAnyData();

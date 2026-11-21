@@ -3,10 +3,11 @@
   <PropertyGroup>
     <Authors></Authors>
     <Company></Company>
-    <Version>1.15.6.001</Version>
+    <Version>1.15.6.301</Version>
     <Description></Description>
     <Copyright></Copyright>
     <PackageProjectUrl>https://github.com/MareSynchronos/client</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/VierAI/MareSynchronosClient</RepositoryUrl><!-- public builds: SourceLink points at the public repo -->
   </PropertyGroup>
   <PropertyGroup Condition="'$(PSyncInternal)' == 'true'">
     <DefineConstants>$(DefineConstants);PSYNC_INTERNAL</DefineConstants>
@@ -71,6 +72,34 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>MareSempiterne</AssemblyName>
   </PropertyGroup>
+
+  <!-- Fork 1.15.6.207: append the git commit (short SHA) to SourceRevisionId, so the informational version reads
+       1.15.6.N+build<time>.g<sha>. No git or not a repo: unchanged.
+       1.15.6.208: stderr is discarded and only a plain hex SHA (^[0-9a-f]{7,40}$) is used; "-dirty" when tracked files differ from HEAD. -->
+  <PropertyGroup>
+    <PSyncNullDevice Condition="$([MSBuild]::IsOSPlatform('Windows'))">nul</PSyncNullDevice>
+    <PSyncNullDevice Condition="'$(PSyncNullDevice)' == ''">/dev/null</PSyncNullDevice>
+  </PropertyGroup>
+  <Target Name="PSyncAddGitSha" BeforeTargets="AddSourceRevisionToInformationalVersion">
+    <Exec Command="git rev-parse --short=8 HEAD 2&gt;$(PSyncNullDevice)" WorkingDirectory="$(MSBuildProjectDirectory)" ConsoleToMSBuild="true" IgnoreExitCode="true" ContinueOnError="true" StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="PSyncGitSha" />
+      <Output TaskParameter="ExitCode" PropertyName="PSyncGitExit" />
+    </Exec>
+    <PropertyGroup>
+      <PSyncGitSha>$(PSyncGitSha.Trim())</PSyncGitSha>
+      <PSyncGitShaOk>false</PSyncGitShaOk>
+      <PSyncGitShaOk Condition="'$(PSyncGitExit)' == '0' And $([System.Text.RegularExpressions.Regex]::IsMatch('$(PSyncGitSha)', '^[0-9a-f]{7,40}$'))">true</PSyncGitShaOk>
+    </PropertyGroup>
+    <Exec Condition="'$(PSyncGitShaOk)' == 'true'" Command="git status --porcelain --untracked-files=no 2&gt;$(PSyncNullDevice)" WorkingDirectory="$(MSBuildProjectDirectory)" ConsoleToMSBuild="true" IgnoreExitCode="true" ContinueOnError="true" StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="PSyncGitStatus" />
+      <Output TaskParameter="ExitCode" PropertyName="PSyncGitStatusExit" />
+    </Exec>
+    <PropertyGroup Condition="'$(PSyncGitShaOk)' == 'true'">
+      <PSyncGitSuffix>.g$(PSyncGitSha)</PSyncGitSuffix>
+      <PSyncGitSuffix Condition="'$(PSyncGitStatusExit)' == '0' And '$(PSyncGitStatus.Trim())' != ''">$(PSyncGitSuffix)-dirty</PSyncGitSuffix>
+      <SourceRevisionId>$(SourceRevisionId)$(PSyncGitSuffix)</SourceRevisionId>
+    </PropertyGroup>
+  </Target>
 
   <ItemGroup>
     <ProjectReference Include="..\MareAPI\MareSynchronosAPI\MareSynchronos.API.csproj" />

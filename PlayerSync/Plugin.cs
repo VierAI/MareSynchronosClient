@@ -50,6 +50,8 @@ public sealed class Plugin : IDalamudPlugin
     {
         if (!Directory.Exists(pluginInterface.ConfigDirectory.FullName))
             Directory.CreateDirectory(pluginInterface.ConfigDirectory.FullName);
+        MareSynchronos.Services.SoundChannelState.Attach(gameConfig); // 1.15.6.202: Noises hides sounds on muted game channels
+        MareSynchronos.Services.ScdInfo.AttachGameData(dataManager); // 1.15.6.205: sounds not on disk are checked against the game data
         var traceDir = Path.Join(pluginInterface.ConfigDirectory.FullName, "tracelog");
         if (!Directory.Exists(traceDir))
             Directory.CreateDirectory(traceDir);
@@ -355,5 +357,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         _host.StopAsync().GetAwaiter().GetResult();
         _host.Dispose();
+        MareSynchronos.Services.SoundChannelState.Detach();
+        MareSynchronos.Services.ScdInfo.AttachGameData(null);
     }
 }

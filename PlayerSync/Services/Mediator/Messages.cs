@@ -70,6 +70,7 @@ public record NotificationMessage
     (string Title, string Message, NotificationType Type, TimeSpan? TimeShownOnScreen = null, string? UpdatedStageFilename = null, string? UpdatedStageId = null, Pair? Pair = null, string? PlayerLinkName = null, string? PlayerIdent = null) : MessageBase; // 1414: Pair = player link in chat; 1417: name/ident for players who are not pairs
 public record ReapplyCachedPairDataMessage(Pair Pair, bool Force = true) : MessageBase;
 public record TextureCapReadyMessage(string Uid) : MessageBase;
+public record PSyncRestoreKeptPairDataMessage(Pair Pair) : MessageBase; // 1.15.6.219: re-apply after a reconnect (1.15.6.220: data taken from the stash by the handler)
 public record OpenSettingsGameUiMessage : MessageBase;
 public record CreateCacheForObjectMessage(GameObjectHandler ObjectToCreateFor) : SameThreadMessage;
 public record CreateCacheForEverythingMessage() : MessageBase;

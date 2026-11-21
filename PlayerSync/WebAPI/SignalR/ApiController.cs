@@ -493,9 +493,10 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
             var pair = _pairManager.GetOnlineUserPairs().Single(p => p.UserPair != null && p.UserData == userData);
             var perm = pair.UserPair!.OwnPermissions;
             perm.SetPaused(paused: true);
+            KeepAutoMute(userData.UID, ref perm); // 1.15.6.209
             await UserSetPairPermissions(new UserPermissionsDto(userData, perm)).ConfigureAwait(false);
             // wait until it's changed
-            while (pair.UserPair!.OwnPermissions != perm)
+            while (!pair.UserPair!.OwnPermissions.IsPaused()) // 1.15.6.210 (P2): wait for the pause itself, not an exact match
             {
                 await Task.Delay(250, cts.Token).ConfigureAwait(false);
                 Logger.LogTrace("Waiting for permissions change for {data}", userData);
@@ -503,7 +504,9 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
             // This works around the condition where we may cycle someone's IsVisible state before the visibility loop can catch it.
             // Basically if you have low latency to the server and the server is too fast, you can "skip" the proper behavior
             await Task.Delay(1000, cts.Token).ConfigureAwait(false);
+            perm = pair.UserPair!.OwnPermissions; // 1.15.6.210 (P2): current permissions (a mute change meanwhile is kept)
             perm.SetPaused(paused: false);
+            KeepAutoMute(userData.UID, ref perm); // 1.15.6.209
             await UserSetPairPermissions(new UserPermissionsDto(userData, perm)).ConfigureAwait(false);
         }, cts.Token).ContinueWith((t) => cts.Dispose());
 
@@ -525,6 +528,7 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
 
         var perm = pair.UserPair!.OwnPermissions;
         perm.SetPaused(paused: true);
+        KeepAutoMute(uid, ref perm); // 1.15.6.209
         await UserSetPairPermissions(new UserPermissionsDto(userData, perm)).ConfigureAwait(false);
 
         _serverManager.SetPauseReasonForUid(uid, reason);
@@ -538,6 +542,14 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
                 MareSynchronos.Services.VierAITempPauses.Upsert(uid, reason.ToString(), pair.HashedCID, pair.PlayerName ?? string.Empty, expires);
             }
         }
+    }
+
+    /// <summary>1.15.6.209 (audit N7): a pause/unpause is built from the local permissions, which still read "unmuted" while a
+    /// blacklist auto-mute waits for its server echo. Sending that would undo the auto-mute and its echo would look like a
+    /// manual unmute. Keep sounds disabled for a pair the auto-mute is holding.</summary>
+    private static void KeepAutoMute(string uid, ref UserPermissions perm)
+    {
+        if (MareSynchronos.UI.Components.NoiseAutoMute.IsTracked(uid)) perm.SetDisableSounds(true);
     }
 
     public async Task UnPauseAsync(UserData userData, bool notification = false)
@@ -558,6 +570,7 @@ public sealed partial class ApiController : DisposableMediatorSubscriberBase, IM
 
         var perm = pair.UserPair!.OwnPermissions;
         perm.SetPaused(paused: false);
+        KeepAutoMute(uid, ref perm); // 1.15.6.209
         await UserSetPairPermissions(new UserPermissionsDto(userData, perm)).ConfigureAwait(false);
 
         if (notification)

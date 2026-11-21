@@ -25,7 +25,7 @@ public class ConfigurationMigrator(ILogger<ConfigurationMigrator> logger, Transi
         {
             if (mareConfigService.Current.MaxConcurrentApplications == 0)
             {
-                mareConfigService.Current.MaxConcurrentApplications = 10;
+                mareConfigService.Current.MaxConcurrentApplications = 20; // 1.15.6.213: new default
             }
 
             mareConfigService.Current.Version = 3;

@@ -292,7 +292,10 @@ public class PairingRequestsUi : WindowMediatorSubscriberBase
         overButton |= ImGui.IsItemHovered();
         UiSharedService.AttachToolTip("Accept");
 
+        // 1.15.6.212: SameLine returns to the line's top (the avatar's y), not to the Accept button's y, so each button sets
+        // the row's middle itself; before, Dismiss and Ignore sat higher than Accept on rows where the avatar is taller.
         ImGui.SameLine(0, spacingX);
+        ImGui.SetCursorPosY(midY);
         if (_uiSharedService.IconButton(FontAwesomeIcon.Times))
         {
             r.Dismiss();
@@ -302,6 +305,7 @@ public class PairingRequestsUi : WindowMediatorSubscriberBase
         UiSharedService.AttachToolTip("Dismiss" + UiSharedService.TooltipSeparator + r.DismissTooltip);
 
         ImGui.SameLine(0, spacingX);
+        ImGui.SetCursorPosY(midY);
         using (ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.DalamudRed))
         {
             if (_uiSharedService.IconButton(FontAwesomeIcon.Ban))

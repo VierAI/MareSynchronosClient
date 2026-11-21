@@ -6,8 +6,20 @@ using System.Runtime.InteropServices;
 
 namespace MareSynchronos.FileCache;
 
-public sealed class FileCompactor
+public sealed class FileCompactor : IDisposable
 {
+    // 1.15.6.215: newly downloaded cache files are not compacted right away. Compaction opens the file for writing, and a pair being
+    // applied at the same moment can fail to load it (missing body parts). New files wait at least 60 s, until no pair apply has run
+    // for 10 s, and are skipped while another program (the game) has them open. Mass compaction from Settings is unchanged.
+    private static readonly TimeSpan NewFileCompactDelay = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan ApplyQuietTime = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan InUseRetryDelay = TimeSpan.FromSeconds(60);
+    private const int MaxInUseRetries = 10;
+    private const int MaxDeferredFiles = 20000;
+    private readonly ConcurrentDictionary<string, (DateTime DueUtc, int Tries)> _deferredCompaction = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Timer _deferredTimer;
+    private int _deferredRunning;
+
     public const uint FSCTL_DELETE_EXTERNAL_BACKING = 0x90314U;
     public const ulong WOF_PROVIDER_FILE = 2UL;
 
@@ -32,6 +44,87 @@ public sealed class FileCompactor
             Algorithm = CompressionAlgorithm.XPRESS8K,
             Flags = 0
         };
+        _deferredTimer = new Timer(_ => ProcessDeferredCompaction(), null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+    }
+
+    public void Dispose()
+    {
+        _deferredTimer.Dispose();
+        _deferredCompaction.Clear();
+    }
+
+    private void ProcessDeferredCompaction()
+    {
+        if (_deferredCompaction.IsEmpty || Interlocked.Exchange(ref _deferredRunning, 1) == 1) return;
+        try
+        {
+            if (MareSynchronos.PlayerData.Pairs.PairDataApplicationHandler.PSyncAnyApplyInFlight
+                || MareSynchronos.PlayerData.Pairs.PairDataApplicationHandler.PSyncSinceLastApply < ApplyQuietTime)
+                return;
+            if (_dalamudUtilService.IsWine || !_mareConfigService.Current.UseCompactor)
+            {
+                _deferredCompaction.Clear();
+                return;
+            }
+
+            var now = DateTime.UtcNow;
+            foreach (var (path, entry) in _deferredCompaction)
+            {
+                if (entry.DueUtc > now) continue;
+                if (!_deferredCompaction.TryRemove(path, out _)) continue;
+                var tries = entry.Tries;
+                _ = _disk.RunIdleAsync(() =>
+                {
+                    // Re-check right before compacting: an apply may have started or finished since the timer ran
+                    // (1.15.6.216, audit V3: the quiet time is checked again here too, per file).
+                    if (MareSynchronos.PlayerData.Pairs.PairDataApplicationHandler.PSyncAnyApplyInFlight
+                        || MareSynchronos.PlayerData.Pairs.PairDataApplicationHandler.PSyncSinceLastApply < ApplyQuietTime)
+                    {
+                        _deferredCompaction.TryAdd(path, (DateTime.UtcNow + ApplyQuietTime, tries));
+                        return;
+                    }
+                    if (!File.Exists(path)) return;
+                    if (IsFileInUse(path))
+                    {
+                        if (tries + 1 < MaxInUseRetries) _deferredCompaction.TryAdd(path, (DateTime.UtcNow + InUseRetryDelay, tries + 1));
+                        else _logger.LogDebug("File {file} stayed in use, not compacting it", path);
+                        return;
+                    }
+                    CompactFile(path);
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Deferred compaction pass failed");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _deferredRunning, 0);
+        }
+    }
+
+    // True if the file is open somewhere in a way the compaction open (read/write, sharing read/write) would collide with, e.g. the
+    // game reading it without sharing write access, or a writer still busy. Same open mode as CompactFile; closed at once.
+    private static bool IsFileInUse(string path)
+    {
+        try
+        {
+            using var probe = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+            return false;
+        }
+        catch (FileNotFoundException)
+        {
+            return false;
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return true;
+        }
     }
 
     private enum CompressionAlgorithm
@@ -119,8 +212,13 @@ public sealed class FileCompactor
         if (_dalamudUtilService.IsWine || !_mareConfigService.Current.UseCompactor)
             return;
 
-        var path = filePath;
-        _ = _disk.RunIdleAsync(() => CompactFile(path));
+        DeferCompaction(filePath);
+    }
+
+    private void DeferCompaction(string filePath)
+    {
+        if (_deferredCompaction.Count >= MaxDeferredFiles) return; // the mass compaction in Settings still covers these
+        _deferredCompaction[filePath] = (DateTime.UtcNow + NewFileCompactDelay, 0);
     }
 
     public void WriteAllBytes(string filePath, byte[] decompressedFile)
@@ -130,10 +228,8 @@ public sealed class FileCompactor
         if (_dalamudUtilService.IsWine || !_mareConfigService.Current.UseCompactor)
             return;
 
-        // Compact after download writes drain. Do not await: this method runs on the disk thread,
-        // and waiting for idle work there would deadlock the worker.
-        var path = filePath;
-        _ = _disk.RunIdleAsync(() => CompactFile(path));
+        // 1.15.6.215: deferred (see NewFileCompactDelay); the timer queues it as idle disk work later.
+        DeferCompaction(filePath);
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]

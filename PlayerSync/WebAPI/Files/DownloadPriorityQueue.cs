@@ -89,6 +89,35 @@ public sealed class DownloadPriorityQueue
     /// <summary>Called once by the orchestrator: tries to take a free slot from the semaphore without waiting.</summary>
     public void SetSlotAcquirer(Func<bool> tryAcquireSlot) => _tryAcquireSlot = tryAcquireSlot;
 
+    private Func<int> _slotLimit = () => 0; // 1.15.6.213: the effective download limit (total slots)
+
+    /// <summary>1.15.6.213: called once by the orchestrator: the effective parallel download limit, split per tier (TierSlots).</summary>
+    public void SetSlotLimit(Func<int> slotLimit) => _slotLimit = slotLimit;
+
+    /// <summary>1.15.6.213: per-tier shares right now (null = no split), with running and waiting counts per tier.</summary>
+    public (int[]? Allow, int[] Running, int[] Waiting) GetTierSlots()
+    {
+        lock (_lock)
+        {
+            var running = new int[TierSlots.Tiers];
+            var waiting = new int[TierSlots.Tiers];
+            var allow = TierAllowancesLocked(running, waiting);
+            return (allow, running, waiting);
+        }
+    }
+
+    private int[]? TierAllowancesLocked(int[] running, int[] waiting)
+    {
+        foreach (var t in _holders.Values) running[TierSlots.Clamp(t)]++;
+        foreach (var w in _waiters) waiting[TierSlots.Clamp(w.Tier)]++;
+        int total;
+        try { total = _slotLimit(); } catch { total = 0; }
+        if (total < TierSlots.Tiers) return null;
+        Span<int> demand = stackalloc int[TierSlots.Tiers];
+        for (var i = 0; i < TierSlots.Tiers; i++) demand[i] = running[i] + waiting[i];
+        return TierSlots.Allowances(total, demand);
+    }
+
     /// <summary>The tier of the batch's player.</summary>
     public int GetTier(DownloadBatchInfo batch) => GetTier(batch.Pair);
 
@@ -124,6 +153,8 @@ public sealed class DownloadPriorityQueue
                 }
                 // Does nothing if a slot was already handed over; the caller then runs and releases as usual.
                 tcs.TrySetCanceled(token);
+                // 1.15.6.214 (audit T2): a cancelled waiter lowers its tier's demand; hand out slots that became eligible now.
+                Pump();
             });
             tcs.Task.ContinueWith(_ => reg.Dispose(), TaskScheduler.Default);
         }
@@ -229,7 +260,12 @@ public sealed class DownloadPriorityQueue
         {
             while (_waiters.Count > 0)
             {
-                var next = PickNextLocked();
+                // 1.15.6.213: only tiers below their share (TierSlots) may start a download; recomputed per hand-out.
+                var running = new int[TierSlots.Tiers];
+                var waiting = new int[TierSlots.Tiers];
+                var allow = TierAllowancesLocked(running, waiting);
+                var next = PickNextLocked(allow, running);
+                if (next == null) break;
                 if (!_tryAcquireSlot()) break;
 
                 _waiters.Remove(next);
@@ -257,13 +293,17 @@ public sealed class DownloadPriorityQueue
         return best >= 10_000f ? int.MaxValue : (int)(best / 10f);
     }
 
-    private Waiter PickNextLocked()
+    private Waiter? PickNextLocked(int[]? allow, int[] running)
     {
         // 1.15.5.1217: tier first, then distance (10-yalm buckets so small movements do not reshuffle), then arrival order.
-        var pick = _waiters[0];
-        var pickBucket = DistanceBucket(pick);
+        // 1.15.6.213: tiers at their share are skipped.
+        bool Eligible(Waiter w) => allow == null || running[TierSlots.Clamp(w.Tier)] < allow[TierSlots.Clamp(w.Tier)];
+        Waiter? pick = null;
+        var pickBucket = int.MaxValue;
         foreach (var w in _waiters)
         {
+            if (!Eligible(w)) continue;
+            if (pick == null) { pick = w; pickBucket = DistanceBucket(w); continue; }
             if (w.Tier > pick.Tier) continue;
             var bucket = DistanceBucket(w);
             if (w.Tier < pick.Tier || bucket < pickBucket || (bucket == pickBucket && w.Sequence < pick.Sequence))

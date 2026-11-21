@@ -39,6 +39,16 @@ public static class PSyncForeignSounds
         return !raw && gamePath.StartsWith("vfx/", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>1.15.6.204: a .scd request on a muted pair's object that is one of THEIR sounds: redirected to the mute target, in
+    /// their received data (stripped by the mute), or referenced by their applied .tmb/.pap/.avfx. Vanilla noise does not count.</summary>
+    public static bool IsMutedPairSound(Pair pair, string gamePath, string filePath)
+    {
+        if (string.IsNullOrEmpty(gamePath) || !gamePath.EndsWith(".scd", StringComparison.OrdinalIgnoreCase)) return false;
+        if (IsMuteTarget(filePath)) return true;
+        if (pair.PSyncReceivedScdPaths is { } received && received.Contains(gamePath)) return true;
+        return pair.PSyncReferencedScdPaths is { } refs && refs.Contains(gamePath);
+    }
+
     public static bool IsMuteTarget(string? filePath)
         => !string.IsNullOrEmpty(filePath) && string.Equals(ScdInfo.NormalizePath(filePath).Replace('\\', '/'), MuteTarget, StringComparison.OrdinalIgnoreCase);
 

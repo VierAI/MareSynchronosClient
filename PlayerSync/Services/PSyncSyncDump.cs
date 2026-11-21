@@ -301,8 +301,8 @@ public sealed class PSyncSyncDump : DisposableMediatorSubscriberBase, IHostedSer
         sb.Append("   own synced .scd game paths (always counted by Noises): ").AppendLine(ownScd == null || ownScd.Count == 0 ? "(none)" : string.Join(", ", ownScd.OrderBy(s => s, StringComparer.OrdinalIgnoreCase)));
         try
         {
-            var recent = _soundTracker.GetRecentSounds(pair.UserData.UID);
-            if (recent.Count > 0) sb.Append("   recent noises: ").AppendLine(string.Join(", ", recent.Select(r => r.GamePath + " @" + r.At.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture))));
+            var recent = _soundTracker.GetRecentSounds(pair);
+            if (recent.Count > 0) sb.Append("   recent noises: ").AppendLine(string.Join(", ", recent.Select(r => r.GamePath + " [" + (SoundChannelLog.ChannelsOf(pair.UserData.UID, r.GamePath) is { } c ? SoundChannelMap.Label(c, r.GamePath) : "?") + "] @" + r.At.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture) + (r.Playing ? " playing" : string.Empty))));
         }
         catch { /* ignore */ }
         if (pair.SoundFailedPaths.Count > 0) sb.Append("   failed sound paths: ").AppendLine(string.Join(", ", pair.SoundFailedPaths.Select(k => k.Key + " x" + k.Value.Count)));

@@ -19,12 +19,31 @@ namespace PlayerSync.FileCache;
 /// Everything here is best effort: a DB error is logged and never blocks syncing.
 /// 1.15.5.1701 (audit M1): the blocked list is mirrored to PSyncBadFiles.json next to the DB. A DB restore (FileCache.GOOD.bak, up to an hour
 /// old) or reset rolls the table back or wipes it; on start the mirror re-applies a later "Clear blocked files" and re-adds lost entries.
+/// 1.15.6.215: entries expire after 7 days (AddedTicks; a row without one gets "now" on first load), then the file is checked again on
+/// its next apply. A body model (chara/human/.../obj/body/) from a single crash is only a suspect (not blocked); a second crash with it
+/// blocks it. Settings lists the blocked files with the pairs they were skipped for, and each one can be unblocked on its own.
 /// </summary>
 public sealed class PSyncFileSafetyStore : IHostedService
 {
     public static PSyncFileSafetyStore? Instance { get; private set; }
 
-    private static readonly ConcurrentDictionary<string, byte> s_bad = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, BadEntry> s_bad = new(StringComparer.OrdinalIgnoreCase);
+    // 1.15.6.215: which pairs had a blocked file skipped this session (hash -> game path and pair uid -> name), for the Settings list.
+    private static readonly ConcurrentDictionary<string, SkipInfo> s_skipped = new(StringComparer.OrdinalIgnoreCase);
+    public static readonly TimeSpan BadExpiry = TimeSpan.FromDays(7);
+    internal const string SuspectReasonPrefix = "crash suspect";
+    internal const string BodyModelMarkerPrefix = "~";
+    private const string CrashReason = "crash quarantine: the game closed while this file was being applied";
+
+    public sealed record BadEntry(string Reason, long AddedTicks, string? SourcePairUid, string? GamePath);
+
+    private sealed class SkipInfo
+    {
+        public string GamePath = string.Empty;
+        public ConcurrentDictionary<string, string> Pairs { get; } = new(StringComparer.Ordinal);
+    }
+
+    public sealed record BlockedFile(string Hash, string Reason, DateTime AddedUtc, DateTime ExpiresUtc, string? SourcePairUid, string? GamePath, IReadOnlyList<string> SkippedFor);
     private readonly string _sessionId = Guid.NewGuid().ToString("N");
     private readonly ILogger<PSyncFileSafetyStore> _logger;
     private readonly IDatabaseProvider<FileCacheDbContext> _db;
@@ -43,7 +62,11 @@ public sealed class PSyncFileSafetyStore : IHostedService
     {
         public long ClearedTicks { get; set; }
         public List<MirrorEntry> Bad { get; set; } = [];
+        // 1.15.6.215: single entries unblocked in Settings (hash -> time), so a DB restore cannot bring them back. Older builds ignore it.
+        public Dictionary<string, long>? Removed { get; set; }
     }
+
+    private readonly ConcurrentDictionary<string, long> _removed = new(StringComparer.OrdinalIgnoreCase);
 
     public PSyncFileSafetyStore(ILogger<PSyncFileSafetyStore> logger, IDatabaseProvider<FileCacheDbContext> db, PairManager pairManager,
         DalamudUtilService dalamudUtil, MareMediator mediator)
@@ -56,8 +79,98 @@ public sealed class PSyncFileSafetyStore : IHostedService
         Instance = this;
     }
 
-    public static bool IsKnownBad(string hash) => s_bad.ContainsKey(hash);
+    /// <summary>True if the file is blocked. An expired entry (older than 7 days) is dropped here and the file gets checked again.</summary>
+    public static bool IsKnownBad(string hash)
+    {
+        if (string.IsNullOrEmpty(hash) || !s_bad.TryGetValue(hash, out var entry)) return false;
+        if (DateTime.UtcNow.Ticks - entry.AddedTicks < BadExpiry.Ticks) return true;
+        if (s_bad.TryRemove(hash, out _))
+        {
+            MareSynchronos.PlayerData.Pairs.PairDataApplicationHandler.ForkRemoveVerifiedBad(hash);
+            Instance?.DeleteRowAsync(hash, "expired");
+        }
+        return false;
+    }
+
     public int BadCount => s_bad.Count;
+
+    /// <summary>1.15.6.215: a pair's apply skipped this blocked file (pair tooltip and Settings list).</summary>
+    public static void NoteSkipped(string hash, string gamePath, string pairUid, string pairName)
+    {
+        if (string.IsNullOrEmpty(hash)) return;
+        if (s_skipped.Count > 2000) s_skipped.Clear();
+        var info = s_skipped.GetOrAdd(hash, _ => new SkipInfo());
+        info.GamePath = gamePath;
+        if (info.Pairs.Count < 50) info.Pairs[pairUid] = pairName;
+    }
+
+    /// <summary>Snapshot of the blocked files for the Settings list (newest first).</summary>
+    public IReadOnlyList<BlockedFile> GetBlockedFiles()
+    {
+        var list = new List<BlockedFile>(s_bad.Count);
+        foreach (var (hash, entry) in s_bad)
+        {
+            var added = new DateTime(Math.Max(0, entry.AddedTicks), DateTimeKind.Utc);
+            s_skipped.TryGetValue(hash, out var skip);
+            var names = skip?.Pairs.Values.Distinct(StringComparer.Ordinal).OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList() ?? [];
+            var gamePath = !string.IsNullOrEmpty(skip?.GamePath) ? skip!.GamePath : entry.GamePath;
+            list.Add(new BlockedFile(hash, entry.Reason, added, added + BadExpiry, entry.SourcePairUid, gamePath, names));
+        }
+        return list.OrderByDescending(b => b.AddedUtc).ToList();
+    }
+
+    /// <summary>1.15.6.215: unblock one file. It is checked again on its next apply; pairs that skipped it are reapplied.</summary>
+    public async Task<bool> RemoveBadAsync(string hash)
+    {
+        if (string.IsNullOrEmpty(hash) || !s_bad.TryRemove(hash, out _)) return false;
+        MareSynchronos.PlayerData.Pairs.PairDataApplicationHandler.ForkRemoveVerifiedBad(hash);
+        _removed[hash.ToUpperInvariant()] = DateTime.UtcNow.Ticks;
+        try
+        {
+            await ExecAsync("DELETE FROM PSyncBadFiles WHERE Hash = $h;", c => c.Parameters.AddWithValue("$h", hash.ToUpperInvariant()), _cts.Token).ConfigureAwait(false);
+            await WriteMirrorAsync(_cts.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "[FileSafety] could not unblock {hash}", hash);
+        }
+        catch (OperationCanceledException)
+        {
+            return true;
+        }
+        _logger.LogInformation("[FileSafety] unblocked one file ({hash}) from Settings", hash);
+
+        if (s_skipped.TryRemove(hash, out var skip))
+        {
+            foreach (var uid in skip.Pairs.Keys)
+            {
+                var pair = _pairManager.GetPairByUID(uid);
+                if (pair != null && pair.IsVisible) pair.ReapplyCachedDataByUser();
+            }
+        }
+        return true;
+    }
+
+    private void DeleteRowAsync(string hash, string why)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await ExecAsync("DELETE FROM PSyncBadFiles WHERE Hash = $h;", c => c.Parameters.AddWithValue("$h", hash.ToUpperInvariant()), _cts.Token).ConfigureAwait(false);
+                await WriteMirrorAsync(_cts.Token).ConfigureAwait(false);
+                _logger.LogInformation("[FileSafety] blocked file {hash} {why}; it will be checked again on its next apply", hash, why);
+            }
+            catch (OperationCanceledException)
+            {
+                // unloading
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "[FileSafety] could not remove blocked file {hash}", hash);
+            }
+        });
+    }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -120,6 +233,8 @@ public sealed class PSyncFileSafetyStore : IHostedService
                 if (mirror != null)
                 {
                     Interlocked.Exchange(ref _clearedTicks, mirror.ClearedTicks);
+                    var cutoff = DateTime.UtcNow.AddDays(-30).Ticks;
+                    foreach (var (h, t) in mirror.Removed ?? new Dictionary<string, long>()) if (t > cutoff) _removed[h] = t;
                     await using var tx0 = (SqliteTransaction)await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
                     var removed = 0;
                     if (mirror.ClearedTicks > 0)
@@ -135,6 +250,7 @@ public sealed class PSyncFileSafetyStore : IHostedService
                     foreach (var entry in mirror.Bad)
                     {
                         if (string.IsNullOrEmpty(entry.Hash) || entry.AddedTicks <= mirror.ClearedTicks) continue;
+                        if (_removed.TryGetValue(entry.Hash, out var removedAt) && entry.AddedTicks <= removedAt) continue;
                         await using var insert = connection.CreateCommand();
                         insert.Transaction = tx0;
                         insert.CommandText = "INSERT OR IGNORE INTO PSyncBadFiles (Hash, Reason, AddedTicks, SourcePairUid) VALUES ($h, $r, $t, $u);";
@@ -143,6 +259,16 @@ public sealed class PSyncFileSafetyStore : IHostedService
                         insert.Parameters.AddWithValue("$t", entry.AddedTicks);
                         insert.Parameters.AddWithValue("$u", (object?)entry.SourcePairUid ?? DBNull.Value);
                         readded += await insert.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                    }
+
+                    foreach (var (h, t) in _removed)
+                    {
+                        await using var deleteOne = connection.CreateCommand();
+                        deleteOne.Transaction = tx0;
+                        deleteOne.CommandText = "DELETE FROM PSyncBadFiles WHERE Hash = $h AND AddedTicks <= $t;";
+                        deleteOne.Parameters.AddWithValue("$h", h.ToUpperInvariant());
+                        deleteOne.Parameters.AddWithValue("$t", t);
+                        removed += await deleteOne.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
                     }
 
                     await tx0.CommitAsync(ct).ConfigureAwait(false);
@@ -171,22 +297,48 @@ public sealed class PSyncFileSafetyStore : IHostedService
                     await using var tx = (SqliteTransaction)await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
                     foreach (var marker in markers)
                     {
-                        foreach (var hash in marker.Hashes)
+                        var quarantined = new List<string>();
+                        var suspects = new List<string>();
+                        foreach (var raw in marker.Hashes)
                         {
-                            await using var insert = connection.CreateCommand();
-                            insert.Transaction = tx;
-                            insert.CommandText = "INSERT OR IGNORE INTO PSyncBadFiles (Hash, Reason, AddedTicks, SourcePairUid) VALUES ($h, $r, $t, $u);";
-                            insert.Parameters.AddWithValue("$h", hash.ToUpperInvariant());
-                            insert.Parameters.AddWithValue("$r", "crash quarantine: the game closed while this file was being applied");
-                            insert.Parameters.AddWithValue("$t", DateTime.UtcNow.Ticks);
-                            insert.Parameters.AddWithValue("$u", marker.Uid);
-                            await insert.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                            // 1.15.6.215: "~HASH" = a shared body model. The first crash only marks it as a suspect; a second one blocks it.
+                            var isBody = raw.StartsWith(BodyModelMarkerPrefix, StringComparison.Ordinal);
+                            var hash = (isBody ? raw[BodyModelMarkerPrefix.Length..] : raw).ToUpperInvariant();
+                            if (hash.Length == 0) continue;
+                            string? existingReason = null;
+                            await using (var select = connection.CreateCommand())
+                            {
+                                select.Transaction = tx;
+                                select.CommandText = "SELECT Reason FROM PSyncBadFiles WHERE Hash = $h;";
+                                select.Parameters.AddWithValue("$h", hash);
+                                existingReason = await select.ExecuteScalarAsync(ct).ConfigureAwait(false) as string;
+                            }
+                            var wasSuspect = existingReason != null && existingReason.StartsWith(SuspectReasonPrefix, StringComparison.Ordinal);
+                            if (existingReason != null && !wasSuspect) continue; // already blocked
+                            var block = !isBody || wasSuspect;
+                            await using var upsert = connection.CreateCommand();
+                            upsert.Transaction = tx;
+                            upsert.CommandText = "INSERT OR REPLACE INTO PSyncBadFiles (Hash, Reason, AddedTicks, SourcePairUid) VALUES ($h, $r, $t, $u);";
+                            upsert.Parameters.AddWithValue("$h", hash);
+                            upsert.Parameters.AddWithValue("$r", block
+                                ? (wasSuspect ? CrashReason + " (body model, second crash)" : CrashReason)
+                                : SuspectReasonPrefix + ": body model was loading when the game closed once; blocked if it happens again");
+                            upsert.Parameters.AddWithValue("$t", DateTime.UtcNow.Ticks);
+                            upsert.Parameters.AddWithValue("$u", marker.Uid);
+                            await upsert.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                            (block ? quarantined : suspects).Add(hash);
                         }
+                        if (suspects.Count > 0)
+                        {
+                            _logger.LogWarning("[FileSafety] game closed while applying files for {uid}; {count} body model(s) marked as suspect (blocked on a second crash): {hashes}",
+                                marker.Uid, suspects.Count, string.Join(", ", suspects));
+                        }
+                        if (quarantined.Count == 0) continue;
                         _logger.LogWarning("[FileSafety] game closed while applying files for {uid}; quarantined {count} model file(s): {hashes}",
-                            marker.Uid, marker.Hashes.Length, string.Join(", ", marker.Hashes));
+                            marker.Uid, quarantined.Count, string.Join(", ", quarantined));
                         var idx = pending.FindIndex(p => string.Equals(p.Uid, marker.Uid, StringComparison.Ordinal));
-                        if (idx < 0) pending.Add((marker.Uid, marker.Hashes.Length));
-                        else pending[idx] = (marker.Uid, pending[idx].Count + marker.Hashes.Length);
+                        if (idx < 0) pending.Add((marker.Uid, quarantined.Count));
+                        else pending[idx] = (marker.Uid, pending[idx].Count + quarantined.Count);
                     }
                     await using (var delete = connection.CreateCommand())
                     {
@@ -198,14 +350,34 @@ public sealed class PSyncFileSafetyStore : IHostedService
                     await tx.CommitAsync(ct).ConfigureAwait(false);
                 }
 
-                // 2) load all known-bad hashes
+                // 1b) 1.15.6.215 expiry: a row without a time gets "now" (expires 7 days from here); rows older than 7 days are removed.
+                var nowTicks = DateTime.UtcNow.Ticks;
+                await using (var stamp = connection.CreateCommand())
+                {
+                    stamp.CommandText = "UPDATE PSyncBadFiles SET AddedTicks = $n WHERE AddedTicks IS NULL OR AddedTicks <= 0;";
+                    stamp.Parameters.AddWithValue("$n", nowTicks);
+                    await stamp.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+                await using (var expire = connection.CreateCommand())
+                {
+                    expire.CommandText = "DELETE FROM PSyncBadFiles WHERE AddedTicks < $c;";
+                    expire.Parameters.AddWithValue("$c", nowTicks - BadExpiry.Ticks);
+                    var expired = await expire.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                    if (expired > 0) _logger.LogInformation("[FileSafety] {count} blocked file(s) older than 7 days expired; they are checked again on their next apply", expired);
+                }
+
+                // 2) load all known-bad hashes (suspects are not blocked), with the last game path each was applied as
                 await using (var command = connection.CreateCommand())
                 {
-                    command.CommandText = "SELECT Hash FROM PSyncBadFiles;";
+                    command.CommandText = "SELECT b.Hash, b.Reason, b.AddedTicks, b.SourcePairUid, "
+                        + "(SELECT a.GamePath FROM PSyncFileApplications a WHERE a.Hash = b.Hash ORDER BY a.LastAppliedTicks DESC LIMIT 1) FROM PSyncBadFiles b;";
                     await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
                     while (await reader.ReadAsync(ct).ConfigureAwait(false))
                     {
-                        s_bad.TryAdd(reader.GetString(0), 0);
+                        var reason = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+                        if (reason.StartsWith(SuspectReasonPrefix, StringComparison.Ordinal)) continue;
+                        s_bad.TryAdd(reader.GetString(0), new BadEntry(reason, reader.GetInt64(2),
+                            reader.IsDBNull(3) ? null : reader.GetString(3), reader.IsDBNull(4) ? null : reader.GetString(4)));
                     }
                 }
             }
@@ -246,7 +418,7 @@ public sealed class PSyncFileSafetyStore : IHostedService
                 {
                     var (uid, count) = pending[i];
                     var pair = _pairManager.GetPairByUID(uid);
-                    var tail = $" had files loading when the game last closed unexpectedly. {count} of their model file(s) are now blocked. If this was a false alarm, use Settings > Sync > Filtering > Clear blocked files.";
+                    var tail = $" had files loading when the game last closed unexpectedly. {count} of their model file(s) are now blocked for 7 days. If this was a false alarm, unblock them in Settings > Sync > Filtering > Blocked files.";
                     if (pair != null && pair.Address != nint.Zero && !string.IsNullOrEmpty(pair.PlayerName))
                     {
                         _mediator.Publish(new PSyncChatNoticeMessage($"{pair.PlayerName} ({pair.UserData.AliasOrUID})" + tail, pair));
@@ -268,7 +440,7 @@ public sealed class PSyncFileSafetyStore : IHostedService
 
     public void RecordBad(string hash, string reason, string? pairUid)
     {
-        if (string.IsNullOrEmpty(hash) || !s_bad.TryAdd(hash, 0)) return;
+        if (string.IsNullOrEmpty(hash) || !s_bad.TryAdd(hash, new BadEntry(reason.Length > 500 ? reason[..500] : reason, DateTime.UtcNow.Ticks, pairUid, null))) return;
         _ = Task.Run(async () =>
         {
             try
@@ -389,6 +561,7 @@ public sealed class PSyncFileSafetyStore : IHostedService
     {
         var count = s_bad.Count;
         s_bad.Clear();
+        s_skipped.Clear();
         MareSynchronos.PlayerData.Pairs.PairDataApplicationHandler.ForkClearVerifiedBad();
         Interlocked.Exchange(ref _clearedTicks, DateTime.UtcNow.Ticks); // 1701: also undoes older entries a DB restore brings back
         try
@@ -452,7 +625,7 @@ public sealed class PSyncFileSafetyStore : IHostedService
 
         try
         {
-            var mirror = new Mirror { ClearedTicks = Interlocked.Read(ref _clearedTicks) };
+            var mirror = new Mirror { ClearedTicks = Interlocked.Read(ref _clearedTicks), Removed = _removed.IsEmpty ? null : new Dictionary<string, long>(_removed) };
             await using (var connection = await OpenAsync(ct).ConfigureAwait(false))
             await using (var command = connection.CreateCommand())
             {

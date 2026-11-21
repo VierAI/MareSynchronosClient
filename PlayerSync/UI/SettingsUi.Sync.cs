@@ -473,9 +473,20 @@ public partial class SettingsUi
                     }
                 }
                 _uiShared.DrawHelpText("Files that failed the crash checks, or that were being applied when the game closed unexpectedly, are blocked and remembered across restarts." + UiSharedService.TooltipSeparator +
+                    "Blocked files are released after 7 days and checked again the next time they are applied." + UiSharedService.TooltipSeparator +
                     "Clear the list if a file was blocked by mistake. Cleared files are checked again the next time they are applied.");
+                DrawPSyncBlockedFilesList(fileSafety); // 1.15.6.215
             }
         }
+        // 1.15.6.215: automatic fix for pairs drawn with missing body parts.
+        var autoHeal = MareSynchronos.Services.VierAIConfigStore.Current.AutoHealMissingParts;
+        if (ImGui.Checkbox("Fix missing body parts automatically", ref autoHeal))
+        {
+            MareSynchronos.Services.VierAIConfigStore.Current.AutoHealMissingParts = autoHeal;
+            MareSynchronos.Services.VierAIConfigStore.MarkDirty();
+        }
+        _uiShared.DrawHelpText("A few seconds after a pair is loaded, PlayerSync checks that their body, legs, head and face loaded. If a part is missing, it reapplies their last data with a redraw (after about 5 seconds, and once more 30 seconds later if needed)." + UiSharedService.TooltipSeparator +
+            "At most 2 tries per pair for the same data, so it never repeats endlessly. Off = only the manual Reapply Last Data.");
         if (ImGui.Checkbox("Filter out all sync data (make others appear vanilla)", ref filterMods))
         {
             _configService.Current.FilterMods = filterMods;
@@ -585,7 +596,7 @@ public partial class SettingsUi
 
         ImGui.TextUnformatted("Max Concurrent Applications");
         ImGui.SetNextItemWidth(200f * ImGuiHelpers.GlobalScale);
-        if (ImGui.SliderInt("##maxConcurrent", ref maxConcurrent, 1, 20))
+        if (ImGui.SliderInt("##maxConcurrent", ref maxConcurrent, 1, 50)) // 1.15.6.213: was 1-20; default 20
         {
             if (maxConcurrent < 1 || maxConcurrent > 99)
             {
@@ -594,7 +605,11 @@ public partial class SettingsUi
             _dataManager.MaxConcurrentApplyData = maxConcurrent;
         }
         _uiShared.DrawHelpText("This affects how many pairs you download/apply mods to at the same time." + UiSharedService.TooltipSeparator +
-            "A lower number may help smooth loading and prevent lag/lockups for PCs with modest specs.");
+            "A lower number may help smooth loading and prevent lag/lockups for PCs with modest specs." + UiSharedService.TooltipSeparator +
+            "Split per priority tier (Settings > Transfers > Priority: listed, in-game friends, party/alliance, direct syncs, everyone else): each tier gets 1/5 of this number, then each tier lends half (rounded down) of what it has to the tier below." + UiSharedService.TooltipSeparator + "A tier with more work than its share takes back as many slots as it needs from the tiers below it; their running work finishes first, only queued work waits. Shares of idle tiers stay reserved so their work starts at once. Below 5 there is no split (best tier first).");
+        ImGui.TextDisabled("Per tier now (listed/friends/party/direct/everyone): " + MareSynchronos.WebAPI.Files.TierSlots.Describe(maxConcurrent));
+        if (maxConcurrent > 30) // 1.15.6.214 (audit T4)
+            ImGui.TextDisabled("High values can make the game hitch while many players load at once.");
 
         ImGuiHelpers.ScaledDummy(5);
 
@@ -606,5 +621,43 @@ public partial class SettingsUi
             Mediator.Publish(new StageSettingsChangedMessage());
         }
         _uiShared.DrawHelpText("Shows the stages you are subscribed to.");
+    }
+
+    // 1.15.6.215: the blocked files, which pairs they were skipped for, and an Unblock button per file.
+    private void DrawPSyncBlockedFilesList(PlayerSync.FileCache.PSyncFileSafetyStore fileSafety)
+    {
+        if (fileSafety.BadCount == 0) return;
+        using var tree = ImRaii.TreeNode($"Blocked files list ({fileSafety.BadCount})###psyncBlockedFiles");
+        if (!tree) return;
+        var files = fileSafety.GetBlockedFiles();
+        using var table = ImRaii.Table("psyncBlockedFilesTable", 4, ImGuiTableFlags.RowBg | ImGuiTableFlags.Borders | ImGuiTableFlags.SizingStretchProp);
+        if (!table) return;
+        ImGui.TableSetupColumn("File");
+        ImGui.TableSetupColumn("Skipped for");
+        ImGui.TableSetupColumn("Released");
+        ImGui.TableSetupColumn(string.Empty, ImGuiTableColumnFlags.WidthFixed);
+        ImGui.TableHeadersRow();
+        var now = DateTime.UtcNow;
+        foreach (var file in files)
+        {
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+            var label = string.IsNullOrEmpty(file.GamePath) ? "(file not applied since start)" : Path.GetFileName(file.GamePath);
+            ImGui.TextUnformatted(label);
+            var why = file.Reason.StartsWith("crash quarantine", StringComparison.Ordinal) ? "Game closed while this file was loading" : "Failed the crash checks";
+            UiSharedService.AttachToolTip((file.GamePath ?? "unknown game path") + Environment.NewLine + why + Environment.NewLine + file.Reason
+                + (string.IsNullOrEmpty(file.SourcePairUid) ? string.Empty : Environment.NewLine + "First seen from: " + file.SourcePairUid));
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(file.SkippedFor.Count == 0 ? "-" : string.Join(", ", file.SkippedFor));
+            ImGui.TableNextColumn();
+            var left = file.ExpiresUtc - now;
+            ImGui.TextUnformatted(left <= TimeSpan.Zero ? "on next use" : left.TotalDays >= 1 ? $"in {(int)Math.Ceiling(left.TotalDays)} day(s)" : $"in {(int)Math.Ceiling(left.TotalHours)} hour(s)");
+            ImGui.TableNextColumn();
+            if (ImGui.SmallButton("Unblock##" + file.Hash))
+            {
+                _ = fileSafety.RemoveBadAsync(file.Hash);
+            }
+            UiSharedService.AttachToolTip("Unblock only this file. It is checked again when it is next applied; pairs that skipped it are reapplied now.");
+        }
     }
 }

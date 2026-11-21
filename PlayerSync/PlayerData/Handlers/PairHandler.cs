@@ -1,3 +1,4 @@
+using MareSynchronos.API.Data.Extensions;
 using MareSynchronos.API.Data.Enum;
 using MareSynchronos.MareConfiguration;
 using MareSynchronos.MareConfiguration.Configurations;
@@ -108,6 +109,18 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         {
             return;
         }
+        // 1.15.6.204: while you muted this pair, their sound requests still arrive (raw for a stripped .scd, redirected to the
+        // mute target for VFX-bound ones). Report them for the opt-in auto-unmute on a whitelisted sound.
+        // 1.15.6.205: also for pairs the blacklist auto-mute muted, so their quiet timer sees banned sounds still playing.
+        if (Pair.UserPair != null && Pair.UserPair.OwnPermissions.IsDisableSounds()
+            && (MareSynchronos.Services.VierAIConfigStore.Current.NoisesAutoUnmuteWhitelisted
+                || MareSynchronos.UI.Components.NoiseAutoMute.IsTracked(Pair.UserData.UID))
+            && PSyncForeignSounds.IsMutedPairSound(Pair, resourceLoad.GamePath, resourceLoad.FilePath))
+        {
+            Mediator.Publish(new PairMutedSoundPlayedMessage(Pair, resourceLoad.GamePath));
+        }
+        // 1.15.6.206: a request redirected to the mute target (blacklist silencing or a mute) plays nothing: not a noise.
+        if (PSyncForeignSounds.IsMuteTarget(resourceLoad.FilePath)) return;
         // Next build: only the pair's own synced sound files count (see SoundActivity.IsOwnSound).
         // 1.15.5.1704: other .scd loads on this object count too when PSyncForeignSounds says so (referenced by the pair's
         // applied .tmb/.pap/.avfx, or a redirected .scd under vfx/); they also feed the pair's mute redirects.
@@ -118,8 +131,27 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
             Pair.PSyncObserveForeignSound(resourceLoad.GamePath);
             if (!PSyncForeignSounds.IsDiskPath(resourceLoad.FilePath))
             {
-                // a game file (nothing on disk to read the header from): counted as a short sound
-                ApplySoundLoad(resourceLoad.GamePath, resourceLoad.FilePath, DateTimeOffset.UtcNow, new ScdClass(true, false, 0));
+                // 1.15.6.205: not on disk. Checked against the game data: missing = a failed load that plays nothing (custom
+                // paths their data does not contain) and is not a noise; present = a game file, channel from its real bus.
+                var gameSrc = string.IsNullOrEmpty(resourceLoad.FilePath) ? resourceLoad.GamePath : ScdInfo.NormalizePath(resourceLoad.FilePath);
+                var gameGamePath = resourceLoad.GamePath;
+                var gameFilePath = resourceLoad.FilePath;
+                var gameAt = DateTimeOffset.UtcNow;
+                var known = ScdInfo.TryGetGameInfo(gameSrc);
+                if (known != null)
+                {
+                    ApplySoundLoad(gameGamePath, gameFilePath, gameAt, known.Value);
+                    return;
+                }
+                _ = ScdInfo.ClassifyGameFileAsync(gameSrc).ContinueWith(t =>
+                {
+                    var result = t.Status == TaskStatus.RanToCompletion ? t.Result : new ScdClass(true, false, 0);
+                    _ = _dalamudUtil.RunOnFrameworkThread(() =>
+                    {
+                        if (_charaHandler == null || !IsVisible) return;
+                        ApplySoundLoad(gameGamePath, gameFilePath, gameAt, result);
+                    });
+                }, TaskScheduler.Default);
                 return;
             }
         }
@@ -160,8 +192,9 @@ public sealed class PairHandler : DisposableMediatorSubscriberBase
         SoundActivity.OnSoundLoadSucceeded(Pair, gamePath);
         Pair.LastLoadedSoundSinceRedrawTime = loadedAt;
         Pair.LastLoadedSoundSinceRedraw = filePath;
+        if (info.Sustained) Pair.SoundLastSustained = new SustainedSound(gamePath, filePath); // 1.15.6.206: unmute restore (207: one record)
         var activeChanged = SoundActivity.OnSoundLoaded(Pair, loadedAt, info);
-        Mediator.Publish(new PairSoundLoadedMessage(Pair, gamePath, filePath));
+        Mediator.Publish(new PairSoundLoadedMessage(Pair, gamePath, filePath, info.Channels, info.UnmappedBus, info.Sustained)); // 1.15.6.202: None -> by game path
         if (activeChanged) Mediator.Publish(new PairSoundActiveChangedMessage(Pair));
     }
 

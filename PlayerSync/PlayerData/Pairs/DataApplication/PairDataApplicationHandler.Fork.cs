@@ -130,6 +130,7 @@ public sealed partial class PairDataApplicationHandler
         {
             _forkAppliedData = copy;
             _forkAppliedSig = applied == null ? null : _forkValidateSig;
+            _psyncStripSigApplied = applied == null ? null : _psyncStripSigPending; // 1.15.6.217
         }
     }
 
@@ -157,7 +158,16 @@ public sealed partial class PairDataApplicationHandler
         return string.Join('|', own.IsDisableSounds(), own.IsDisableAnimations(), own.IsDisableVFX(),
             other.IsDisableSounds(), other.IsDisableAnimations(), other.IsDisableVFX(),
             c.FilterSounds, c.FilterAnimations, c.FilterVfx, c.FilterMinionsAndMounts, c.FilterPets, c.DoFilteringBidirectionDirectPairs,
-            Pair.UserPair.IndividualPairStatus, c.UIDsToOverrideFilter.Count);
+            Pair.UserPair.IndividualPairStatus, c.UIDsToOverrideFilter.Count,
+            // 1.15.6.210: the whitelist decides which sounds a mute you set keeps, so an edit must re-apply those pairs.
+            own.IsDisableSounds() && !other.IsDisableSounds() ? NoiseFilter.WhitelistSignature() : string.Empty,
+            // 1.15.6.217: the blacklisted sounds stripped at apply (auto-mute blacklisted on), so a list edit re-applies the pair.
+            PSyncStripSigPendingLocked());
+    }
+
+    private string PSyncStripSigPendingLocked()
+    {
+        lock (_forkDebounceLock) return _psyncStripSigPending;
     }
 
     /// <summary>Same data hash, but applied under different filter settings (mute/unmute and similar): must re-apply.</summary>
@@ -252,6 +262,7 @@ public sealed partial class PairDataApplicationHandler
     private void OnForkDataApplied(Guid applicationId, CharacterData charaData, Dictionary<ObjectKind, HashSet<PlayerChanges>> updatedData)
     {
         ForkRecordApplied(charaData);
+        PSyncScheduleAutoHeal(applicationId, charaData); // 1.15.6.215
         var soundRestore = Interlocked.Exchange(ref _forkSoundRestorePending, 0) == 1;
         // Full restart only when the user asked for the sound back (unmute or Reapply Last Data); an ordinary data update
         // (a DJ changing songs every few minutes) keeps the plain replay so the dance is not cut off each time.
@@ -299,8 +310,18 @@ public sealed partial class PairDataApplicationHandler
                 // 1.15.5.1204: only for an unmute restore of a player who was noisy when muted; any other replay waits for a real .scd load.
                 // Next build: also when the emote could not be restarted (sound not carried by a looping emote, e.g. a DJ setup) and when
                 // the unmute came through the full user-style reapply; the noisy-at-mute flag alone marks it as an unmute restore.
-                if ((replayed || soundRestore || fullRestart) && SoundActivity.TakeNoisyAtMute(Pair) && SoundActivity.OnSoundLoaded(Pair, DateTimeOffset.UtcNow, sustained: true))
-                    Mediator.Publish(new PairSoundActiveChangedMessage(Pair));
+                // 1.15.6.206: only with a known sound, and that sound is recorded for the Noises tooltip. Before, the restore set
+                // ACTIVE (sustained, so it lasted the whole emote loop) without recording any file: the row looked like it was
+                // playing while its tooltip said no sound files were recorded.
+                // 1.15.6.207: one atomic read of the record, and only while that sound is still in their received data or referenced
+                // by their applied files (a sound from older data is not shown again).
+                if ((replayed || soundRestore || fullRestart) && SoundActivity.TakeNoisyAtMute(Pair) && Pair.SoundLastSustained is { } restored
+                    && ((Pair.PSyncReceivedScdPaths?.Contains(restored.GamePath) ?? false) || (Pair.PSyncReferencedScdPaths?.Contains(restored.GamePath) ?? false)))
+                {
+                    var changed = SoundActivity.OnSoundLoaded(Pair, DateTimeOffset.UtcNow, sustained: true);
+                    Mediator.Publish(new PairSoundLoadedMessage(Pair, restored.GamePath, restored.FilePath, Sustained: true, Restored: true));
+                    if (changed) Mediator.Publish(new PairSoundActiveChangedMessage(Pair));
+                }
             }
             catch (Exception ex)
             {
